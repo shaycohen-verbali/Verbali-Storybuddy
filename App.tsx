@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BookOpen, Key, ArrowRight, RotateCcw, RefreshCw, AlertCircle, Library as LibraryIcon } from 'lucide-react';
-import { AppMode, FileData, StoryAssets, StoryManifest, StoryMetadata, StoryPack } from './types';
+import { AppMode, FileData, StoryManifest, StoryMetadata, StoryPack } from './types';
 import { USE_BACKEND_PIPELINE } from './services/apiClient';
 import RecordButton from './components/RecordButton';
 import OptionCard from './components/OptionCard';
