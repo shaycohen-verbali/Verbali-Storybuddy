@@ -1,5 +1,6 @@
-import { GoogleGenAI, Modality, Type, GenerateContentResponse } from '@google/genai';
-import { ChatTurn, FileData, Option, PipelineTimings, SetupTimings, StoryPack } from '../../types';
+import { GoogleGenAI, Modality, Type } from '@google/genai';
+import type { GenerateContentResponse } from '@google/genai';
+import type { ChatTurn, FileData, Option, PipelineTimings, SetupTimings, StoryPack } from '../../types';
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

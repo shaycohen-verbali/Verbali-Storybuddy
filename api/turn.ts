@@ -1,5 +1,5 @@
-import { runTurnPipeline } from './_lib/geminiServer';
-import { TurnRequest } from '../types';
+import { runTurnPipeline } from './_lib/geminiServer.js';
+import type { TurnRequest } from '../types';
 
 const send = (res: any, status: number, data: unknown) => {
   res.statusCode = status;

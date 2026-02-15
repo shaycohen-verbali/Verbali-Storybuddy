@@ -1,5 +1,5 @@
-import { setupStoryPack } from './_lib/geminiServer';
-import { SetupStoryRequest } from '../types';
+import { setupStoryPack } from './_lib/geminiServer.js';
+import type { SetupStoryRequest } from '../types';
 
 const send = (res: any, status: number, data: unknown) => {
   res.statusCode = status;

@@ -1,4 +1,4 @@
-import { synthesizeSpeech } from './_lib/geminiServer';
+import { synthesizeSpeech } from './_lib/geminiServer.js';
 
 const send = (res: any, status: number, data: unknown) => {
   res.statusCode = status;
