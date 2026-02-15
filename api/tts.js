@@ -1,12 +1,12 @@
 import { synthesizeSpeech } from './_lib/geminiServer.js';
 
-const send = (res: any, status: number, data: unknown) => {
+const send = (res, status, data) => {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(data));
 };
 
-export default async function handler(req: any, res: any) {
+export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return send(res, 405, { error: 'Method not allowed' });
   }
@@ -19,7 +19,7 @@ export default async function handler(req: any, res: any) {
 
     const audio = await synthesizeSpeech(body.text);
     return send(res, 200, { audio });
-  } catch (error: any) {
+  } catch (error) {
     return send(res, 500, {
       error: error?.message || 'tts failed'
     });

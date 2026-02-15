@@ -1,19 +1,18 @@
 import { runTurnPipeline } from './_lib/geminiServer.js';
-import type { TurnRequest } from '../types';
 
-const send = (res: any, status: number, data: unknown) => {
+const send = (res, status, data) => {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(data));
 };
 
-export default async function handler(req: any, res: any) {
+export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return send(res, 405, { error: 'Method not allowed' });
   }
 
   try {
-    const body: TurnRequest = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const payloadBytes = Buffer.byteLength(JSON.stringify(body || {}), 'utf8');
 
     if (!body?.audioBase64 || !body.mimeType || !body.storyBrief) {
@@ -33,7 +32,7 @@ export default async function handler(req: any, res: any) {
       ...result,
       payloadBytes
     });
-  } catch (error: any) {
+  } catch (error) {
     return send(res, 500, {
       error: error?.message || 'turn failed'
     });

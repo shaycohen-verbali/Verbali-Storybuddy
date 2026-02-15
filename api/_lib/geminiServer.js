@@ -1,13 +1,11 @@
 import { GoogleGenAI, Modality, Type } from '@google/genai';
-import type { GenerateContentResponse } from '@google/genai';
-import type { ChatTurn, FileData, Option, PipelineTimings, SetupTimings, StoryPack } from '../../types';
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const retryWithBackoff = async <T>(fn: () => Promise<T>, retries = 4, delayMs = 1000): Promise<T> => {
+const retryWithBackoff = async (fn, retries = 4, delayMs = 1000) => {
   try {
     return await fn();
-  } catch (error: any) {
+  } catch (error) {
     const message = String(error?.message || error || '');
     if (
       retries > 0 &&
@@ -28,7 +26,7 @@ const getClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
-const extractImageDataUrl = (response: GenerateContentResponse): string | null => {
+const extractImageDataUrl = (response) => {
   for (const part of response.candidates?.[0]?.content?.parts || []) {
     if (part.inlineData) {
       return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
@@ -37,7 +35,7 @@ const extractImageDataUrl = (response: GenerateContentResponse): string | null =
   return null;
 };
 
-const toFileDataFromDataUrl = (dataUrl: string | null): FileData | null => {
+const toFileDataFromDataUrl = (dataUrl) => {
   if (!dataUrl) {
     return null;
   }
@@ -53,7 +51,7 @@ const toFileDataFromDataUrl = (dataUrl: string | null): FileData | null => {
   };
 };
 
-const normalizeJsonArray = (text?: string): string[] => {
+const normalizeJsonArray = (text) => {
   let cleaned = text || '[]';
   const firstOpen = cleaned.indexOf('[');
   const lastClose = cleaned.lastIndexOf(']');
@@ -75,13 +73,13 @@ const normalizeJsonArray = (text?: string): string[] => {
   return ['Yes', 'No', 'Maybe'];
 };
 
-export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[]): Promise<{ storyPack: StoryPack; timings: SetupTimings }> => {
+export const setupStoryPack = async (storyFile, styleImages) => {
   const ai = getClient();
 
   const setupStart = performance.now();
   const analyzeStart = performance.now();
 
-  const analysisResponse = await retryWithBackoff<GenerateContentResponse>(() =>
+  const analysisResponse = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: {
@@ -123,7 +121,7 @@ export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[
   const storyBrief = parsed.story_brief || summary;
 
   const coverStart = performance.now();
-  const coverParts: any[] = [];
+  const coverParts = [];
   const styleInputs = styleImages.length > 0 ? styleImages : [storyFile];
 
   for (const img of styleInputs.slice(0, 4)) {
@@ -139,7 +137,7 @@ export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[
     ].join('\n')
   });
 
-  const coverResponse = await retryWithBackoff<GenerateContentResponse>(() =>
+  const coverResponse = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-2.5-flash-image',
       contents: { parts: coverParts },
@@ -171,18 +169,18 @@ export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[
 };
 
 export const runTurnPipeline = async (
-  audioBase64: string,
-  mimeType: string,
-  storyBrief: string,
-  artStyle: string,
-  stylePrimer: FileData[],
-  history: ChatTurn[]
-): Promise<{ question: string; cards: Option[]; timings: PipelineTimings }> => {
+  audioBase64,
+  mimeType,
+  storyBrief,
+  artStyle,
+  stylePrimer,
+  history
+) => {
   const ai = getClient();
   const totalStart = performance.now();
 
   const transcribeStart = performance.now();
-  const transcribeResponse = await retryWithBackoff<GenerateContentResponse>(() =>
+  const transcribeResponse = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: {
@@ -224,7 +222,7 @@ export const runTurnPipeline = async (
     .map((turn) => `${turn.role === 'parent' ? 'Parent' : 'Child'}: ${turn.text}`)
     .join('\n');
 
-  const optionsResponse = await retryWithBackoff<GenerateContentResponse>(() =>
+  const optionsResponse = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: {
@@ -253,19 +251,19 @@ export const runTurnPipeline = async (
   const optionTexts = normalizeJsonArray(optionsResponse.text);
   const optionsMs = Math.round(performance.now() - optionsStart);
 
-  const cards: Option[] = optionTexts.map((text, idx) => ({
+  const cards = optionTexts.map((text, idx) => ({
     id: `opt-${idx}`,
     text,
     isLoadingImage: true
   }));
 
-  const imageMsById: Record<string, number> = {};
+  const imageMsById = {};
   const imageStart = performance.now();
 
   await Promise.all(
     cards.map(async (card) => {
       const start = performance.now();
-      const parts: any[] = [];
+      const parts = [];
 
       for (const ref of stylePrimer.slice(0, 4)) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
@@ -280,7 +278,7 @@ export const runTurnPipeline = async (
         ].join('\n')
       });
 
-      const imageResponse = await retryWithBackoff<GenerateContentResponse>(() =>
+      const imageResponse = await retryWithBackoff(() =>
         ai.models.generateContent({
           model: 'gemini-2.5-flash-image',
           contents: { parts },
@@ -310,10 +308,10 @@ export const runTurnPipeline = async (
   };
 };
 
-export const synthesizeSpeech = async (text: string): Promise<{ audioBase64: string; mimeType: string } | null> => {
+export const synthesizeSpeech = async (text) => {
   const ai = getClient();
 
-  const response = await retryWithBackoff<GenerateContentResponse>(() =>
+  const response = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-2.5-flash-preview-tts',
       contents: { parts: [{ text }] },
