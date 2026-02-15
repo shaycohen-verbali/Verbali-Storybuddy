@@ -28,6 +28,8 @@ export const setupStoryWithBackend = async (payload: SetupStoryRequest): Promise
 };
 
 export const runTurnWithBackend = async (payload: TurnRequest): Promise<TurnResponse> => {
+  const nonAudioPayload = { ...payload, audioBase64: '<omitted>' };
+  logPayloadSize('/api/turn(non-audio)', getPayloadBytes(nonAudioPayload));
   const response = await postJson<TurnResponse>('/api/turn', payload);
   logTurnTimings('turn', response.timings);
   return response;

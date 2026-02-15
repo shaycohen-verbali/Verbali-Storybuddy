@@ -44,7 +44,7 @@ export const useStorySetup = () => {
           stylePrimer: styleImages.length > 0 ? styleImages : coverImage ? [{
             mimeType: coverImage.split(';')[0].replace('data:', ''),
             data: coverImage.split(',')[1] || ''
-          }] : [storyFile]
+          }] : []
         },
         timings: { analyzeMs, coverMs, totalMs },
         payloadBytes

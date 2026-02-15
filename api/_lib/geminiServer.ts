@@ -36,6 +36,22 @@ const extractImageDataUrl = (response: GenerateContentResponse): string | null =
   return null;
 };
 
+const toFileDataFromDataUrl = (dataUrl: string | null): FileData | null => {
+  if (!dataUrl) {
+    return null;
+  }
+
+  const match = dataUrl.match(/^data:(.+);base64,(.+)$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mimeType: match[1],
+    data: match[2]
+  };
+};
+
 const normalizeJsonArray = (text?: string): string[] => {
   let cleaned = text || '[]';
   const firstOpen = cleaned.indexOf('[');
@@ -107,9 +123,9 @@ export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[
 
   const coverStart = performance.now();
   const coverParts: any[] = [];
-  const stylePrimer = styleImages.length > 0 ? styleImages : [storyFile];
+  const styleInputs = styleImages.length > 0 ? styleImages : [storyFile];
 
-  for (const img of stylePrimer.slice(0, 4)) {
+  for (const img of styleInputs.slice(0, 4)) {
     coverParts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
   }
 
@@ -133,12 +149,16 @@ export const setupStoryPack = async (storyFile: FileData, styleImages: FileData[
   const coverMs = Math.round(performance.now() - coverStart);
   const totalMs = Math.round(performance.now() - setupStart);
 
+  const coverImage = extractImageDataUrl(coverResponse);
+  const coverPrimer = toFileDataFromDataUrl(coverImage);
+  const stylePrimer = styleImages.length > 0 ? styleImages.slice(0, 4) : coverPrimer ? [coverPrimer] : [];
+
   return {
     storyPack: {
       summary,
       artStyle,
       storyBrief,
-      coverImage: extractImageDataUrl(coverResponse),
+      coverImage,
       stylePrimer
     },
     timings: {
