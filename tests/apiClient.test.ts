@@ -1,0 +1,74 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { runTurnWithBackend, setupStoryWithBackend } from '../services/apiClient';
+
+describe('apiClient', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('maps setup response shape', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          storyPack: {
+            summary: 'A short story',
+            artStyle: 'watercolor cartoon',
+            storyBrief: 'brief',
+            coverImage: null,
+            stylePrimer: []
+          },
+          timings: { analyzeMs: 10, coverMs: 20, totalMs: 30 },
+          payloadBytes: 123
+        })
+      })
+    );
+
+    const response = await setupStoryWithBackend({
+      storyFile: { data: 'abc', mimeType: 'application/pdf' },
+      styleImages: []
+    });
+
+    expect(response.storyPack.summary).toBe('A short story');
+    expect(response.timings.totalMs).toBe(30);
+  });
+
+  it('maps turn response shape', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          question: 'What happened?',
+          cards: [
+            { id: 'opt-0', text: 'He ran', isLoadingImage: false },
+            { id: 'opt-1', text: 'He slept', isLoadingImage: false },
+            { id: 'opt-2', text: 'He flew', isLoadingImage: false }
+          ],
+          timings: {
+            transcribeMs: 100,
+            optionsMs: 200,
+            imageMsById: { 'opt-0': 300, 'opt-1': 310, 'opt-2': 320 },
+            fullCardsMs: 320,
+            totalMs: 620
+          },
+          payloadBytes: 256
+        })
+      })
+    );
+
+    const response = await runTurnWithBackend({
+      audioBase64: 'abc',
+      mimeType: 'audio/webm',
+      storyBrief: 'brief',
+      artStyle: 'style',
+      stylePrimer: [],
+      history: []
+    });
+
+    expect(response.question).toBe('What happened?');
+    expect(response.cards).toHaveLength(3);
+    expect(response.timings.fullCardsMs).toBe(320);
+  });
+});

@@ -1,0 +1,7 @@
+{
+  "name": "Verbali StoryBuddy",
+  "description": "An AI-powered assistant for non-verbal children to engage in storytelling using visual choices and speech.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
