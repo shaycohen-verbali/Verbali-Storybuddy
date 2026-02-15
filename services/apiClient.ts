@@ -13,9 +13,21 @@ const postJson = async <TResponse>(path: string, payload: unknown): Promise<TRes
     body: JSON.stringify(payload)
   });
 
-  const json = await response.json();
+  const raw = await response.text();
+  let json: any = null;
+  try {
+    json = raw ? JSON.parse(raw) : {};
+  } catch {
+    json = null;
+  }
+
   if (!response.ok) {
-    throw new Error(json?.error || `Request failed: ${path}`);
+    const textError = raw?.trim();
+    throw new Error(json?.error || textError || `Request failed: ${path}`);
+  }
+
+  if (!json) {
+    throw new Error(`Invalid JSON response from ${path}`);
   }
 
   return json as TResponse;

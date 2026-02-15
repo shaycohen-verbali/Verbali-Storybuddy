@@ -1,6 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
 import { FileData, SetupStoryResponse, StoryPack } from '../types';
+import { USE_BACKEND_PIPELINE } from '../services/apiClient';
 
 interface SetupPanelProps {
   onPrepareStory: (storyFile: FileData, styleImages: FileData[]) => Promise<SetupStoryResponse>;
@@ -60,6 +61,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
   const [currentStory, setCurrentStory] = useState<FileData | null>(null);
   const [styleReferences, setStyleReferences] = useState<FileData[]>([]);
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
+  const maxPdfSizeBytes = USE_BACKEND_PIPELINE ? 3 * 1024 * 1024 : 50 * 1024 * 1024;
 
   const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -72,7 +74,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
     setPreparedPack(null);
 
     try {
-      if (file.size > 50 * 1024 * 1024) {
+      if (file.size > maxPdfSizeBytes) {
+        if (USE_BACKEND_PIPELINE) {
+          throw new Error('PDF is too large for cloud processing. Use a PDF smaller than 3MB.');
+        }
         throw new Error('File is too large. Please use a file smaller than 50MB.');
       }
 
