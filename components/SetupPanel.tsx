@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles } from 'lucide-react';
 import { FileData, SetupStoryResponse, StoryPack } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
+import { extractStyleScreenshotsFromPdf } from '../services/pdfService';
 
 interface SetupInitialView {
   storyId?: string;
@@ -134,7 +135,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setIsProcessing(false);
   }, [initialView]);
 
-  const runSetupFromCurrentStory = async (sourceStory?: FileData | null) => {
+  const runSetupFromCurrentStory = async (sourceStory?: FileData | null, sourceStyles?: FileData[]) => {
     const storySource = sourceStory || currentStory;
     if (!storySource) {
       setErrorMsg('Original PDF is required to re-run setup.');
@@ -145,13 +146,25 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setIsProcessing(true);
 
     try {
-      const setupResponse = await onPrepareStory(storySource, styleReferences);
+      let effectiveStyles = sourceStyles ?? styleReferences;
+      if (effectiveStyles.length === 0) {
+        const screenshots = await extractStyleScreenshotsFromPdf(storySource.data, 8);
+        effectiveStyles = screenshots
+          .map((dataUrl) => parseDataUrl(dataUrl))
+          .filter((item) => item.data.length > 0);
+      }
+
+      if (effectiveStyles.length > 0) {
+        setStyleReferences(effectiveStyles);
+      }
+
+      const setupResponse = await onPrepareStory(storySource, effectiveStyles);
       setPreparedPack((prev) => ({
         ...setupResponse.storyPack,
         coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
       }));
 
-      if (styleReferences.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
+      if (effectiveStyles.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
         setStyleReferences(setupResponse.storyPack.stylePrimer);
       }
     } catch (error: any) {
@@ -185,7 +198,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       const dataUrl = await fileToDataUrl(file);
       const storyFile: FileData = { data: dataUrl.split(',')[1] || '', mimeType: file.type };
       setCurrentStory(storyFile);
-      await runSetupFromCurrentStory(storyFile);
+      const screenshots = await extractStyleScreenshotsFromPdf(storyFile.data, 8);
+      const screenshotReferences = screenshots
+        .map((value) => parseDataUrl(value))
+        .filter((item) => item.data.length > 0);
+      if (screenshotReferences.length > 0) {
+        setStyleReferences(screenshotReferences);
+      }
+      await runSetupFromCurrentStory(storyFile, screenshotReferences);
     } catch (error: any) {
       console.error(error);
       setErrorMsg(error?.message || 'Failed to read story file');
@@ -248,6 +268,27 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     }
 
     setStyleReferences((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleRerunAnalysis = async () => {
+    try {
+      if (!currentStory) {
+        await runSetupFromCurrentStory();
+        return;
+      }
+
+      const screenshots = await extractStyleScreenshotsFromPdf(currentStory.data, 8);
+      const screenshotReferences = screenshots
+        .map((value) => parseDataUrl(value))
+        .filter((item) => item.data.length > 0);
+      if (screenshotReferences.length > 0) {
+        setStyleReferences(screenshotReferences);
+      }
+      await runSetupFromCurrentStory(currentStory, screenshotReferences);
+    } catch (error: any) {
+      console.error(error);
+      setErrorMsg(error?.message || 'Failed to refresh screenshots from the book');
+    }
   };
 
   const handleFinish = async () => {
@@ -420,7 +461,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
 
                           {currentStory && (
                             <button
-                              onClick={runSetupFromCurrentStory}
+                              onClick={handleRerunAnalysis}
                               className="px-4 py-2 rounded-lg bg-kid-teal/10 text-kid-teal text-sm font-bold hover:bg-kid-teal/20 transition flex items-center gap-1"
                             >
                               <Sparkles className="w-4 h-4" /> Re-run Analysis
@@ -459,7 +500,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Style References
                 </h3>
                 <p className="text-gray-500 text-sm mb-6">
-                  Style agent assets and uploaded references used for option image generation.
+                  Book screenshots and uploaded references used for option image generation.
                 </p>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">

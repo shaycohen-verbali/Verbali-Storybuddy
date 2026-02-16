@@ -681,54 +681,6 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
   return [...styleLayer, ...semanticLayer].join('\n');
 };
 
-const runIllustrationStyleAgent = async (ai, storyFile, storyFacts, artStyle) => {
-  const catalog = (storyFacts?.characterCatalog || [])
-    .map((entry) => normalizePhrase(entry?.name))
-    .filter(Boolean)
-    .slice(0, 8);
-  const characterLine = catalog.length > 0 ? catalog.join(', ') : 'Main story characters';
-
-  const tasks = [
-    `Create a square style-reference image focused on character design from this book.
-Known characters: ${characterLine}.
-Keep only in-book characters. No text.`,
-    `Create a square style-reference image focused on environments and backgrounds from this book.
-Match the original linework, colors, and texture.
-No text.`,
-    `Create a square style-reference image focused on recurring story objects and visual motifs.
-Art style: ${artStyle}.
-No text.`
-  ];
-
-  const generated = await Promise.all(
-    tasks.map(async (taskPrompt) => {
-      try {
-        const response = await retryWithBackoff(() =>
-          ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: {
-              parts: [
-                { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
-                { text: taskPrompt }
-              ]
-            },
-            config: { imageConfig: { aspectRatio: '1:1' } }
-          }),
-          1,
-          350
-        );
-
-        return toFileDataFromDataUrl(extractImageDataUrl(response));
-      } catch (error) {
-        console.warn('[style-agent] failed to generate style asset', error?.message || error);
-        return null;
-      }
-    })
-  );
-
-  return generated.filter(Boolean);
-};
-
 export const setupStoryPack = async (storyFile, styleImages) => {
   const ai = getClient();
 
@@ -869,12 +821,9 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     storyBrief
   );
 
-  const styleAgentAssets = await runIllustrationStyleAgent(ai, storyFile, storyFacts, artStyle);
-  console.info(`[style-agent] generated_assets=${styleAgentAssets.length}`);
-
   const coverStart = performance.now();
   const coverParts = [];
-  const styleInputs = styleImages.length > 0 ? styleImages : [storyFile, ...styleAgentAssets];
+  const styleInputs = styleImages.length > 0 ? styleImages : [storyFile];
 
   for (const img of styleInputs.slice(0, 4)) {
     coverParts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
@@ -904,7 +853,6 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   const coverPrimer = toFileDataFromDataUrl(coverImage);
   const stylePrimer = [
     ...styleImages.slice(0, 4),
-    ...styleAgentAssets,
     ...(coverPrimer ? [coverPrimer] : [])
   ].slice(0, 8);
 
