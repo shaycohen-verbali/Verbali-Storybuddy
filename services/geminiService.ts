@@ -53,6 +53,35 @@ const shuffleArray = <T>(array: T[]): T[] => {
   return newArray;
 };
 
+const normalizeOptionSet = (text: string): string[] => {
+  try {
+    const parsed = JSON.parse(text || '{}');
+    const options = Array.isArray(parsed?.options) ? parsed.options : [];
+    const mapped = options
+      .map((opt: any) => ({
+        text: String(opt?.text || '').trim(),
+        isCorrect: Boolean(opt?.is_correct),
+      }))
+      .filter((opt: any) => opt.text.length > 0)
+      .slice(0, 3);
+
+    if (mapped.length !== 3) {
+      return ["Not in this book", "Maybe", "No idea"];
+    }
+
+    const correctCount = mapped.filter((opt: any) => opt.isCorrect).length;
+    if (correctCount !== 1) {
+      mapped[0].isCorrect = true;
+      mapped[1].isCorrect = false;
+      mapped[2].isCorrect = false;
+    }
+
+    return shuffleArray(mapped.map((opt: any) => opt.text));
+  } catch (e) {
+    return ["Not in this book", "Maybe", "No idea"];
+  }
+};
+
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const getAIClient = () => {
@@ -207,8 +236,9 @@ export const transcribeParentQuestion = async (
   try {
     const ai = getAIClient();
     
-    let promptText = `Listen to this audio. The user is a parent discussing a story with a child. 
-    Transcribe the parent's full inquiry exactly as spoken.`;
+    let promptText = `Listen to this audio. This is a reading-comprehension activity for a non-verbal child.
+    The parent asks the question; the child chooses one answer from options.
+    Transcribe only the parent's full inquiry exactly as spoken.`;
     
     if (context) {
       promptText += `
@@ -269,14 +299,15 @@ export const generateAnswerOptions = async (
     });
 
     let prompt = `
-      You are an assistant for a non-verbal child engaging in a story.
+      You are helping a non-verbal child answer a reading-comprehension question.
+      The parent is the reader. The child is the answerer.
       The parent just asked: "${question}"
       ${historyText}
-      Task: Generate exactly 3 short answers (under 5 words each).
-      1. Correct Answer.
-      2. Incorrect Answer (Conceptually wrong).
-      3. Distractor (Related but wrong).
-      Return JSON array of strings.
+      Task: Return exactly 3 short answers (under 5 words each).
+      Exactly ONE answer must be correct based on the story.
+      The other TWO must be clearly incorrect but plausible distractors.
+      If question is not answerable from the story, use "Not in this book" as the only correct option.
+      Return strict JSON object: {"options":[{"text":"...","is_correct":true|false}, ...]}.
     `;
 
     if (metadata) {
@@ -292,8 +323,21 @@ export const generateAnswerOptions = async (
       config: {
         responseMimeType: "application/json",
         responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
+          type: Type.OBJECT,
+          properties: {
+            options: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING },
+                  is_correct: { type: Type.BOOLEAN }
+                },
+                required: ["text", "is_correct"]
+              }
+            }
+          },
+          required: ["options"]
         },
         thinkingConfig: { thinkingBudget: 0 }
       }
@@ -309,14 +353,13 @@ export const generateAnswerOptions = async (
     }
 
     try {
-      const options = JSON.parse(text);
-      return shuffleArray(options);
+      return normalizeOptionSet(text);
     } catch (e) {
-      return ["Yes", "No", "Maybe"];
+      return ["Not in this book", "Maybe", "No idea"];
     }
   } catch (error) {
     console.error("Error generating options:", error);
-    return ["Yes", "No", "Maybe"];
+    return ["Not in this book", "Maybe", "No idea"];
   }
 };
 

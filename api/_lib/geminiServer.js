@@ -73,6 +73,47 @@ const normalizeJsonArray = (text) => {
   return ['Yes', 'No', 'Maybe'];
 };
 
+const normalizeOptionSet = (rawText) => {
+  const fallback = [
+    { text: 'Not in this book', isCorrect: true },
+    { text: 'Maybe', isCorrect: false },
+    { text: 'No idea', isCorrect: false }
+  ];
+
+  try {
+    const parsed = JSON.parse(rawText || '{}');
+    const options = Array.isArray(parsed?.options) ? parsed.options : [];
+    const mapped = options
+      .map((opt) => ({
+        text: String(opt?.text || '').trim(),
+        isCorrect: Boolean(opt?.is_correct)
+      }))
+      .filter((opt) => opt.text.length > 0)
+      .slice(0, 3);
+
+    if (mapped.length !== 3) {
+      return fallback;
+    }
+
+    const correctCount = mapped.filter((opt) => opt.isCorrect).length;
+    if (correctCount !== 1) {
+      mapped[0].isCorrect = true;
+      mapped[1].isCorrect = false;
+      mapped[2].isCorrect = false;
+    }
+
+    // Shuffle to avoid always placing the correct answer first.
+    for (let i = mapped.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [mapped[i], mapped[j]] = [mapped[j], mapped[i]];
+    }
+
+    return mapped;
+  } catch {
+    return fallback;
+  }
+};
+
 export const setupStoryPack = async (storyFile, styleImages) => {
   const ai = getClient();
 
@@ -91,7 +132,8 @@ export const setupStoryPack = async (storyFile, styleImages) => {
               'Fields:',
               '1) summary: two short kid-friendly sentences.',
               '2) art_style: at most 5 words.',
-              '3) story_brief: concise structured brief for turn-time Q&A and image prompts.',
+              '3) story_brief: concise but detailed comprehension brief for turn-time Q&A.',
+              'Include in story_brief: main characters, setting, sequence of key events, and concrete facts answerable from the book.',
               'Return valid JSON only.'
             ].join('\n')
           }
@@ -189,6 +231,7 @@ export const runTurnPipeline = async (
           {
             text: [
               'Transcribe only the parent question from this audio.',
+              'This is a book comprehension activity for a non-verbal child who chooses among answers.',
               'Return only plain text transcription.',
               `Story context: ${storyBrief}`
             ].join('\n')
@@ -229,32 +272,53 @@ export const runTurnPipeline = async (
         parts: [
           {
             text: [
-              'You are helping a non-verbal child answer about a story.',
+              'You are helping a non-verbal child answer a reading-comprehension question.',
+              'The parent is the reader. The child is the answerer.',
+              'Every answer option MUST be grounded in the story context below.',
               `Story brief: ${storyBrief}`,
               `Conversation:\n${historyText}`,
               `Parent asked: ${question}`,
-              'Generate exactly 3 short answers (max 5 words each):',
-              '1) correct, 2) incorrect, 3) related distractor.',
-              'Return JSON array of strings only.'
+              'Task: return exactly 3 short answer options (max 5 words each).',
+              'Exactly ONE option must be correct for the parent question based on the story.',
+              'The other TWO options must be clearly incorrect but plausible distractors.',
+              'If the question cannot be answered from the story, mark "Not in this book" as the only correct option.',
+              'Return strict JSON object: {"options":[{"text":"...","is_correct":true|false}, ...]}'
             ].join('\n')
           }
         ]
       },
       config: {
         responseMimeType: 'application/json',
-        responseSchema: { type: Type.ARRAY, items: { type: Type.STRING } },
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            options: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING },
+                  is_correct: { type: Type.BOOLEAN }
+                },
+                required: ['text', 'is_correct']
+              }
+            }
+          },
+          required: ['options']
+        },
         thinkingConfig: { thinkingBudget: 0 }
       }
     })
   );
 
-  const optionTexts = normalizeJsonArray(optionsResponse.text);
+  const optionChoices = normalizeOptionSet(optionsResponse.text);
   const optionsMs = Math.round(performance.now() - optionsStart);
 
-  const cards = optionTexts.map((text, idx) => ({
+  const cards = optionChoices.map((choice, idx) => ({
     id: `opt-${idx}`,
-    text,
-    isLoadingImage: true
+    text: choice.text,
+    isLoadingImage: true,
+    type: choice.isCorrect ? 'correct' : 'wrong'
   }));
 
   const imageMsById = {};
