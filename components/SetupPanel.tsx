@@ -89,7 +89,7 @@ const mergePrimerSources = (preferred: FileData[], fallback: FileData[]): FileDa
     merged.push(item);
   }
 
-  return merged.slice(0, 8);
+  return merged.slice(0, 120);
 };
 
 const SetupPanel: React.FC<SetupPanelProps> = ({
@@ -148,7 +148,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     try {
       let effectiveStyles = sourceStyles ?? styleReferences;
       if (effectiveStyles.length === 0) {
-        const screenshots = await extractStyleScreenshotsFromPdf(storySource.data, 8);
+        const screenshots = await extractStyleScreenshotsFromPdf(storySource.data, 80);
         effectiveStyles = screenshots
           .map((dataUrl) => parseDataUrl(dataUrl))
           .filter((item) => item.data.length > 0);
@@ -158,7 +158,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         setStyleReferences(effectiveStyles);
       }
 
-      const setupResponse = await onPrepareStory(storySource, effectiveStyles);
+      const setupStyles = effectiveStyles.slice(0, 8);
+      const setupResponse = await onPrepareStory(storySource, setupStyles);
       setPreparedPack((prev) => ({
         ...setupResponse.storyPack,
         coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
@@ -198,7 +199,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       const dataUrl = await fileToDataUrl(file);
       const storyFile: FileData = { data: dataUrl.split(',')[1] || '', mimeType: file.type };
       setCurrentStory(storyFile);
-      const screenshots = await extractStyleScreenshotsFromPdf(storyFile.data, 8);
+      const screenshots = await extractStyleScreenshotsFromPdf(storyFile.data, 80);
       const screenshotReferences = screenshots
         .map((value) => parseDataUrl(value))
         .filter((item) => item.data.length > 0);
@@ -277,7 +278,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
-      const screenshots = await extractStyleScreenshotsFromPdf(currentStory.data, 8);
+      const screenshots = await extractStyleScreenshotsFromPdf(currentStory.data, 80);
       const screenshotReferences = screenshots
         .map((value) => parseDataUrl(value))
         .filter((item) => item.data.length > 0);
@@ -500,7 +501,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Style References
                 </h3>
                 <p className="text-gray-500 text-sm mb-6">
-                  Book screenshots and uploaded references used for option image generation.
+                  Page screenshots from across the book plus uploaded references used for option image generation.
                 </p>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">
