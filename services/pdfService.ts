@@ -1,7 +1,32 @@
-import * as pdfjsLib from 'pdfjs-dist';
+type PdfJsModule = {
+  GlobalWorkerOptions: {
+    workerSrc: string;
+  };
+  getDocument: (params: { data: Uint8Array }) => {
+    promise: Promise<{
+      numPages: number;
+      getPage: (pageNumber: number) => Promise<{
+        getViewport: (params: { scale: number }) => { width: number; height: number };
+        render: (params: { canvasContext: CanvasRenderingContext2D; viewport: { width: number; height: number } }) => { promise: Promise<void> };
+      }>;
+    }>;
+  };
+};
 
-// Set worker source to the CDN version matching the library
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.0.379/build/pdf.worker.mjs';
+let pdfJsPromise: Promise<PdfJsModule> | null = null;
+
+const getPdfJs = async (): Promise<PdfJsModule> => {
+  if (!pdfJsPromise) {
+    pdfJsPromise = import(
+      /* @vite-ignore */
+      'https://esm.sh/pdfjs-dist@4.0.379/build/pdf.mjs'
+    ) as Promise<PdfJsModule>;
+  }
+
+  const pdfjsLib = await pdfJsPromise;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.0.379/build/pdf.worker.mjs';
+  return pdfjsLib;
+};
 
 interface ConvertPdfOptions {
   maxPages?: number;
@@ -59,6 +84,7 @@ const createCharacterFocusCrop = async (pageDataUrl: string): Promise<string | n
 
 export const convertPdfToImages = async (base64Data: string, options: ConvertPdfOptions = {}): Promise<string[]> => {
   try {
+    const pdfjsLib = await getPdfJs();
     const binaryString = atob(base64Data);
     const len = binaryString.length;
     const bytes = new Uint8Array(len);
