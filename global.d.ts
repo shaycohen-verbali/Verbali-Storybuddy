@@ -13,3 +13,6 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+declare const __APP_COMMIT_SHA__: string;
+declare const __APP_REPO_SLUG__: string;

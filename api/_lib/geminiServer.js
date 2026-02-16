@@ -95,6 +95,47 @@ const normalizeFactList = (items, limit = 10) => {
   return unique;
 };
 
+const normalizeCharacterSource = (value) => {
+  const source = String(value || '').toLowerCase();
+  if (source === 'illustrated') return 'illustrated';
+  if (source === 'both') return 'both';
+  return 'mentioned';
+};
+
+const mergeCharacterSource = (currentSource, nextSource) => {
+  if (currentSource === nextSource) return currentSource;
+  if (!currentSource) return nextSource;
+  if (!nextSource) return currentSource;
+  return 'both';
+};
+
+const normalizeCharacterCatalog = (catalog, fallbackCharacters) => {
+  const merged = new Map();
+
+  for (const item of Array.isArray(catalog) ? catalog : []) {
+    const name = normalizePhrase(item?.name || item);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const source = normalizeCharacterSource(item?.source);
+    const previous = merged.get(key);
+    merged.set(key, {
+      name,
+      source: mergeCharacterSource(previous?.source, source)
+    });
+  }
+
+  for (const character of normalizeFactList(fallbackCharacters, 20)) {
+    const key = character.toLowerCase();
+    const previous = merged.get(key);
+    merged.set(key, {
+      name: character,
+      source: mergeCharacterSource(previous?.source, 'mentioned')
+    });
+  }
+
+  return Array.from(merged.values()).slice(0, 20);
+};
+
 const inferLocationFromStory = (storyBrief) => {
   const brief = (storyBrief || '').toLowerCase();
   if (/(ocean|sea|underwater|reef|shark|whale|fish)/.test(brief)) return 'In the ocean';
@@ -124,8 +165,14 @@ const inferWorldTagsFromText = (text) => {
 };
 
 const normalizeStoryFacts = (facts, storyBrief) => {
+  const characterCatalog = normalizeCharacterCatalog(
+    facts?.characterCatalog || facts?.character_catalog,
+    facts?.characters
+  );
+
   const normalized = {
-    characters: normalizeFactList(facts?.characters, 12),
+    characters: characterCatalog.map((entry) => entry.name),
+    characterCatalog,
     places: normalizeFactList(facts?.places, 12),
     objects: normalizeFactList(facts?.objects, 12),
     events: normalizeFactList(facts?.events, 14),
@@ -640,12 +687,36 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
 };
 
 const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts }) => {
+  const allowedCharacters = (storyFacts?.characterCatalog || [])
+    .map((entry) => normalizePhrase(entry?.name))
+    .filter(Boolean)
+    .slice(0, 12);
+  const normalizedOption = canonicalOption(optionText);
+  const optionUsesKnownCharacter = allowedCharacters.some((name) => {
+    const normalizedName = canonicalOption(name);
+    return normalizedName && normalizedOption.includes(normalizedName);
+  });
+
+  const characterRules = allowedCharacters.length > 0
+    ? [
+        `- Allowed characters from this book only: ${allowedCharacters.join(', ')}.`,
+        '- Never invent new people, animals, or creatures that are not in the allowed list.',
+        optionUsesKnownCharacter
+          ? '- If a character is shown, prioritize the matching allowed character.'
+          : '- If the option is about a place/object, avoid adding extra characters.'
+      ]
+    : [
+        '- Do not invent any named characters.',
+        '- Prefer object/location-only scenes when possible.'
+      ];
+
   const styleLayer = [
     'STYLE LAYER:',
     `- Match the attached style references exactly.`,
     `- Art style description: ${artStyle || 'Children\'s book illustration'}.`,
     '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
-    '- Composition must be easy for a non-verbal child to recognize quickly.'
+    '- Composition must be easy for a non-verbal child to recognize quickly.',
+    ...characterRules
   ];
 
   const semanticLayer =
@@ -689,7 +760,9 @@ export const setupStoryPack = async (storyFile, styleImages) => {
               '2) art_style: at most 5 words.',
               '3) story_brief: concise but detailed brief for comprehension Q&A.',
               '4) story_facts object with:',
-              '   - characters: short names/roles',
+              '   - characters: short names/roles (all characters in book)',
+              '   - character_catalog: list of all characters that are mentioned or illustrated',
+              '     each item: {name, source} where source is mentioned, illustrated, or both',
               '   - places: concrete locations mentioned',
               '   - objects: key objects',
               '   - events: key events in sequence fragments',
@@ -713,13 +786,24 @@ export const setupStoryPack = async (storyFile, styleImages) => {
               type: Type.OBJECT,
               properties: {
                 characters: { type: Type.ARRAY, items: { type: Type.STRING } },
+                character_catalog: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      name: { type: Type.STRING },
+                      source: { type: Type.STRING }
+                    },
+                    required: ['name', 'source']
+                  }
+                },
                 places: { type: Type.ARRAY, items: { type: Type.STRING } },
                 objects: { type: Type.ARRAY, items: { type: Type.STRING } },
                 events: { type: Type.ARRAY, items: { type: Type.STRING } },
                 setting: { type: Type.STRING },
                 world_tags: { type: Type.ARRAY, items: { type: Type.STRING } }
               },
-              required: ['characters', 'places', 'objects', 'events', 'setting', 'world_tags']
+              required: ['characters', 'character_catalog', 'places', 'objects', 'events', 'setting', 'world_tags']
             }
           },
           required: ['summary', 'art_style', 'story_brief', 'story_facts']
@@ -734,7 +818,67 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   const summary = parsed.summary || 'Story analyzed.';
   const artStyle = parsed.art_style || 'Children\'s book illustration';
   const storyBrief = parsed.story_brief || summary;
-  const storyFacts = normalizeStoryFacts(parsed.story_facts, storyBrief);
+
+  let extractedCharacterCatalog = [];
+  try {
+    const characterResponse = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
+            {
+              text: [
+                'Extract all story characters from this children\'s book PDF.',
+                'Include characters that are explicitly mentioned in text and characters that are visually illustrated.',
+                'Return strict JSON with character_catalog only.',
+                'Each item must be: {name, source} and source must be one of mentioned, illustrated, both.'
+              ].join('\n')
+            }
+          ]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              character_catalog: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    source: { type: Type.STRING }
+                  },
+                  required: ['name', 'source']
+                }
+              }
+            },
+            required: ['character_catalog']
+          },
+          thinkingConfig: { thinkingBudget: 0 }
+        }
+      })
+    );
+
+    const characterPayload = parseJsonSafe(characterResponse.text, { character_catalog: [] });
+    extractedCharacterCatalog = Array.isArray(characterPayload.character_catalog)
+      ? characterPayload.character_catalog
+      : [];
+  } catch {
+    extractedCharacterCatalog = [];
+  }
+
+  const storyFacts = normalizeStoryFacts(
+    {
+      ...(parsed.story_facts || {}),
+      character_catalog: [
+        ...((parsed.story_facts && parsed.story_facts.character_catalog) || []),
+        ...extractedCharacterCatalog
+      ]
+    },
+    storyBrief
+  );
 
   const coverStart = performance.now();
   const coverParts = [];

@@ -14,6 +14,8 @@ import { useTurnPipeline } from './hooks/useTurnPipeline';
 const App: React.FC = () => {
   const [hasApiKey, setHasApiKey] = useState(USE_BACKEND_PIPELINE);
   const [currentMode, setCurrentMode] = useState<AppMode>(AppMode.LIBRARY);
+  const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
+  const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
   const { stories, activeManifest, activeAssets, selectStory, saveNewStory, deleteStory } = useLibrary();
   const { prepareStory } = useStorySetup();
@@ -139,6 +141,7 @@ const App: React.FC = () => {
           <button onClick={handleSelectKey} className="w-full py-4 bg-kid-blue text-white font-bold rounded-xl shadow-lg hover:bg-blue-500 transition-all flex items-center justify-center gap-2 group">
             Connect API Key <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition" />
           </button>
+          <p className="text-xs text-gray-400 font-mono">Build {buildLabel}</p>
         </div>
       </div>
     );
@@ -154,6 +157,11 @@ const App: React.FC = () => {
           <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-kid-blue to-kid-pink">StoryBuddy</h1>
         </div>
         <div className="flex gap-2">
+          {currentMode === AppMode.LIBRARY && (
+            <div className="px-3 py-2 bg-white rounded-full shadow-md text-[11px] text-gray-500 font-mono">
+              Build {buildLabel}
+            </div>
+          )}
           {currentMode === AppMode.STORY && (
             <>
               {conversationHistory.length > 0 && (

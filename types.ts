@@ -66,11 +66,17 @@ export interface StoryPack {
 
 export interface StoryFacts {
   characters: string[];
+  characterCatalog: StoryCharacterFact[];
   places: string[];
   objects: string[];
   events: string[];
   setting: string;
   worldTags: string[];
+}
+
+export interface StoryCharacterFact {
+  name: string;
+  source: 'mentioned' | 'illustrated' | 'both';
 }
 
 export interface StoryManifest {

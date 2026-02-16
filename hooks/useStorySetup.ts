@@ -42,6 +42,7 @@ export const useStorySetup = () => {
           storyBrief: analysis.summary,
           storyFacts: {
             characters: [],
+            characterCatalog: [],
             places: [],
             objects: [],
             events: [],

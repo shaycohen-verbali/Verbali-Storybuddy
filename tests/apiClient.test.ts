@@ -18,6 +18,7 @@ describe('apiClient', () => {
             storyBrief: 'brief',
             storyFacts: {
               characters: ['Milo'],
+              characterCatalog: [{ name: 'Milo', source: 'mentioned' }],
               places: ['ocean reef'],
               objects: ['shell'],
               events: ['Milo finds a shell'],
@@ -73,6 +74,7 @@ describe('apiClient', () => {
       storyBrief: 'brief',
       storyFacts: {
         characters: ['Milo'],
+        characterCatalog: [{ name: 'Milo', source: 'mentioned' }],
         places: ['reef'],
         objects: [],
         events: [],

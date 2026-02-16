@@ -10,6 +10,7 @@ let dbPromise: Promise<IDBDatabase> | null = null;
 
 const createDefaultStoryFacts = (source: string) => ({
   characters: [],
+  characterCatalog: [],
   places: [],
   objects: [],
   events: [],
