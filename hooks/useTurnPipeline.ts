@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
-import { Option, StoryAssets } from '../types';
+import { ChatTurn, Option, StoryAssets } from '../types';
 import { initialTurnSessionState, turnSessionReducer } from '../features/session/sessionReducer';
 import { requestTtsFromBackend, runTurnWithBackend, USE_BACKEND_PIPELINE } from '../services/apiClient';
-import { playPcm16AudioBase64 } from '../services/audioService';
+import { decodePcm16AudioBase64, playAudioBuffer, playPcm16AudioBase64 } from '../services/audioService';
 import * as GeminiService from '../services/geminiService';
+
+const MAX_HISTORY_TURNS_FOR_BACKEND = 6;
+const MAX_HISTORY_TEXT_CHARS = 120;
+
+type TtsResponse = { audioBase64: string; mimeType: string; audioBuffer?: AudioBuffer } | null;
 
 const readBlobAsBase64 = async (blob: Blob): Promise<string> => {
   const reader = new FileReader();
@@ -17,13 +22,72 @@ const readBlobAsBase64 = async (blob: Blob): Promise<string> => {
   });
 };
 
+const truncateText = (value: string, maxChars: number): string => {
+  const normalized = String(value || '').trim().replace(/\s+/g, ' ');
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+};
+
+const compactHistoryForBackend = (history: ChatTurn[]): ChatTurn[] =>
+  history.slice(-MAX_HISTORY_TURNS_FOR_BACKEND).map((turn) => ({
+    role: turn.role,
+    text: truncateText(turn.text, MAX_HISTORY_TEXT_CHARS)
+  }));
+
+const ttsCacheKey = (text: string): string =>
+  String(text || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
 export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
   const [state, dispatch] = useReducer(turnSessionReducer, initialTurnSessionState);
   const stateRef = useRef(state);
+  const ttsCacheRef = useRef<Map<string, Promise<TtsResponse>>>(new Map());
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  const getTtsPromise = useCallback((text: string): Promise<TtsResponse> => {
+    const key = ttsCacheKey(text);
+    const cached = ttsCacheRef.current.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const pending = requestTtsFromBackend(text)
+      .then((audio) => {
+        if (!audio?.audioBase64) {
+          return audio;
+        }
+        try {
+          return {
+            ...audio,
+            audioBuffer: decodePcm16AudioBase64(audio.audioBase64)
+          };
+        } catch {
+          return audio;
+        }
+      })
+      .catch((error) => {
+        console.warn('TTS prefetch failed', error);
+        ttsCacheRef.current.delete(key);
+        return null;
+      });
+
+    ttsCacheRef.current.set(key, pending);
+    return pending;
+  }, []);
+
+  const warmTtsCache = useCallback((options: Option[]) => {
+    if (!USE_BACKEND_PIPELINE) {
+      return;
+    }
+
+    for (const option of options.slice(0, 3)) {
+      void getTtsPromise(option.text);
+    }
+  }, [getTtsPromise]);
 
   const processRecording = useCallback(async (audioBlob: Blob) => {
     if (!activeAssets) {
@@ -31,6 +95,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       return;
     }
 
+    ttsCacheRef.current.clear();
     dispatch({ type: 'START', audioBlob });
 
     try {
@@ -43,8 +108,8 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           storyBrief: activeAssets.storyBrief,
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
-          stylePrimer: activeAssets.stylePrimer.slice(0, 2),
-          history: stateRef.current.conversationHistory
+          stylePrimer: activeAssets.stylePrimer.slice(0, 1),
+          history: compactHistoryForBackend(stateRef.current.conversationHistory)
         });
 
         if (!turnResponse.question) {
@@ -59,6 +124,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           type: 'SET_OPTIONS',
           options: turnResponse.cards.map((card) => ({ ...card, isLoadingImage: false }))
         });
+        warmTtsCache(turnResponse.cards);
         dispatch({ type: 'SET_TIMINGS', timings: turnResponse.timings });
         dispatch({ type: 'SET_STAGE', stage: 'completed' });
         return;
@@ -134,7 +200,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       console.error('Turn pipeline failed', error);
       dispatch({ type: 'SET_ERROR', error: 'Something went wrong processing your request.' });
     }
-  }, [activeAssets]);
+  }, [activeAssets, warmTtsCache]);
 
   const retry = useCallback(() => {
     if (stateRef.current.lastAudioBlob) {
@@ -147,8 +213,10 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
 
     try {
       if (USE_BACKEND_PIPELINE) {
-        const audio = await requestTtsFromBackend(option.text);
-        if (audio?.audioBase64) {
+        const audio = await getTtsPromise(option.text);
+        if (audio?.audioBuffer) {
+          await playAudioBuffer(audio.audioBuffer);
+        } else if (audio?.audioBase64) {
           await playPcm16AudioBase64(audio.audioBase64);
         }
         return;
@@ -158,9 +226,10 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
     } catch (error) {
       console.error('TTS failed', error);
     }
-  }, []);
+  }, [getTtsPromise]);
 
   const resetConversation = useCallback(() => {
+    ttsCacheRef.current.clear();
     dispatch({ type: 'RESET' });
   }, []);
 

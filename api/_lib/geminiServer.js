@@ -5,6 +5,12 @@ const RENDER_MODE_STANDALONE = 'standalone_option_world';
 const STOP_WORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'the', 'to', 'with'
 ]);
+const MAX_OPTION_WORDS = 10;
+const MAX_TTS_WORDS = 10;
+const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
+const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
+const MAX_HISTORY_TEXT_CHARS = 90;
+const MAX_FACT_PROMPT_ITEMS = 8;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -73,6 +79,22 @@ const titleCaseFirst = (text) => {
 };
 
 const normalizePhrase = (value) => String(value || '').trim().replace(/\s+/g, ' ');
+const truncate = (value, maxChars) => {
+  const normalized = normalizePhrase(value);
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+};
+const limitWords = (value, maxWords) => {
+  const normalized = normalizePhrase(value);
+  if (!normalized) return '';
+  const words = normalized.split(' ');
+  if (words.length <= maxWords) {
+    return normalized;
+  }
+  return words.slice(0, maxWords).join(' ');
+};
 
 const normalizeFactList = (items, limit = 10) => {
   if (!Array.isArray(items)) return [];
@@ -198,6 +220,30 @@ const normalizeStoryFacts = (facts, storyBrief) => {
   return normalized;
 };
 
+const compactStoryBriefForPrompt = (storyBrief) =>
+  truncate(storyBrief || '', MAX_STORY_BRIEF_PROMPT_CHARS);
+
+const compactFactsForPrompt = (storyFacts) => {
+  const normalized = normalizeStoryFacts(storyFacts, '');
+  return {
+    setting: truncate(normalized.setting || '', 140),
+    worldTags: normalized.worldTags.slice(0, 6),
+    characters: normalized.characterCatalog.slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      name: truncate(entry.name, 36),
+      source: entry.source
+    })),
+    places: normalized.places.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
+    objects: normalized.objects.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
+    events: normalized.events.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 56))
+  };
+};
+
+const compactHistoryForPrompt = (history) =>
+  (Array.isArray(history) ? history : [])
+    .slice(-MAX_HISTORY_TURNS_FOR_PROMPT)
+    .map((turn) => `${turn.role === 'parent' ? 'Parent' : 'Child'}: ${truncate(turn.text || '', MAX_HISTORY_TEXT_CHARS)}`)
+    .join('\n');
+
 const tokenize = (value) => {
   const text = String(value || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
   return text
@@ -236,10 +282,7 @@ const simplifyOptionText = (text, question) => {
     }
   }
 
-  const words = value.split(' ');
-  if (words.length > 10) {
-    value = words.slice(0, 10).join(' ');
-  }
+  value = limitWords(value, MAX_OPTION_WORDS);
 
   return titleCaseFirst(value);
 };
@@ -361,7 +404,11 @@ const buildFallbackOptions = (question, storyBrief, storyFacts) => {
   ];
 };
 
-const generateCandidates = async (ai, question, historyText, storyBrief, storyFacts) => {
+const generateCandidates = async (ai, question, history, storyBrief, storyFacts) => {
+  const compactStoryBrief = compactStoryBriefForPrompt(storyBrief);
+  const compactStoryFacts = compactFactsForPrompt(storyFacts);
+  const compactHistory = compactHistoryForPrompt(history);
+
   const response = await retryWithBackoff(() =>
     ai.models.generateContent({
       model: 'gemini-3-flash-preview',
@@ -372,9 +419,9 @@ const generateCandidates = async (ai, question, historyText, storyBrief, storyFa
               'You are generating answer candidates for a non-verbal child comprehension activity.',
               'Parent asks the question. Child selects one of 3 options.',
               'Use simple language suitable for ages 3-7.',
-              `Story brief: ${storyBrief}`,
-              `Story facts: ${JSON.stringify(storyFacts)}`,
-              `Conversation:\n${historyText}`,
+              `Story brief: ${compactStoryBrief}`,
+              `Story facts: ${JSON.stringify(compactStoryFacts)}`,
+              `Conversation:\n${compactHistory || 'None yet.'}`,
               `Parent asked: ${question}`,
               'Return JSON with:',
               '- candidate_correct: 3 answer candidates with text and short evidence from the story.',
@@ -897,8 +944,7 @@ export const runTurnPipeline = async (
             text: [
               'Transcribe only the parent question from this audio.',
               'This is a reading comprehension activity for a non-verbal child.',
-              'Return only plain text transcription.',
-              `Story context: ${storyBrief}`
+              'Return only plain text transcription.'
             ].join('\n')
           }
         ]
@@ -926,13 +972,10 @@ export const runTurnPipeline = async (
   }
 
   const optionsStart = performance.now();
-  const historyText = history
-    .map((turn) => `${turn.role === 'parent' ? 'Parent' : 'Child'}: ${turn.text}`)
-    .join('\n');
 
   let candidatePayload;
   try {
-    candidatePayload = await generateCandidates(ai, question, historyText, storyBrief, normalizedFacts);
+    candidatePayload = await generateCandidates(ai, question, history, storyBrief, normalizedFacts);
   } catch {
     candidatePayload = null;
   }
@@ -991,7 +1034,7 @@ export const runTurnPipeline = async (
       const start = performance.now();
       const parts = [];
 
-      for (const ref of stylePrimer.slice(0, 2)) {
+      for (const ref of stylePrimer.slice(0, 1)) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
       }
 
@@ -1006,13 +1049,16 @@ export const runTurnPipeline = async (
       });
 
       try {
-        const imageResponse = await retryWithBackoff(() =>
-          ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: { parts },
-            config: { imageConfig: { aspectRatio: '1:1' } }
-          })
-        , 1, 350);
+        const imageResponse = await retryWithBackoff(
+          () =>
+            ai.models.generateContent({
+              model: 'gemini-2.5-flash-image',
+              contents: { parts },
+              config: { imageConfig: { aspectRatio: '1:1' } }
+            }),
+          1,
+          350
+        );
 
         card.imageUrl = extractImageDataUrl(imageResponse) || undefined;
       } catch (error) {
@@ -1043,18 +1089,22 @@ export const runTurnPipeline = async (
 
 export const synthesizeSpeech = async (text) => {
   const ai = getClient();
+  const normalizedText = limitWords(text, MAX_TTS_WORDS) || 'Okay';
 
-  const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: 'gemini-2.5-flash-preview-tts',
-      contents: { parts: [{ text }] },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+  const response = await retryWithBackoff(
+    () =>
+      ai.models.generateContent({
+        model: 'gemini-2.5-flash-preview-tts',
+        contents: { parts: [{ text: normalizedText }] },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+          }
         }
-      }
-    })
+      }),
+    1,
+    150
   );
 
   const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;

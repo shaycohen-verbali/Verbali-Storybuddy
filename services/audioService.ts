@@ -37,16 +37,25 @@ const pcmToAudioBuffer = (
   return buffer;
 };
 
-export const playPcm16AudioBase64 = async (audioBase64: string): Promise<void> => {
+export const decodePcm16AudioBase64 = (audioBase64: string): AudioBuffer => {
+  const ctx = getAudioContext();
+  const audioBytes = base64ToBytes(audioBase64);
+  return pcmToAudioBuffer(audioBytes, ctx, 24000, 1);
+};
+
+export const playAudioBuffer = async (audioBuffer: AudioBuffer): Promise<void> => {
   const ctx = getAudioContext();
   if (ctx.state === 'suspended') {
     await ctx.resume();
   }
 
-  const audioBytes = base64ToBytes(audioBase64);
-  const audioBuffer = pcmToAudioBuffer(audioBytes, ctx, 24000, 1);
   const source = ctx.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(ctx.destination);
   source.start();
+};
+
+export const playPcm16AudioBase64 = async (audioBase64: string): Promise<void> => {
+  const audioBuffer = decodePcm16AudioBase64(audioBase64);
+  await playAudioBuffer(audioBuffer);
 };
