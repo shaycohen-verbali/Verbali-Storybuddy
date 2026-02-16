@@ -11,9 +11,18 @@ import { useLibrary } from './hooks/useLibrary';
 import { useStorySetup } from './hooks/useStorySetup';
 import { useTurnPipeline } from './hooks/useTurnPipeline';
 
+interface SetupViewState {
+  readOnly: boolean;
+  title?: string;
+  storyFile?: FileData | null;
+  styleImages?: FileData[];
+  storyPack?: StoryPack | null;
+}
+
 const App: React.FC = () => {
   const [hasApiKey, setHasApiKey] = useState(USE_BACKEND_PIPELINE);
   const [currentMode, setCurrentMode] = useState<AppMode>(AppMode.LIBRARY);
+  const [setupView, setSetupView] = useState<SetupViewState | null>(null);
   const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
   const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
@@ -68,12 +77,45 @@ const App: React.FC = () => {
     try {
       await selectStory(story);
       resetConversation();
+      setSetupView(null);
       setCurrentMode(AppMode.STORY);
     } catch (error) {
       console.error('Failed to select story', error);
       alert('Failed to load story. Please try again.');
     }
   }, [resetConversation, selectStory]);
+
+  const handleOpenStorySetup = useCallback(async (story: StoryManifest) => {
+    try {
+      const assets = await selectStory(story);
+      setSetupView({
+        readOnly: true,
+        title: story.title,
+        storyFile: assets.pdfData || null,
+        styleImages: assets.stylePrimer,
+        storyPack: {
+          summary: assets.metadata.summary || story.summary,
+          artStyle: assets.metadata.artStyle || story.artStyle,
+          storyBrief: assets.storyBrief,
+          storyFacts: assets.metadata.storyFacts || {
+            characters: [],
+            characterCatalog: [],
+            places: [],
+            objects: [],
+            events: [],
+            setting: assets.storyBrief,
+            worldTags: []
+          },
+          coverImage: story.coverImage || null,
+          stylePrimer: assets.stylePrimer
+        }
+      });
+      setCurrentMode(AppMode.SETUP);
+    } catch (error) {
+      console.error('Failed to open setup view', error);
+      alert('Failed to open setup view. Please try again.');
+    }
+  }, [selectStory]);
 
   const handleDeleteStory = useCallback(async (id: string) => {
     if (!confirm('Are you sure you want to delete this story?')) {
@@ -123,6 +165,7 @@ const App: React.FC = () => {
 
     await saveNewStory(manifest, assets);
     resetConversation();
+    setSetupView(null);
     setCurrentMode(AppMode.STORY);
   }, [resetConversation, saveNewStory]);
 
@@ -182,8 +225,12 @@ const App: React.FC = () => {
           <Library
             stories={stories}
             onSelectStory={handleStorySelect}
+            onOpenSetup={handleOpenStorySetup}
             onDeleteStory={handleDeleteStory}
-            onAddNew={() => setCurrentMode(AppMode.SETUP)}
+            onAddNew={() => {
+              setSetupView(null);
+              setCurrentMode(AppMode.SETUP);
+            }}
           />
         )}
 
@@ -251,7 +298,15 @@ const App: React.FC = () => {
         <SetupPanel
           onPrepareStory={prepareStory}
           onComplete={handleSetupComplete}
-          onClose={() => setCurrentMode(AppMode.LIBRARY)}
+          onStartFromSetup={() => {
+            resetConversation();
+            setCurrentMode(AppMode.STORY);
+          }}
+          initialView={setupView}
+          onClose={() => {
+            setSetupView(null);
+            setCurrentMode(AppMode.LIBRARY);
+          }}
         />
       )}
     </div>

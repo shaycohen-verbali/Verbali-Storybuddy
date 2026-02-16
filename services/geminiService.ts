@@ -80,8 +80,8 @@ const simplifyOptionText = (text: string, question: string): string => {
   }
 
   const words = value.split(" ");
-  if (words.length > 4) {
-    value = words.slice(0, 4).join(" ");
+  if (words.length > 10) {
+    value = words.slice(0, 10).join(" ");
   }
 
   return value.charAt(0).toUpperCase() + value.slice(1);
@@ -350,7 +350,7 @@ export const generateAnswerOptions = async (
       The parent just asked: "${question}"
       ${historyText}
       Use simple child language (age 3-7), no advanced vocabulary.
-      Task: Return exactly 3 short answers (under 4 words each).
+      Task: Return exactly 3 short answers (up to 10 words each).
       Exactly ONE answer must be correct based on the story.
       The other TWO must be clearly incorrect but plausible distractors.
       For "Where" questions, use location phrases like "In the ocean", "At home", or "At school".
@@ -434,7 +434,7 @@ export const generateIllustration = async (
   // Add style references
   // Prioritize explicit style images, fallback to story PDF
   if (styleImages.length > 0) {
-      styleImages.forEach((img) => {
+      styleImages.slice(0, 2).forEach((img) => {
           parts.push({
               inlineData: {
                   mimeType: img.mimeType,

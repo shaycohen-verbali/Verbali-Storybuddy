@@ -18,7 +18,7 @@ export const useLibrary = () => {
     });
   }, [refreshStories]);
 
-  const selectStory = useCallback(async (manifest: StoryManifest) => {
+  const selectStory = useCallback(async (manifest: StoryManifest): Promise<StoryAssets> => {
     const assets = await StorageService.getStoryAssets(manifest.id);
     if (!assets) {
       throw new Error('Story assets not found.');
@@ -26,6 +26,7 @@ export const useLibrary = () => {
 
     setActiveManifest(manifest);
     setActiveAssets(assets);
+    return assets;
   }, []);
 
   const saveNewStory = useCallback(async (manifest: StoryManifest, assets: StoryAssets) => {

@@ -237,8 +237,8 @@ const simplifyOptionText = (text, question) => {
   }
 
   const words = value.split(' ');
-  if (words.length > 4) {
-    value = words.slice(0, 4).join(' ');
+  if (words.length > 10) {
+    value = words.slice(0, 10).join(' ');
   }
 
   return titleCaseFirst(value);
@@ -382,7 +382,7 @@ const generateCandidates = async (ai, question, historyText, storyBrief, storyFa
               '- not_answerable: true only when the question is not supported by book facts.',
               'Rules:',
               '1) Candidate correct options should be directly grounded in story facts.',
-              '2) Distractors should stay short and child-friendly.',
+              '2) Distractors should stay short and child-friendly (max 10 words).',
               '3) For "Where" questions, format options like "In the ocean" or "At school".',
               '4) Output strict JSON only.'
             ].join('\n')
@@ -487,49 +487,7 @@ const selectDistractors = ({
   return selected;
 };
 
-const regenerateDistractors = async (ai, question, storyBrief, storyFacts, correctOption) => {
-  const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: {
-        parts: [
-          {
-            text: [
-              'Generate 6 short wrong answer options for a non-verbal child.',
-              'Keep language very simple.',
-              `Question: ${question}`,
-              `Correct answer: ${correctOption}`,
-              `Story brief: ${storyBrief}`,
-              `Story facts: ${JSON.stringify(storyFacts)}`,
-              'Rules:',
-              '1) Every option must be WRONG for this question.',
-              '2) Do not repeat the correct answer.',
-              '3) For "Where" questions, use short location phrases.',
-              'Return strict JSON array of strings.'
-            ].join('\n')
-          }
-        ]
-      },
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
-        },
-        thinkingConfig: { thinkingBudget: 0 }
-      }
-    })
-  );
-
-  try {
-    const parsed = JSON.parse(response.text || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
-
-const buildFinalOptions = async ({ ai, question, storyBrief, storyFacts, candidatePayload }) => {
+const buildFinalOptions = ({ question, storyBrief, storyFacts, candidatePayload }) => {
   const fallback = buildFallbackOptions(question, storyBrief, storyFacts);
 
   if (candidatePayload?.not_answerable) {
@@ -573,35 +531,7 @@ const buildFinalOptions = async ({ ai, question, storyBrief, storyFacts, candida
     correctSupport: selectedCorrect.supportLevel
   });
 
-  let regenerationCount = 0;
-
-  if (distractors.length < 2) {
-    regenerationCount = 1;
-    const regenerated = await regenerateDistractors(ai, question, storyBrief, storyFacts, selectedCorrect.text);
-
-    const fromRegeneration = selectDistractors({
-      candidates: regenerated,
-      question,
-      storyBrief,
-      storyFacts,
-      correctCanonical,
-      correctSupport: selectedCorrect.supportLevel
-    });
-
-    const combined = [...distractors, ...fromRegeneration];
-    const deduped = [];
-    const seen = new Set();
-
-    for (const option of combined) {
-      const key = canonicalOption(option.text);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      deduped.push(option);
-      if (deduped.length === 2) break;
-    }
-
-    distractors = deduped;
-  }
+  const regenerationCount = distractors.length < 2 ? 1 : 0;
 
   if (distractors.length < 2) {
     const fallbackDistractors = fallback.filter((item) => !item.isCorrect);
@@ -687,10 +617,17 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
 };
 
 const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts }) => {
-  const allowedCharacters = (storyFacts?.characterCatalog || [])
-    .map((entry) => normalizePhrase(entry?.name))
+  const allowedCharacterEntries = (storyFacts?.characterCatalog || [])
+    .map((entry) => ({
+      name: normalizePhrase(entry?.name),
+      source: normalizeCharacterSource(entry?.source)
+    }))
+    .filter((entry) => entry.name);
+  const allowedCharacters = allowedCharacterEntries
+    .map((entry) => entry.name)
     .filter(Boolean)
     .slice(0, 12);
+  const primaryCharacter = allowedCharacters[0] || '';
   const normalizedOption = canonicalOption(optionText);
   const optionUsesKnownCharacter = allowedCharacters.some((name) => {
     const normalizedName = canonicalOption(name);
@@ -699,15 +636,19 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
 
   const characterRules = allowedCharacters.length > 0
     ? [
-        `- Allowed characters from this book only: ${allowedCharacters.join(', ')}.`,
-        '- Never invent new people, animals, or creatures that are not in the allowed list.',
+        `- Allowed characters from this book only: ${allowedCharacterEntries.map((entry) => `${entry.name} (${entry.source})`).join(', ')}.`,
+        '- Never invent new people, animals, fish, or creatures not in the allowed list.',
+        '- If a character is needed, use only one of the allowed characters.',
         optionUsesKnownCharacter
-          ? '- If a character is shown, prioritize the matching allowed character.'
-          : '- If the option is about a place/object, avoid adding extra characters.'
+          ? '- The matching allowed character must be visually recognizable.'
+          : '- For place/object options, draw zero characters unless absolutely required.',
+        !optionUsesKnownCharacter && primaryCharacter
+          ? `- If the scene needs a character, use "${primaryCharacter}" only.`
+          : '- If the scene needs a character, use only one allowed character.'
       ]
     : [
-        '- Do not invent any named characters.',
-        '- Prefer object/location-only scenes when possible.'
+        '- Do not invent any characters.',
+        '- Prefer object/location-only scenes.'
       ];
 
   const styleLayer = [
@@ -993,8 +934,7 @@ export const runTurnPipeline = async (
     candidatePayload = null;
   }
 
-  const { options: resolvedOptions, regenerationCount } = await buildFinalOptions({
-    ai,
+  const { options: resolvedOptions, regenerationCount } = buildFinalOptions({
     question,
     storyBrief,
     storyFacts: normalizedFacts,
@@ -1048,7 +988,7 @@ export const runTurnPipeline = async (
       const start = performance.now();
       const parts = [];
 
-      for (const ref of stylePrimer.slice(0, 4)) {
+      for (const ref of stylePrimer.slice(0, 2)) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
       }
 
@@ -1069,7 +1009,7 @@ export const runTurnPipeline = async (
             contents: { parts },
             config: { imageConfig: { aspectRatio: '1:1' } }
           })
-        );
+        , 1, 350);
 
         card.imageUrl = extractImageDataUrl(imageResponse) || undefined;
       } catch (error) {

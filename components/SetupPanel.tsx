@@ -1,11 +1,21 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
 import { FileData, SetupStoryResponse, StoryPack } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
 
+interface SetupInitialView {
+  readOnly?: boolean;
+  title?: string;
+  storyFile?: FileData | null;
+  styleImages?: FileData[];
+  storyPack?: StoryPack | null;
+}
+
 interface SetupPanelProps {
   onPrepareStory: (storyFile: FileData, styleImages: FileData[]) => Promise<SetupStoryResponse>;
   onComplete: (storyFile: FileData, styleImages: FileData[], storyPack: StoryPack) => void;
+  onStartFromSetup?: () => void;
+  initialView?: SetupInitialView | null;
   onClose: () => void;
 }
 
@@ -51,7 +61,13 @@ const compressImageFile = async (file: File): Promise<FileData> => {
   return parseDataUrl(canvas.toDataURL('image/jpeg', 0.78));
 };
 
-const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onClose }) => {
+const SetupPanel: React.FC<SetupPanelProps> = ({
+  onPrepareStory,
+  onComplete,
+  onStartFromSetup,
+  initialView,
+  onClose
+}) => {
   const storyInputRef = useRef<HTMLInputElement>(null);
   const styleInputRef = useRef<HTMLInputElement>(null);
 
@@ -61,9 +77,33 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
   const [currentStory, setCurrentStory] = useState<FileData | null>(null);
   const [styleReferences, setStyleReferences] = useState<FileData[]>([]);
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
+  const isReadOnly = Boolean(initialView?.readOnly);
+  const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+
+  useEffect(() => {
+    if (!initialView) {
+      setCurrentStory(null);
+      setStyleReferences([]);
+      setPreparedPack(null);
+      setErrorMsg(null);
+      setIsProcessing(false);
+      return;
+    }
+
+    setCurrentStory(initialView.storyFile || null);
+    setStyleReferences(initialView.styleImages || []);
+    setPreparedPack(initialView.storyPack || null);
+    setErrorMsg(null);
+    setIsProcessing(false);
+  }, [initialView]);
+
   const maxPdfSizeBytes = USE_BACKEND_PIPELINE ? 3 * 1024 * 1024 : 50 * 1024 * 1024;
 
   const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isReadOnly) {
+      return;
+    }
+
     const file = e.target.files?.[0];
     if (!file) {
       return;
@@ -107,6 +147,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
   };
 
   const handleStyleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (isReadOnly) {
+      return;
+    }
+
     const files = e.target.files;
     if (!files || files.length === 0) {
       return;
@@ -126,10 +170,19 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
   };
 
   const removeStyleImage = (index: number) => {
+    if (isReadOnly) {
+      return;
+    }
+
     setStyleReferences((prev) => prev.filter((_, i) => i !== index));
   };
 
   const handleFinish = () => {
+    if (isReadOnly) {
+      onStartFromSetup?.();
+      return;
+    }
+
     if (!currentStory || !preparedPack) {
       return;
     }
@@ -144,6 +197,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
 
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
+  const hasAnalysis = Boolean(summary) || isReadOnly;
 
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -152,8 +206,11 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
           <div>
             <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
               <BookOpen className="w-6 h-6 text-kid-blue" />
-              Prepare Story
+              {isReadOnly ? 'Story Setup' : 'Prepare Story'}
             </h2>
+            {isReadOnly && initialView?.title && (
+              <p className="text-sm text-gray-500 mt-1">{initialView.title}</p>
+            )}
           </div>
           <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full text-gray-400 transition">
             <X className="w-6 h-6" />
@@ -176,7 +233,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
                   Upload Story
                 </h3>
 
-                {!currentStory ? (
+                {!currentStory && !isReadOnly ? (
                   <div
                     onClick={() => storyInputRef.current?.click()}
                     className="border-2 border-dashed border-gray-300 rounded-xl p-8 flex flex-col items-center justify-center cursor-pointer hover:bg-blue-50 hover:border-kid-blue transition group"
@@ -185,24 +242,30 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
                     <span className="text-gray-500 font-medium">Click to upload PDF</span>
                     <input type="file" ref={storyInputRef} onChange={handleStoryUpload} className="hidden" accept=".pdf" />
                   </div>
-                ) : (
+                ) : currentStory ? (
                   <div className="flex items-center gap-3 p-4 bg-blue-50 text-kid-blue rounded-xl border border-blue-100">
                     <CheckCircle className="w-5 h-5" />
-                    <span className="font-bold">PDF Uploaded</span>
-                    <button
-                      onClick={() => {
-                        setCurrentStory(null);
-                        setPreparedPack(null);
-                      }}
-                      className="ml-auto text-xs underline"
-                    >
-                      Change
-                    </button>
+                    <span className="font-bold">{isReadOnly ? 'Book Loaded' : 'PDF Uploaded'}</span>
+                    {!isReadOnly && (
+                      <button
+                        onClick={() => {
+                          setCurrentStory(null);
+                          setPreparedPack(null);
+                        }}
+                        className="ml-auto text-xs underline"
+                      >
+                        Change
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="p-4 bg-gray-50 rounded-xl border border-gray-200 text-sm text-gray-500">
+                    No original PDF stored for this story.
                   </div>
                 )}
               </section>
 
-              {(isProcessing || summary) && (
+              {(isProcessing || hasAnalysis) && (
                 <section className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 animate-fade-in-up">
                   <h3 className="text-lg font-bold text-gray-700 mb-4 flex items-center gap-2">
                     <span className="bg-kid-orange text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">2</span>
@@ -229,13 +292,31 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
                           </div>
                         </div>
                       )}
+
+                      <div>
+                        <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Character Mapping</label>
+                        {characterCatalog.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {characterCatalog.map((character) => (
+                              <span
+                                key={`${character.name}-${character.source}`}
+                                className="px-3 py-1 rounded-full bg-kid-teal/10 text-kid-teal text-xs font-bold"
+                              >
+                                {character.name} ({character.source})
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 mt-1">No characters mapped yet.</p>
+                        )}
+                      </div>
                     </div>
                   )}
                 </section>
               )}
             </div>
 
-            <div className={`space-y-6 transition-opacity duration-500 ${!summary ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
+            <div className={`space-y-6 transition-opacity duration-500 ${!hasAnalysis ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
               <section className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 h-full flex flex-col">
                 <h3 className="text-lg font-bold text-gray-700 mb-2 flex items-center gap-2">
                   <span className="bg-kid-pink text-white w-6 h-6 rounded-full flex items-center justify-center text-xs">3</span>
@@ -249,28 +330,32 @@ const SetupPanel: React.FC<SetupPanelProps> = ({ onPrepareStory, onComplete, onC
                   {styleReferences.map((style, idx) => (
                     <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
                       <img src={`data:${style.mimeType};base64,${style.data}`} className="w-full h-full object-cover" />
-                      <button
-                        onClick={() => removeStyleImage(idx)}
-                        className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
+                      {!isReadOnly && (
+                        <button
+                          onClick={() => removeStyleImage(idx)}
+                          className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
                     </div>
                   ))}
-                  <button
-                    onClick={() => styleInputRef.current?.click()}
-                    className="aspect-square rounded-xl border-2 border-dashed border-gray-300 flex flex-col items-center justify-center text-gray-400 hover:border-kid-pink hover:text-kid-pink hover:bg-pink-50 transition"
-                  >
-                    <Upload className="w-6 h-6 mb-1" />
-                    <span className="text-xs font-bold">Add Image</span>
-                  </button>
+                  {!isReadOnly && (
+                    <button
+                      onClick={() => styleInputRef.current?.click()}
+                      className="aspect-square rounded-xl border-2 border-dashed border-gray-300 flex flex-col items-center justify-center text-gray-400 hover:border-kid-pink hover:text-kid-pink hover:bg-pink-50 transition"
+                    >
+                      <Upload className="w-6 h-6 mb-1" />
+                      <span className="text-xs font-bold">Add Image</span>
+                    </button>
+                  )}
                   <input type="file" ref={styleInputRef} onChange={handleStyleUpload} className="hidden" accept="image/*" multiple />
                 </div>
 
                 <div className="mt-auto pt-6 border-t border-gray-100">
                   <button
                     onClick={handleFinish}
-                    disabled={!summary}
+                    disabled={!isReadOnly && !summary}
                     className="w-full py-4 bg-kid-blue text-white font-bold rounded-xl shadow-lg hover:bg-blue-600 transition flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <BookOpen className="w-5 h-5" /> Start Story
