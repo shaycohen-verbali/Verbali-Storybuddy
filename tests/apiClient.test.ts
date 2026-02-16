@@ -11,11 +11,19 @@ describe('apiClient', () => {
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({
+        text: async () => JSON.stringify({
           storyPack: {
             summary: 'A short story',
             artStyle: 'watercolor cartoon',
             storyBrief: 'brief',
+            storyFacts: {
+              characters: ['Milo'],
+              places: ['ocean reef'],
+              objects: ['shell'],
+              events: ['Milo finds a shell'],
+              setting: 'An underwater reef school.',
+              worldTags: ['ocean']
+            },
             coverImage: null,
             stylePrimer: []
           },
@@ -31,6 +39,7 @@ describe('apiClient', () => {
     });
 
     expect(response.storyPack.summary).toBe('A short story');
+    expect(response.storyPack.storyFacts.places[0]).toBe('ocean reef');
     expect(response.timings.totalMs).toBe(30);
   });
 
@@ -39,12 +48,12 @@ describe('apiClient', () => {
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
-        json: async () => ({
+        text: async () => JSON.stringify({
           question: 'What happened?',
           cards: [
-            { id: 'opt-0', text: 'He ran', isLoadingImage: false },
-            { id: 'opt-1', text: 'He slept', isLoadingImage: false },
-            { id: 'opt-2', text: 'He flew', isLoadingImage: false }
+            { id: 'opt-0', text: 'He ran', isLoadingImage: false, renderMode: 'blend_with_story_world' },
+            { id: 'opt-1', text: 'He slept', isLoadingImage: false, renderMode: 'standalone_option_world' },
+            { id: 'opt-2', text: 'He flew', isLoadingImage: false, renderMode: 'standalone_option_world' }
           ],
           timings: {
             transcribeMs: 100,
@@ -62,6 +71,14 @@ describe('apiClient', () => {
       audioBase64: 'abc',
       mimeType: 'audio/webm',
       storyBrief: 'brief',
+      storyFacts: {
+        characters: ['Milo'],
+        places: ['reef'],
+        objects: [],
+        events: [],
+        setting: 'Ocean reef',
+        worldTags: ['ocean']
+      },
       artStyle: 'style',
       stylePrimer: [],
       history: []

@@ -1,5 +1,11 @@
 import { GoogleGenAI, Modality, Type } from '@google/genai';
 
+const RENDER_MODE_BLEND = 'blend_with_story_world';
+const RENDER_MODE_STANDALONE = 'standalone_option_world';
+const STOP_WORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'the', 'to', 'with'
+]);
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const retryWithBackoff = async (fn, retries = 4, delayMs = 1000) => {
@@ -51,29 +57,43 @@ const toFileDataFromDataUrl = (dataUrl) => {
   };
 };
 
-const normalizeJsonArray = (text) => {
-  let cleaned = text || '[]';
-  const firstOpen = cleaned.indexOf('[');
-  const lastClose = cleaned.lastIndexOf(']');
-  if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-    cleaned = cleaned.substring(firstOpen, lastClose + 1);
-  } else {
-    cleaned = cleaned.replace(/```json/g, '').replace(/```/g, '').trim();
-  }
-
+const parseJsonSafe = (rawText, fallback) => {
   try {
-    const parsed = JSON.parse(cleaned);
-    if (Array.isArray(parsed)) {
-      return parsed.filter((item) => typeof item === 'string').slice(0, 3);
-    }
+    return JSON.parse(rawText || '');
   } catch {
-    // Fall through to default.
+    return fallback;
   }
-
-  return ['Yes', 'No', 'Maybe'];
 };
 
 const isWhereQuestion = (question) => /^\s*where\b/i.test(question || '');
+
+const titleCaseFirst = (text) => {
+  if (!text) return text;
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+const normalizePhrase = (value) => String(value || '').trim().replace(/\s+/g, ' ');
+
+const normalizeFactList = (items, limit = 10) => {
+  if (!Array.isArray(items)) return [];
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const item of items) {
+    const cleaned = normalizePhrase(item);
+    if (!cleaned) continue;
+
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    unique.push(cleaned);
+    if (unique.length >= limit) break;
+  }
+
+  return unique;
+};
 
 const inferLocationFromStory = (storyBrief) => {
   const brief = (storyBrief || '').toLowerCase();
@@ -85,17 +105,82 @@ const inferLocationFromStory = (storyBrief) => {
   if (/(farm|barn)/.test(brief)) return 'On a farm';
   if (/(city|town|street)/.test(brief)) return 'In the city';
   if (/(cave)/.test(brief)) return 'In a cave';
-  return 'In the ocean';
+  return 'In the story setting';
 };
 
-const titleCaseFirst = (text) => {
-  if (!text) return text;
-  return text.charAt(0).toUpperCase() + text.slice(1);
+const inferWorldTagsFromText = (text) => {
+  const value = (text || '').toLowerCase();
+  const tags = [];
+
+  if (/(ocean|sea|reef|underwater|coral|shark|whale|fish)/.test(value)) tags.push('ocean');
+  if (/(forest|woods|jungle|tree)/.test(value)) tags.push('forest');
+  if (/(school|classroom|teacher)/.test(value)) tags.push('school');
+  if (/(home|house|kitchen|bedroom)/.test(value)) tags.push('home');
+  if (/(playground|park|slide|swing)/.test(value)) tags.push('playground');
+  if (/(beach|shore|coast|sand)/.test(value)) tags.push('beach');
+  if (/(city|town|street)/.test(value)) tags.push('city');
+
+  return [...new Set(tags)];
+};
+
+const normalizeStoryFacts = (facts, storyBrief) => {
+  const normalized = {
+    characters: normalizeFactList(facts?.characters, 12),
+    places: normalizeFactList(facts?.places, 12),
+    objects: normalizeFactList(facts?.objects, 12),
+    events: normalizeFactList(facts?.events, 14),
+    setting: normalizePhrase(facts?.setting || storyBrief || inferLocationFromStory(storyBrief)),
+    worldTags: normalizeFactList(facts?.worldTags || facts?.world_tags || [], 8).map((item) => item.toLowerCase())
+  };
+
+  if (!normalized.setting) {
+    normalized.setting = inferLocationFromStory(storyBrief);
+  }
+
+  if (normalized.places.length === 0) {
+    normalized.places.push(inferLocationFromStory(storyBrief).replace(/^(In|On|At)\s+/i, ''));
+  }
+
+  if (normalized.worldTags.length === 0) {
+    const derived = inferWorldTagsFromText(
+      [normalized.setting, ...normalized.places, ...normalized.events].join(' | ')
+    );
+    normalized.worldTags = derived;
+  }
+
+  return normalized;
+};
+
+const tokenize = (value) => {
+  const text = String(value || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  return text
+    .split(/\s+/)
+    .filter((token) => token && token.length > 1 && !STOP_WORDS.has(token));
+};
+
+const canonicalOption = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/^(in|on|at)\s+/i, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const shuffle = (array) => {
+  const output = [...array];
+  for (let i = output.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [output[i], output[j]] = [output[j], output[i]];
+  }
+  return output;
 };
 
 const simplifyOptionText = (text, question) => {
-  let value = String(text || '').trim().replace(/[.?!]+$/g, '').replace(/\s+/g, ' ');
+  let value = normalizePhrase(text).replace(/[.?!]+$/g, '');
   if (!value) return value;
+  if (/^not in this book$/i.test(value)) {
+    return 'Not in this book';
+  }
 
   if (isWhereQuestion(question)) {
     value = value.replace(/^(a|an|the)\s+/i, '');
@@ -112,57 +197,476 @@ const simplifyOptionText = (text, question) => {
   return titleCaseFirst(value);
 };
 
-const buildFallbackOptions = (question, storyBrief) => {
+const getAllFactPhrases = (storyFacts) => [
+  ...(storyFacts?.characters || []),
+  ...(storyFacts?.places || []),
+  ...(storyFacts?.objects || []),
+  ...(storyFacts?.events || []),
+  storyFacts?.setting || ''
+].filter(Boolean);
+
+const computeSupportLevel = (candidateText, evidenceText, storyFacts, question, storyBrief) => {
+  const text = `${candidateText || ''} ${evidenceText || ''}`.trim();
+  if (!text) return 0;
+
+  const candidateCanonical = canonicalOption(candidateText);
+  if (!candidateCanonical) return 0;
+  const candidateTokens = tokenize(text);
+  const storyTokens = tokenize(storyBrief || '');
+  const factPhrases = getAllFactPhrases(storyFacts);
+  const factTokens = tokenize(factPhrases.join(' '));
+
+  const candidateSet = new Set(candidateTokens);
+  const factSet = new Set(factTokens);
+  const storySet = new Set(storyTokens);
+
+  let score = 0;
+
+  const phraseMatches = factPhrases.filter((phrase) => {
+    const normalizedPhrase = canonicalOption(phrase);
+    return normalizedPhrase && (normalizedPhrase.includes(candidateCanonical) || candidateCanonical.includes(normalizedPhrase));
+  });
+
+  if (phraseMatches.length > 0) {
+    score += 35;
+  }
+
+  let overlap = 0;
+  for (const token of candidateSet) {
+    if (factSet.has(token)) overlap += 1;
+  }
+  score += Math.min(overlap * 8, 32);
+
+  let briefOverlap = 0;
+  for (const token of candidateSet) {
+    if (storySet.has(token)) briefOverlap += 1;
+  }
+  score += Math.min(briefOverlap * 4, 16);
+
   if (isWhereQuestion(question)) {
+    const placeMatches = (storyFacts?.places || []).some((place) =>
+      canonicalOption(place).includes(candidateCanonical) || candidateCanonical.includes(canonicalOption(place))
+    );
+
+    if (placeMatches) {
+      score += 20;
+    }
+
+    if (/^(in|on|at)\s+/i.test(String(candidateText || ''))) {
+      score += 6;
+    }
+  }
+
+  if (/not in this book/i.test(String(candidateText || ''))) {
+    score = Math.max(score, 12);
+  }
+
+  return Math.max(0, Math.min(100, score));
+};
+
+const buildFallbackOptions = (question, storyBrief, storyFacts) => {
+  if (isWhereQuestion(question)) {
+    const bestPlace = storyFacts?.places?.[0]
+      ? simplifyOptionText(`In ${storyFacts.places[0]}`, question)
+      : inferLocationFromStory(storyBrief);
+
     return [
-      { text: inferLocationFromStory(storyBrief), isCorrect: true },
-      { text: 'In space', isCorrect: false },
-      { text: 'In the desert', isCorrect: false }
+      {
+        text: bestPlace,
+        isCorrect: true,
+        supportLevel: 80,
+        evidence: 'Fallback location inferred from story facts.'
+      },
+      {
+        text: 'In space',
+        isCorrect: false,
+        supportLevel: 8,
+        evidence: ''
+      },
+      {
+        text: 'In the desert',
+        isCorrect: false,
+        supportLevel: 10,
+        evidence: ''
+      }
     ];
   }
 
   return [
-    { text: 'Not in this book', isCorrect: true },
-    { text: 'Maybe', isCorrect: false },
-    { text: 'No idea', isCorrect: false }
+    {
+      text: 'Not in this book',
+      isCorrect: true,
+      supportLevel: 15,
+      evidence: 'Question appears unsupported by the book facts.'
+    },
+    {
+      text: 'Maybe',
+      isCorrect: false,
+      supportLevel: 5,
+      evidence: ''
+    },
+    {
+      text: 'No idea',
+      isCorrect: false,
+      supportLevel: 5,
+      evidence: ''
+    }
   ];
 };
 
-const normalizeOptionSet = (rawText, question, storyBrief) => {
-  const fallback = buildFallbackOptions(question, storyBrief);
+const generateCandidates = async (ai, question, historyText, storyBrief, storyFacts) => {
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: {
+        parts: [
+          {
+            text: [
+              'You are generating answer candidates for a non-verbal child comprehension activity.',
+              'Parent asks the question. Child selects one of 3 options.',
+              'Use simple language suitable for ages 3-7.',
+              `Story brief: ${storyBrief}`,
+              `Story facts: ${JSON.stringify(storyFacts)}`,
+              `Conversation:\n${historyText}`,
+              `Parent asked: ${question}`,
+              'Return JSON with:',
+              '- candidate_correct: 3 answer candidates with text and short evidence from the story.',
+              '- distractor_candidates: 6 short wrong options (still plausible choices).',
+              '- not_answerable: true only when the question is not supported by book facts.',
+              'Rules:',
+              '1) Candidate correct options should be directly grounded in story facts.',
+              '2) Distractors should stay short and child-friendly.',
+              '3) For "Where" questions, format options like "In the ocean" or "At school".',
+              '4) Output strict JSON only.'
+            ].join('\n')
+          }
+        ]
+      },
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            candidate_correct: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  text: { type: Type.STRING },
+                  evidence: { type: Type.STRING }
+                },
+                required: ['text', 'evidence']
+              }
+            },
+            distractor_candidates: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            not_answerable: { type: Type.BOOLEAN }
+          },
+          required: ['candidate_correct', 'distractor_candidates', 'not_answerable']
+        },
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    })
+  );
+
+  return parseJsonSafe(response.text, {
+    candidate_correct: [],
+    distractor_candidates: [],
+    not_answerable: false
+  });
+};
+
+const scoreCorrectCandidates = (candidates, question, storyBrief, storyFacts) => {
+  const unique = [];
+  const seen = new Set();
+
+  for (const candidate of candidates || []) {
+    const simplified = simplifyOptionText(candidate?.text, question);
+    const canonical = canonicalOption(simplified);
+    if (!simplified || !canonical || seen.has(canonical)) continue;
+
+    seen.add(canonical);
+    const supportLevel = computeSupportLevel(simplified, candidate?.evidence || '', storyFacts, question, storyBrief);
+
+    unique.push({
+      text: simplified,
+      evidence: normalizePhrase(candidate?.evidence || ''),
+      supportLevel
+    });
+  }
+
+  unique.sort((a, b) => b.supportLevel - a.supportLevel);
+  return unique;
+};
+
+const selectDistractors = ({
+  candidates,
+  question,
+  storyBrief,
+  storyFacts,
+  correctCanonical,
+  correctSupport
+}) => {
+  const selected = [];
+  const seen = new Set([correctCanonical]);
+
+  for (const rawCandidate of candidates || []) {
+    const text = simplifyOptionText(rawCandidate, question);
+    const canonical = canonicalOption(text);
+    if (!text || !canonical || seen.has(canonical)) continue;
+
+    const supportLevel = computeSupportLevel(text, '', storyFacts, question, storyBrief);
+    const tooSupported = supportLevel >= Math.max(60, correctSupport - 8);
+
+    if (tooSupported) {
+      continue;
+    }
+
+    selected.push({
+      text,
+      isCorrect: false,
+      supportLevel,
+      evidence: ''
+    });
+    seen.add(canonical);
+
+    if (selected.length === 2) {
+      break;
+    }
+  }
+
+  return selected;
+};
+
+const regenerateDistractors = async (ai, question, storyBrief, storyFacts, correctOption) => {
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: {
+        parts: [
+          {
+            text: [
+              'Generate 6 short wrong answer options for a non-verbal child.',
+              'Keep language very simple.',
+              `Question: ${question}`,
+              `Correct answer: ${correctOption}`,
+              `Story brief: ${storyBrief}`,
+              `Story facts: ${JSON.stringify(storyFacts)}`,
+              'Rules:',
+              '1) Every option must be WRONG for this question.',
+              '2) Do not repeat the correct answer.',
+              '3) For "Where" questions, use short location phrases.',
+              'Return strict JSON array of strings.'
+            ].join('\n')
+          }
+        ]
+      },
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
+        },
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    })
+  );
 
   try {
-    const parsed = JSON.parse(rawText || '{}');
-    const options = Array.isArray(parsed?.options) ? parsed.options : [];
-    const mapped = options
-      .map((opt) => ({
-        text: simplifyOptionText(opt?.text, question),
-        isCorrect: Boolean(opt?.is_correct)
-      }))
-      .filter((opt) => opt.text.length > 0)
-      .slice(0, 3);
-
-    if (mapped.length !== 3) {
-      return fallback;
-    }
-
-    const correctCount = mapped.filter((opt) => opt.isCorrect).length;
-    if (correctCount !== 1) {
-      mapped[0].isCorrect = true;
-      mapped[1].isCorrect = false;
-      mapped[2].isCorrect = false;
-    }
-
-    // Shuffle to avoid always placing the correct answer first.
-    for (let i = mapped.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [mapped[i], mapped[j]] = [mapped[j], mapped[i]];
-    }
-
-    return mapped;
+    const parsed = JSON.parse(response.text || '[]');
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return fallback;
+    return [];
   }
+};
+
+const buildFinalOptions = async ({ ai, question, storyBrief, storyFacts, candidatePayload }) => {
+  const fallback = buildFallbackOptions(question, storyBrief, storyFacts);
+
+  if (candidatePayload?.not_answerable) {
+    return {
+      options: [
+        {
+          text: 'Not in this book',
+          isCorrect: true,
+          supportLevel: 20,
+          evidence: 'Model marked this question as unsupported by the book.'
+        },
+        ...fallback.filter((item) => !item.isCorrect).slice(0, 2)
+      ],
+      regenerationCount: 0
+    };
+  }
+
+  const scoredCandidates = scoreCorrectCandidates(
+    candidatePayload?.candidate_correct,
+    question,
+    storyBrief,
+    storyFacts
+  );
+
+  const selectedCorrect = scoredCandidates[0];
+
+  if (!selectedCorrect) {
+    return {
+      options: fallback,
+      regenerationCount: 0
+    };
+  }
+
+  const correctCanonical = canonicalOption(selectedCorrect.text);
+  let distractors = selectDistractors({
+    candidates: candidatePayload?.distractor_candidates,
+    question,
+    storyBrief,
+    storyFacts,
+    correctCanonical,
+    correctSupport: selectedCorrect.supportLevel
+  });
+
+  let regenerationCount = 0;
+
+  if (distractors.length < 2) {
+    regenerationCount = 1;
+    const regenerated = await regenerateDistractors(ai, question, storyBrief, storyFacts, selectedCorrect.text);
+
+    const fromRegeneration = selectDistractors({
+      candidates: regenerated,
+      question,
+      storyBrief,
+      storyFacts,
+      correctCanonical,
+      correctSupport: selectedCorrect.supportLevel
+    });
+
+    const combined = [...distractors, ...fromRegeneration];
+    const deduped = [];
+    const seen = new Set();
+
+    for (const option of combined) {
+      const key = canonicalOption(option.text);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(option);
+      if (deduped.length === 2) break;
+    }
+
+    distractors = deduped;
+  }
+
+  if (distractors.length < 2) {
+    const fallbackDistractors = fallback.filter((item) => !item.isCorrect);
+    const existing = new Set(distractors.map((item) => canonicalOption(item.text)));
+
+    for (const extra of fallbackDistractors) {
+      const key = canonicalOption(extra.text);
+      if (key === correctCanonical || existing.has(key)) continue;
+      distractors.push(extra);
+      existing.add(key);
+      if (distractors.length === 2) break;
+    }
+  }
+
+  const options = [
+    {
+      text: selectedCorrect.text,
+      isCorrect: true,
+      supportLevel: selectedCorrect.supportLevel,
+      evidence: selectedCorrect.evidence
+    },
+    ...distractors.slice(0, 2)
+  ];
+
+  while (options.length < 3) {
+    const fallbackOption = fallback[options.length];
+    options.push(fallbackOption);
+  }
+
+  return {
+    options,
+    regenerationCount
+  };
+};
+
+const isOptionInStoryFacts = (optionText, storyFacts, storyBrief) => {
+  const canonical = canonicalOption(optionText);
+  if (!canonical) return false;
+
+  const factPhrases = getAllFactPhrases(storyFacts).map((phrase) => canonicalOption(phrase));
+  const phraseMatch = factPhrases.some(
+    (phrase) => phrase && (phrase.includes(canonical) || canonical.includes(phrase))
+  );
+
+  if (phraseMatch) {
+    return true;
+  }
+
+  const optionTokens = tokenize(optionText);
+  const factTokens = new Set(tokenize(factPhrases.join(' ')));
+  const briefTokens = new Set(tokenize(storyBrief || ''));
+
+  let overlap = 0;
+  for (const token of optionTokens) {
+    if (factTokens.has(token) || briefTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+
+  return overlap >= 2;
+};
+
+const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, storyBrief) => {
+  if (isCorrect) {
+    return RENDER_MODE_BLEND;
+  }
+
+  const text = String(optionText || '').toLowerCase();
+  const inStory = isOptionInStoryFacts(optionText, storyFacts, storyBrief) || supportLevel >= 55;
+
+  if (inStory) {
+    return RENDER_MODE_BLEND;
+  }
+
+  const hasOceanWorld = (storyFacts?.worldTags || []).includes('ocean') || /ocean|underwater|reef|sea/.test(storyBrief || '');
+  const optionIsForest = /forest|woods|jungle|tree/.test(text);
+
+  if (hasOceanWorld && optionIsForest) {
+    return RENDER_MODE_STANDALONE;
+  }
+
+  return RENDER_MODE_STANDALONE;
+};
+
+const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts }) => {
+  const styleLayer = [
+    'STYLE LAYER:',
+    `- Match the attached style references exactly.`,
+    `- Art style description: ${artStyle || 'Children\'s book illustration'}.`,
+    '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
+    '- Composition must be easy for a non-verbal child to recognize quickly.'
+  ];
+
+  const semanticLayer =
+    renderMode === RENDER_MODE_BLEND
+      ? [
+          'SEMANTIC LAYER:',
+          `- Main subject to depict: "${optionText}".`,
+          '- Blend the subject naturally into the story world when plausible.',
+          `- Story world context: ${storyFacts?.setting || storyBrief}.`,
+          '- Keep the scene simple with minimal clutter.'
+        ]
+      : [
+          'SEMANTIC LAYER:',
+          `- Main subject to depict: "${optionText}".`,
+          '- Render this option in its normal real-world context.',
+          `- Keep style consistent with the story art, but DO NOT force story-world mashups.`,
+          '- Explicitly avoid adding underwater/ocean setting unless the option itself requires it.',
+          '- Keep the scene simple with minimal clutter.'
+        ];
+
+  return [...styleLayer, ...semanticLayer].join('\n');
 };
 
 export const setupStoryPack = async (storyFile, styleImages) => {
@@ -179,13 +683,19 @@ export const setupStoryPack = async (storyFile, styleImages) => {
           { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
           {
             text: [
-              'Analyze this children\'s story PDF and return JSON.',
+              'Analyze this children\'s story PDF and return strict JSON.',
               'Fields:',
               '1) summary: two short kid-friendly sentences.',
               '2) art_style: at most 5 words.',
-              '3) story_brief: concise but detailed comprehension brief for turn-time Q&A.',
-              'Include in story_brief: main characters, setting, sequence of key events, and concrete facts answerable from the book.',
-              'Return valid JSON only.'
+              '3) story_brief: concise but detailed brief for comprehension Q&A.',
+              '4) story_facts object with:',
+              '   - characters: short names/roles',
+              '   - places: concrete locations mentioned',
+              '   - objects: key objects',
+              '   - events: key events in sequence fragments',
+              '   - setting: one short sentence for overall world',
+              '   - world_tags: short tags like ocean, school, forest',
+              'Keep facts compact and evidence-based. Return valid JSON only.'
             ].join('\n')
           }
         ]
@@ -198,9 +708,21 @@ export const setupStoryPack = async (storyFile, styleImages) => {
           properties: {
             summary: { type: Type.STRING },
             art_style: { type: Type.STRING },
-            story_brief: { type: Type.STRING }
+            story_brief: { type: Type.STRING },
+            story_facts: {
+              type: Type.OBJECT,
+              properties: {
+                characters: { type: Type.ARRAY, items: { type: Type.STRING } },
+                places: { type: Type.ARRAY, items: { type: Type.STRING } },
+                objects: { type: Type.ARRAY, items: { type: Type.STRING } },
+                events: { type: Type.ARRAY, items: { type: Type.STRING } },
+                setting: { type: Type.STRING },
+                world_tags: { type: Type.ARRAY, items: { type: Type.STRING } }
+              },
+              required: ['characters', 'places', 'objects', 'events', 'setting', 'world_tags']
+            }
           },
-          required: ['summary', 'art_style', 'story_brief']
+          required: ['summary', 'art_style', 'story_brief', 'story_facts']
         }
       }
     })
@@ -208,10 +730,11 @@ export const setupStoryPack = async (storyFile, styleImages) => {
 
   const analyzeMs = Math.round(performance.now() - analyzeStart);
 
-  const parsed = JSON.parse(analysisResponse.text || '{}');
+  const parsed = parseJsonSafe(analysisResponse.text, {});
   const summary = parsed.summary || 'Story analyzed.';
   const artStyle = parsed.art_style || 'Children\'s book illustration';
   const storyBrief = parsed.story_brief || summary;
+  const storyFacts = normalizeStoryFacts(parsed.story_facts, storyBrief);
 
   const coverStart = performance.now();
   const coverParts = [];
@@ -250,6 +773,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
       summary,
       artStyle,
       storyBrief,
+      storyFacts,
       coverImage,
       stylePrimer
     },
@@ -265,12 +789,14 @@ export const runTurnPipeline = async (
   audioBase64,
   mimeType,
   storyBrief,
+  storyFacts,
   artStyle,
   stylePrimer,
   history
 ) => {
   const ai = getClient();
   const totalStart = performance.now();
+  const normalizedFacts = normalizeStoryFacts(storyFacts, storyBrief);
 
   const transcribeStart = performance.now();
   const transcribeResponse = await retryWithBackoff(() =>
@@ -282,7 +808,7 @@ export const runTurnPipeline = async (
           {
             text: [
               'Transcribe only the parent question from this audio.',
-              'This is a book comprehension activity for a non-verbal child who chooses among answers.',
+              'This is a reading comprehension activity for a non-verbal child.',
               'Return only plain text transcription.',
               `Story context: ${storyBrief}`
             ].join('\n')
@@ -316,63 +842,59 @@ export const runTurnPipeline = async (
     .map((turn) => `${turn.role === 'parent' ? 'Parent' : 'Child'}: ${turn.text}`)
     .join('\n');
 
-  const optionsResponse = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: {
-        parts: [
-          {
-            text: [
-              'You are helping a non-verbal child answer a reading-comprehension question.',
-              'The parent is the reader. The child is the answerer.',
-              'Every answer option MUST be grounded in the story context below.',
-              'Use simple child language (age 3-7), no advanced vocabulary.',
-              `Story brief: ${storyBrief}`,
-              `Conversation:\n${historyText}`,
-              `Parent asked: ${question}`,
-              'Task: return exactly 3 short answer options (max 4 words each).',
-              'Exactly ONE option must be correct for the parent question based on the story.',
-              'The other TWO options must be clearly incorrect but still plausible choices.',
-              'For "Where" questions, use location phrases like "In the ocean", "At home", or "At school".',
-              'If the question cannot be answered from the story, mark "Not in this book" as the only correct option.',
-              'Return strict JSON object: {"options":[{"text":"...","is_correct":true|false}, ...]}'
-            ].join('\n')
-          }
-        ]
-      },
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            options: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  text: { type: Type.STRING },
-                  is_correct: { type: Type.BOOLEAN }
-                },
-                required: ['text', 'is_correct']
-              }
-            }
-          },
-          required: ['options']
-        },
-        thinkingConfig: { thinkingBudget: 0 }
-      }
-    })
-  );
+  let candidatePayload;
+  try {
+    candidatePayload = await generateCandidates(ai, question, historyText, storyBrief, normalizedFacts);
+  } catch {
+    candidatePayload = null;
+  }
 
-  const optionChoices = normalizeOptionSet(optionsResponse.text, question, storyBrief);
+  const { options: resolvedOptions, regenerationCount } = await buildFinalOptions({
+    ai,
+    question,
+    storyBrief,
+    storyFacts: normalizedFacts,
+    candidatePayload
+  });
+
+  const shuffled = shuffle(resolvedOptions);
   const optionsMs = Math.round(performance.now() - optionsStart);
 
-  const cards = optionChoices.map((choice, idx) => ({
-    id: `opt-${idx}`,
-    text: choice.text,
-    isLoadingImage: true,
-    type: choice.isCorrect ? 'correct' : 'wrong'
-  }));
+  const cards = shuffled.map((choice, idx) => {
+    const renderMode = determineRenderMode(
+      choice.text,
+      choice.isCorrect,
+      choice.supportLevel || 0,
+      normalizedFacts,
+      storyBrief
+    );
+
+    return {
+      id: `opt-${idx}`,
+      text: choice.text,
+      isLoadingImage: true,
+      type: choice.isCorrect ? 'correct' : 'wrong',
+      isCorrect: choice.isCorrect,
+      renderMode,
+      supportLevel: choice.supportLevel || 0
+    };
+  });
+
+  const wrongCards = cards.filter((card) => !card.isCorrect);
+  const accidentalTruthCount = wrongCards.filter((card) => (card.supportLevel || 0) >= 60).length;
+  const renderModeSplit = cards.reduce(
+    (acc, card) => {
+      if (card.renderMode === RENDER_MODE_BLEND) acc.blend += 1;
+      else acc.standalone += 1;
+      return acc;
+    },
+    { blend: 0, standalone: 0 }
+  );
+
+  console.info(
+    `[qa] turn options wrong_truth_rate=${(accidentalTruthCount / Math.max(wrongCards.length, 1)).toFixed(2)} ` +
+      `render_split=${renderModeSplit.blend}/${renderModeSplit.standalone} regenerations=${regenerationCount}`
+  );
 
   const imageMsById = {};
   const imageStart = performance.now();
@@ -387,23 +909,30 @@ export const runTurnPipeline = async (
       }
 
       parts.push({
-        text: [
-          `Generate a clear square illustration for: "${card.text}".`,
-          `Story context: ${storyBrief}`,
-          `Art style: ${artStyle}`,
-          'Match the attached style references. Keep minimal and clear background.'
-        ].join('\n')
+        text: buildImagePrompt({
+          optionText: card.text,
+          renderMode: card.renderMode,
+          storyBrief,
+          artStyle,
+          storyFacts: normalizedFacts
+        })
       });
 
-      const imageResponse = await retryWithBackoff(() =>
-        ai.models.generateContent({
-          model: 'gemini-2.5-flash-image',
-          contents: { parts },
-          config: { imageConfig: { aspectRatio: '1:1' } }
-        })
-      );
+      try {
+        const imageResponse = await retryWithBackoff(() =>
+          ai.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: { parts },
+            config: { imageConfig: { aspectRatio: '1:1' } }
+          })
+        );
 
-      card.imageUrl = extractImageDataUrl(imageResponse) || undefined;
+        card.imageUrl = extractImageDataUrl(imageResponse) || undefined;
+      } catch (error) {
+        console.warn('[image] generation failed', card.id, error?.message || error);
+        card.imageUrl = undefined;
+      }
+
       card.isLoadingImage = false;
       imageMsById[card.id] = Math.round(performance.now() - start);
     })

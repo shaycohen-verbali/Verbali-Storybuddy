@@ -40,6 +40,14 @@ export const useStorySetup = () => {
           summary: analysis.summary,
           artStyle: analysis.artStyle,
           storyBrief: analysis.summary,
+          storyFacts: {
+            characters: [],
+            places: [],
+            objects: [],
+            events: [],
+            setting: analysis.summary,
+            worldTags: []
+          },
           coverImage,
           stylePrimer: styleImages.length > 0 ? styleImages : coverImage ? [{
             mimeType: coverImage.split(';')[0].replace('data:', ''),

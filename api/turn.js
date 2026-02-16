@@ -23,6 +23,7 @@ export default async function handler(req, res) {
       body.audioBase64,
       body.mimeType,
       body.storyBrief,
+      body.storyFacts || null,
       body.artStyle,
       body.stylePrimer || [],
       body.history || []

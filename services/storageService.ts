@@ -8,6 +8,15 @@ const ASSETS_STORE = 'story_assets';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+const createDefaultStoryFacts = (source: string) => ({
+  characters: [],
+  places: [],
+  objects: [],
+  events: [],
+  setting: source,
+  worldTags: []
+});
+
 const legacyToManifest = (legacy: StoredStory): StoryManifest => ({
   id: legacy.id,
   title: legacy.title,
@@ -26,7 +35,8 @@ const legacyToAssets = (legacy: StoredStory): StoryAssets => ({
   pdfData: legacy.pdfData,
   metadata: {
     ...legacy.metadata,
-    storyBrief: legacy.metadata.storyBrief || legacy.metadata.summary
+    storyBrief: legacy.metadata.storyBrief || legacy.metadata.summary,
+    storyFacts: legacy.metadata.storyFacts || createDefaultStoryFacts(legacy.metadata.storyBrief || legacy.metadata.summary)
   }
 });
 

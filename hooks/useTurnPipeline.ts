@@ -41,6 +41,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           audioBase64,
           mimeType: audioBlob.type,
           storyBrief: activeAssets.storyBrief,
+          storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
           stylePrimer: activeAssets.stylePrimer,
           history: stateRef.current.conversationHistory

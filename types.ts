@@ -34,7 +34,10 @@ export interface StoryMetadata {
   objects: StoryObject[];
   artStyle?: string;
   storyBrief?: string;
+  storyFacts?: StoryFacts;
 }
+
+export type RenderMode = 'blend_with_story_world' | 'standalone_option_world';
 
 export interface Option {
   id: string;
@@ -42,6 +45,9 @@ export interface Option {
   imageUrl?: string;
   isLoadingImage: boolean;
   type?: 'correct' | 'wrong' | 'neutral';
+  isCorrect?: boolean;
+  renderMode?: RenderMode;
+  supportLevel?: number;
 }
 
 export interface ChatTurn {
@@ -53,8 +59,18 @@ export interface StoryPack {
   summary: string;
   artStyle: string;
   storyBrief: string;
+  storyFacts: StoryFacts;
   coverImage?: string | null;
   stylePrimer: FileData[];
+}
+
+export interface StoryFacts {
+  characters: string[];
+  places: string[];
+  objects: string[];
+  events: string[];
+  setting: string;
+  worldTags: string[];
 }
 
 export interface StoryManifest {
@@ -103,6 +119,7 @@ export interface TurnRequest {
   audioBase64: string;
   mimeType: string;
   storyBrief: string;
+  storyFacts?: StoryFacts;
   artStyle: string;
   stylePrimer: FileData[];
   history: ChatTurn[];
