@@ -4,7 +4,7 @@ import { AppMode, FileData, StoryAssets, StoryManifest, StoryMetadata, StoryPack
 import { USE_BACKEND_PIPELINE } from './services/apiClient';
 import RecordButton from './components/RecordButton';
 import OptionCard from './components/OptionCard';
-import SetupPanel from './components/SetupPanel';
+import SetupPanel, { ExistingSetupUpdatePayload } from './components/SetupPanel';
 import ProcessingSteps from './components/ProcessingSteps';
 import Library from './components/Library';
 import { useLibrary } from './hooks/useLibrary';
@@ -12,6 +12,8 @@ import { useStorySetup } from './hooks/useStorySetup';
 import { useTurnPipeline } from './hooks/useTurnPipeline';
 
 interface SetupViewState {
+  storyId?: string;
+  createdAt?: number;
   readOnly: boolean;
   title?: string;
   storyFile?: FileData | null;
@@ -89,6 +91,8 @@ const App: React.FC = () => {
     try {
       const assets = await selectStory(story);
       setSetupView({
+        storyId: story.id,
+        createdAt: story.createdAt,
         readOnly: true,
         title: story.title,
         storyFile: assets.pdfData || null,
@@ -172,6 +176,45 @@ const App: React.FC = () => {
   const handleOptionClick = useCallback(async (option: (typeof options)[number]) => {
     await selectOption(option);
   }, [selectOption]);
+
+  const handleSaveExistingSetup = useCallback(async (payload: ExistingSetupUpdatePayload) => {
+    const existingManifest = stories.find((story) => story.id === payload.storyId);
+    const existingAssetsPdf = setupView?.storyId === payload.storyId
+      ? setupView.storyFile
+      : activeAssets?.id === payload.storyId
+        ? activeAssets.pdfData || null
+        : null;
+
+    const metadata: StoryMetadata = {
+      summary: payload.storyPack.summary,
+      artStyle: payload.storyPack.artStyle,
+      storyBrief: payload.storyPack.storyBrief,
+      storyFacts: payload.storyPack.storyFacts,
+      characters: [],
+      objects: []
+    };
+
+    const manifest: StoryManifest = {
+      id: payload.storyId,
+      title: payload.storyPack.summary.substring(0, 50) || existingManifest?.title || 'Untitled Story',
+      coverImage: payload.storyPack.coverImage || undefined,
+      createdAt: existingManifest?.createdAt || payload.createdAt,
+      summary: payload.storyPack.summary,
+      artStyle: payload.storyPack.artStyle
+    };
+
+    const assets: StoryAssets = {
+      id: payload.storyId,
+      storyBrief: payload.storyPack.storyBrief,
+      stylePrimer: payload.storyPack.stylePrimer,
+      pdfData: payload.storyFile || existingAssetsPdf || undefined,
+      metadata
+    };
+
+    await saveNewStory(manifest, assets);
+    setSetupView(null);
+    setCurrentMode(AppMode.LIBRARY);
+  }, [activeAssets, saveNewStory, setupView, stories]);
 
   if (!hasApiKey) {
     return (
@@ -298,8 +341,10 @@ const App: React.FC = () => {
         <SetupPanel
           onPrepareStory={prepareStory}
           onComplete={handleSetupComplete}
+          onSaveExisting={handleSaveExistingSetup}
           onStartFromSetup={() => {
             resetConversation();
+            setSetupView(null);
             setCurrentMode(AppMode.STORY);
           }}
           initialView={setupView}

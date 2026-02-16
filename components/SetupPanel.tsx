@@ -1,9 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2 } from 'lucide-react';
+import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles } from 'lucide-react';
 import { FileData, SetupStoryResponse, StoryPack } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
 
 interface SetupInitialView {
+  storyId?: string;
+  createdAt?: number;
   readOnly?: boolean;
   title?: string;
   storyFile?: FileData | null;
@@ -11,9 +13,18 @@ interface SetupInitialView {
   storyPack?: StoryPack | null;
 }
 
+export interface ExistingSetupUpdatePayload {
+  storyId: string;
+  createdAt: number;
+  storyFile: FileData | null;
+  styleImages: FileData[];
+  storyPack: StoryPack;
+}
+
 interface SetupPanelProps {
   onPrepareStory: (storyFile: FileData, styleImages: FileData[]) => Promise<SetupStoryResponse>;
   onComplete: (storyFile: FileData, styleImages: FileData[], storyPack: StoryPack) => void;
+  onSaveExisting?: (payload: ExistingSetupUpdatePayload) => Promise<void> | void;
   onStartFromSetup?: () => void;
   initialView?: SetupInitialView | null;
   onClose: () => void;
@@ -28,13 +39,17 @@ const parseDataUrl = (dataUrl: string): FileData => {
   return { mimeType: match[1], data: match[2] };
 };
 
-const compressImageFile = async (file: File): Promise<FileData> => {
+const fileToDataUrl = async (file: File): Promise<string> => {
   const reader = new FileReader();
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    reader.onload = () => resolve(reader.result as string);
+  return new Promise((resolve, reject) => {
+    reader.onload = () => resolve(String(reader.result || ''));
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+};
+
+const compressImageFile = async (file: File): Promise<FileData> => {
+  const dataUrl = await fileToDataUrl(file);
 
   const img = new Image();
   await new Promise<void>((resolve, reject) => {
@@ -61,15 +76,32 @@ const compressImageFile = async (file: File): Promise<FileData> => {
   return parseDataUrl(canvas.toDataURL('image/jpeg', 0.78));
 };
 
+const mergePrimerSources = (preferred: FileData[], fallback: FileData[]): FileData[] => {
+  const merged: FileData[] = [];
+  const seen = new Set<string>();
+
+  for (const item of [...preferred, ...fallback]) {
+    if (!item?.data || !item?.mimeType) continue;
+    const key = `${item.mimeType}:${item.data.slice(0, 64)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+
+  return merged.slice(0, 8);
+};
+
 const SetupPanel: React.FC<SetupPanelProps> = ({
   onPrepareStory,
   onComplete,
+  onSaveExisting,
   onStartFromSetup,
   initialView,
   onClose
 }) => {
   const storyInputRef = useRef<HTMLInputElement>(null);
   const styleInputRef = useRef<HTMLInputElement>(null);
+  const coverInputRef = useRef<HTMLInputElement>(null);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -77,14 +109,18 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [currentStory, setCurrentStory] = useState<FileData | null>(null);
   const [styleReferences, setStyleReferences] = useState<FileData[]>([]);
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
-  const isReadOnly = Boolean(initialView?.readOnly);
-  const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+  const [isReadOnlyView, setIsReadOnlyView] = useState(false);
+
+  const isExistingStory = Boolean(initialView?.storyId);
+  const canEdit = !isReadOnlyView;
+  const maxPdfSizeBytes = USE_BACKEND_PIPELINE ? 3 * 1024 * 1024 : 50 * 1024 * 1024;
 
   useEffect(() => {
     if (!initialView) {
       setCurrentStory(null);
       setStyleReferences([]);
       setPreparedPack(null);
+      setIsReadOnlyView(false);
       setErrorMsg(null);
       setIsProcessing(false);
       return;
@@ -93,48 +129,28 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setCurrentStory(initialView.storyFile || null);
     setStyleReferences(initialView.styleImages || []);
     setPreparedPack(initialView.storyPack || null);
+    setIsReadOnlyView(Boolean(initialView.readOnly));
     setErrorMsg(null);
     setIsProcessing(false);
   }, [initialView]);
 
-  const maxPdfSizeBytes = USE_BACKEND_PIPELINE ? 3 * 1024 * 1024 : 50 * 1024 * 1024;
-
-  const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (isReadOnly) {
-      return;
-    }
-
-    const file = e.target.files?.[0];
-    if (!file) {
+  const runSetupFromCurrentStory = async (sourceStory?: FileData | null) => {
+    const storySource = sourceStory || currentStory;
+    if (!storySource) {
+      setErrorMsg('Original PDF is required to re-run setup.');
       return;
     }
 
     setErrorMsg(null);
     setIsProcessing(true);
-    setPreparedPack(null);
 
     try {
-      if (file.size > maxPdfSizeBytes) {
-        if (USE_BACKEND_PIPELINE) {
-          throw new Error('PDF is too large for cloud processing. Use a PDF smaller than 3MB.');
-        }
-        throw new Error('File is too large. Please use a file smaller than 50MB.');
-      }
+      const setupResponse = await onPrepareStory(storySource, styleReferences);
+      setPreparedPack((prev) => ({
+        ...setupResponse.storyPack,
+        coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
+      }));
 
-      const reader = new FileReader();
-      const base64 = await new Promise<string>((resolve, reject) => {
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-
-      const storyFile: FileData = { data: base64, mimeType: file.type };
-      setCurrentStory(storyFile);
-
-      const setupResponse = await onPrepareStory(storyFile, styleReferences);
-      setPreparedPack(setupResponse.storyPack);
-
-      // If style references were not provided, keep the backend-selected primer.
       if (styleReferences.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
         setStyleReferences(setupResponse.storyPack.stylePrimer);
       }
@@ -146,8 +162,38 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     }
   };
 
+  const handleStoryUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canEdit) {
+      return;
+    }
+
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    if (file.size > maxPdfSizeBytes) {
+      if (USE_BACKEND_PIPELINE) {
+        setErrorMsg('PDF is too large for cloud processing. Use a PDF smaller than 3MB.');
+      } else {
+        setErrorMsg('File is too large. Please use a file smaller than 50MB.');
+      }
+      return;
+    }
+
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      const storyFile: FileData = { data: dataUrl.split(',')[1] || '', mimeType: file.type };
+      setCurrentStory(storyFile);
+      await runSetupFromCurrentStory(storyFile);
+    } catch (error: any) {
+      console.error(error);
+      setErrorMsg(error?.message || 'Failed to read story file');
+    }
+  };
+
   const handleStyleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (isReadOnly) {
+    if (!canEdit) {
       return;
     }
 
@@ -162,42 +208,94 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       if (!file.type.startsWith('image/')) {
         continue;
       }
-
       newStyles.push(await compressImageFile(file));
     }
 
     setStyleReferences((prev) => [...prev, ...newStyles]);
   };
 
+  const handleCoverUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canEdit) {
+      return;
+    }
+
+    const file = e.target.files?.[0];
+    if (!file || !file.type.startsWith('image/')) {
+      return;
+    }
+
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      setPreparedPack((prev) => {
+        if (!prev) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          coverImage: dataUrl
+        };
+      });
+    } catch (error: any) {
+      console.error(error);
+      setErrorMsg(error?.message || 'Failed to update cover image');
+    }
+  };
+
   const removeStyleImage = (index: number) => {
-    if (isReadOnly) {
+    if (!canEdit) {
       return;
     }
 
     setStyleReferences((prev) => prev.filter((_, i) => i !== index));
   };
 
-  const handleFinish = () => {
-    if (isReadOnly) {
-      onStartFromSetup?.();
-      return;
-    }
+  const handleFinish = async () => {
+    try {
+      if (isReadOnlyView) {
+        onStartFromSetup?.();
+        return;
+      }
 
-    if (!currentStory || !preparedPack) {
-      return;
-    }
+      if (!preparedPack) {
+        return;
+      }
 
-    const finalPrimer = styleReferences.length > 0 ? styleReferences : preparedPack.stylePrimer;
-    onComplete(currentStory, finalPrimer, {
-      ...preparedPack,
-      stylePrimer: finalPrimer
-    });
-    onClose();
+      const finalPrimer = mergePrimerSources(styleReferences, preparedPack.stylePrimer);
+      const finalPack: StoryPack = {
+        ...preparedPack,
+        stylePrimer: finalPrimer
+      };
+
+      if (isExistingStory && initialView?.storyId) {
+        await onSaveExisting?.({
+          storyId: initialView.storyId,
+          createdAt: initialView.createdAt || Date.now(),
+          storyFile: currentStory,
+          styleImages: finalPrimer,
+          storyPack: finalPack
+        });
+        onClose();
+        return;
+      }
+
+      if (!currentStory) {
+        setErrorMsg('Please upload a story PDF first.');
+        return;
+      }
+
+      await Promise.resolve(onComplete(currentStory, finalPrimer, finalPack));
+      onClose();
+    } catch (error: any) {
+      console.error(error);
+      setErrorMsg(error?.message || 'Failed to save setup changes');
+    }
   };
 
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
-  const hasAnalysis = Boolean(summary) || isReadOnly;
+  const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+  const hasAnalysis = Boolean(summary || preparedPack) || isReadOnlyView;
 
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -206,15 +304,26 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
           <div>
             <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
               <BookOpen className="w-6 h-6 text-kid-blue" />
-              {isReadOnly ? 'Story Setup' : 'Prepare Story'}
+              {isExistingStory ? 'Story Setup' : 'Prepare Story'}
             </h2>
-            {isReadOnly && initialView?.title && (
+            {initialView?.title && (
               <p className="text-sm text-gray-500 mt-1">{initialView.title}</p>
             )}
           </div>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full text-gray-400 transition">
-            <X className="w-6 h-6" />
-          </button>
+
+          <div className="flex items-center gap-2">
+            {isExistingStory && isReadOnlyView && (
+              <button
+                onClick={() => setIsReadOnlyView(false)}
+                className="px-4 py-2 rounded-full bg-gray-100 text-gray-700 text-sm font-bold hover:bg-gray-200 transition"
+              >
+                Edit Setup
+              </button>
+            )}
+            <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full text-gray-400 transition">
+              <X className="w-6 h-6" />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto p-8 bg-gray-50/50">
@@ -233,7 +342,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Upload Story
                 </h3>
 
-                {!currentStory && !isReadOnly ? (
+                {!currentStory && canEdit ? (
                   <div
                     onClick={() => storyInputRef.current?.click()}
                     className="border-2 border-dashed border-gray-300 rounded-xl p-8 flex flex-col items-center justify-center cursor-pointer hover:bg-blue-50 hover:border-kid-blue transition group"
@@ -245,8 +354,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                 ) : currentStory ? (
                   <div className="flex items-center gap-3 p-4 bg-blue-50 text-kid-blue rounded-xl border border-blue-100">
                     <CheckCircle className="w-5 h-5" />
-                    <span className="font-bold">{isReadOnly ? 'Book Loaded' : 'PDF Uploaded'}</span>
-                    {!isReadOnly && (
+                    <span className="font-bold">Book Loaded</span>
+                    {canEdit && (
                       <button
                         onClick={() => {
                           setCurrentStory(null);
@@ -275,21 +384,48 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   {isProcessing ? (
                     <div className="flex flex-col items-center py-8 text-gray-400">
                       <Loader2 className="w-8 h-8 animate-spin mb-2 text-kid-orange" />
-                      <span>Reading & Drawing Cover...</span>
+                      <span>Reading and building setup...</span>
                     </div>
                   ) : (
                     <div className="space-y-4">
                       <div>
                         <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Summary</label>
-                        <p className="text-gray-700 text-lg leading-relaxed">{summary}</p>
+                        <p className="text-gray-700 text-lg leading-relaxed">{summary || 'No summary available.'}</p>
                       </div>
 
                       {generatedCover && (
                         <div>
-                          <label className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2 block">AI Generated Cover</label>
+                          <label className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2 block">Cover</label>
                           <div className="relative aspect-[3/4] w-48 rounded-xl overflow-hidden shadow-lg">
                             <img src={generatedCover} alt="Cover" className="w-full h-full object-cover" />
                           </div>
+                        </div>
+                      )}
+
+                      {canEdit && (
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => coverInputRef.current?.click()}
+                            className="px-4 py-2 rounded-lg bg-gray-100 text-gray-700 text-sm font-bold hover:bg-gray-200 transition"
+                          >
+                            Update Cover
+                          </button>
+                          <input
+                            type="file"
+                            ref={coverInputRef}
+                            onChange={handleCoverUpload}
+                            className="hidden"
+                            accept="image/*"
+                          />
+
+                          {currentStory && (
+                            <button
+                              onClick={runSetupFromCurrentStory}
+                              className="px-4 py-2 rounded-lg bg-kid-teal/10 text-kid-teal text-sm font-bold hover:bg-kid-teal/20 transition flex items-center gap-1"
+                            >
+                              <Sparkles className="w-4 h-4" /> Re-run Analysis
+                            </button>
+                          )}
                         </div>
                       )}
 
@@ -323,14 +459,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Style References
                 </h3>
                 <p className="text-gray-500 text-sm mb-6">
-                  Upload reference images from the book so generated option cards stay visually consistent.
+                  Style agent assets and uploaded references used for option image generation.
                 </p>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">
                   {styleReferences.map((style, idx) => (
                     <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
                       <img src={`data:${style.mimeType};base64,${style.data}`} className="w-full h-full object-cover" />
-                      {!isReadOnly && (
+                      {canEdit && (
                         <button
                           onClick={() => removeStyleImage(idx)}
                           className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition"
@@ -340,7 +476,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                       )}
                     </div>
                   ))}
-                  {!isReadOnly && (
+
+                  {canEdit && (
                     <button
                       onClick={() => styleInputRef.current?.click()}
                       className="aspect-square rounded-xl border-2 border-dashed border-gray-300 flex flex-col items-center justify-center text-gray-400 hover:border-kid-pink hover:text-kid-pink hover:bg-pink-50 transition"
@@ -349,16 +486,18 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                       <span className="text-xs font-bold">Add Image</span>
                     </button>
                   )}
+
                   <input type="file" ref={styleInputRef} onChange={handleStyleUpload} className="hidden" accept="image/*" multiple />
                 </div>
 
                 <div className="mt-auto pt-6 border-t border-gray-100">
                   <button
                     onClick={handleFinish}
-                    disabled={!isReadOnly && !summary}
+                    disabled={isProcessing || (!isReadOnlyView && !preparedPack)}
                     className="w-full py-4 bg-kid-blue text-white font-bold rounded-xl shadow-lg hover:bg-blue-600 transition flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    <BookOpen className="w-5 h-5" /> Start Story
+                    <BookOpen className="w-5 h-5" />
+                    {isReadOnlyView ? 'Start Story' : isExistingStory ? 'Save Updates' : 'Start Story'}
                     <ArrowRight className="w-5 h-5" />
                   </button>
                 </div>
