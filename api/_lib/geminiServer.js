@@ -73,19 +73,70 @@ const normalizeJsonArray = (text) => {
   return ['Yes', 'No', 'Maybe'];
 };
 
-const normalizeOptionSet = (rawText) => {
-  const fallback = [
+const isWhereQuestion = (question) => /^\s*where\b/i.test(question || '');
+
+const inferLocationFromStory = (storyBrief) => {
+  const brief = (storyBrief || '').toLowerCase();
+  if (/(ocean|sea|underwater|reef|shark|whale|fish)/.test(brief)) return 'In the ocean';
+  if (/(beach|shore|coast)/.test(brief)) return 'On the beach';
+  if (/(forest|jungle|woods|tree)/.test(brief)) return 'In the forest';
+  if (/(home|house|bedroom|kitchen)/.test(brief)) return 'At home';
+  if (/(school|classroom)/.test(brief)) return 'At school';
+  if (/(farm|barn)/.test(brief)) return 'On a farm';
+  if (/(city|town|street)/.test(brief)) return 'In the city';
+  if (/(cave)/.test(brief)) return 'In a cave';
+  return 'In the ocean';
+};
+
+const titleCaseFirst = (text) => {
+  if (!text) return text;
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+const simplifyOptionText = (text, question) => {
+  let value = String(text || '').trim().replace(/[.?!]+$/g, '').replace(/\s+/g, ' ');
+  if (!value) return value;
+
+  if (isWhereQuestion(question)) {
+    value = value.replace(/^(a|an|the)\s+/i, '');
+    if (!/^(in|on|at)\s+/i.test(value)) {
+      value = `In ${value.toLowerCase()}`;
+    }
+  }
+
+  const words = value.split(' ');
+  if (words.length > 4) {
+    value = words.slice(0, 4).join(' ');
+  }
+
+  return titleCaseFirst(value);
+};
+
+const buildFallbackOptions = (question, storyBrief) => {
+  if (isWhereQuestion(question)) {
+    return [
+      { text: inferLocationFromStory(storyBrief), isCorrect: true },
+      { text: 'In space', isCorrect: false },
+      { text: 'In the desert', isCorrect: false }
+    ];
+  }
+
+  return [
     { text: 'Not in this book', isCorrect: true },
     { text: 'Maybe', isCorrect: false },
     { text: 'No idea', isCorrect: false }
   ];
+};
+
+const normalizeOptionSet = (rawText, question, storyBrief) => {
+  const fallback = buildFallbackOptions(question, storyBrief);
 
   try {
     const parsed = JSON.parse(rawText || '{}');
     const options = Array.isArray(parsed?.options) ? parsed.options : [];
     const mapped = options
       .map((opt) => ({
-        text: String(opt?.text || '').trim(),
+        text: simplifyOptionText(opt?.text, question),
         isCorrect: Boolean(opt?.is_correct)
       }))
       .filter((opt) => opt.text.length > 0)
@@ -275,12 +326,14 @@ export const runTurnPipeline = async (
               'You are helping a non-verbal child answer a reading-comprehension question.',
               'The parent is the reader. The child is the answerer.',
               'Every answer option MUST be grounded in the story context below.',
+              'Use simple child language (age 3-7), no advanced vocabulary.',
               `Story brief: ${storyBrief}`,
               `Conversation:\n${historyText}`,
               `Parent asked: ${question}`,
-              'Task: return exactly 3 short answer options (max 5 words each).',
+              'Task: return exactly 3 short answer options (max 4 words each).',
               'Exactly ONE option must be correct for the parent question based on the story.',
-              'The other TWO options must be clearly incorrect but plausible distractors.',
+              'The other TWO options must be clearly incorrect but still plausible choices.',
+              'For "Where" questions, use location phrases like "In the ocean", "At home", or "At school".',
               'If the question cannot be answered from the story, mark "Not in this book" as the only correct option.',
               'Return strict JSON object: {"options":[{"text":"...","is_correct":true|false}, ...]}'
             ].join('\n')
@@ -311,7 +364,7 @@ export const runTurnPipeline = async (
     })
   );
 
-  const optionChoices = normalizeOptionSet(optionsResponse.text);
+  const optionChoices = normalizeOptionSet(optionsResponse.text, question, storyBrief);
   const optionsMs = Math.round(performance.now() - optionsStart);
 
   const cards = optionChoices.map((choice, idx) => ({

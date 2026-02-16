@@ -53,20 +53,66 @@ const shuffleArray = <T>(array: T[]): T[] => {
   return newArray;
 };
 
-const normalizeOptionSet = (text: string): string[] => {
+const isWhereQuestion = (question: string): boolean => /^\s*where\b/i.test(question || '');
+
+const inferLocationFromSummary = (summary: string): string => {
+  const s = (summary || '').toLowerCase();
+  if (/(ocean|sea|underwater|reef|shark|whale|fish)/.test(s)) return "In the ocean";
+  if (/(beach|shore|coast)/.test(s)) return "On the beach";
+  if (/(forest|jungle|woods|tree)/.test(s)) return "In the forest";
+  if (/(home|house|bedroom|kitchen)/.test(s)) return "At home";
+  if (/(school|classroom)/.test(s)) return "At school";
+  if (/(farm|barn)/.test(s)) return "On a farm";
+  if (/(city|town|street)/.test(s)) return "In the city";
+  if (/(cave)/.test(s)) return "In a cave";
+  return "In the ocean";
+};
+
+const simplifyOptionText = (text: string, question: string): string => {
+  let value = String(text || "").trim().replace(/[.?!]+$/g, "").replace(/\s+/g, " ");
+  if (!value) return value;
+
+  if (isWhereQuestion(question)) {
+    value = value.replace(/^(a|an|the)\s+/i, "");
+    if (!/^(in|on|at)\s+/i.test(value)) {
+      value = `In ${value.toLowerCase()}`;
+    }
+  }
+
+  const words = value.split(" ");
+  if (words.length > 4) {
+    value = words.slice(0, 4).join(" ");
+  }
+
+  return value.charAt(0).toUpperCase() + value.slice(1);
+};
+
+const buildFallbackOptions = (question: string, summary?: string): string[] => {
+  if (isWhereQuestion(question)) {
+    return [
+      inferLocationFromSummary(summary || ""),
+      "In space",
+      "In the desert"
+    ];
+  }
+
+  return ["Not in this book", "Maybe", "No idea"];
+};
+
+const normalizeOptionSet = (text: string, question: string, summary?: string): string[] => {
   try {
     const parsed = JSON.parse(text || '{}');
     const options = Array.isArray(parsed?.options) ? parsed.options : [];
     const mapped = options
       .map((opt: any) => ({
-        text: String(opt?.text || '').trim(),
+        text: simplifyOptionText(String(opt?.text || ''), question),
         isCorrect: Boolean(opt?.is_correct),
       }))
       .filter((opt: any) => opt.text.length > 0)
       .slice(0, 3);
 
     if (mapped.length !== 3) {
-      return ["Not in this book", "Maybe", "No idea"];
+      return buildFallbackOptions(question, summary);
     }
 
     const correctCount = mapped.filter((opt: any) => opt.isCorrect).length;
@@ -78,7 +124,7 @@ const normalizeOptionSet = (text: string): string[] => {
 
     return shuffleArray(mapped.map((opt: any) => opt.text));
   } catch (e) {
-    return ["Not in this book", "Maybe", "No idea"];
+    return buildFallbackOptions(question, summary);
   }
 };
 
@@ -303,9 +349,11 @@ export const generateAnswerOptions = async (
       The parent is the reader. The child is the answerer.
       The parent just asked: "${question}"
       ${historyText}
-      Task: Return exactly 3 short answers (under 5 words each).
+      Use simple child language (age 3-7), no advanced vocabulary.
+      Task: Return exactly 3 short answers (under 4 words each).
       Exactly ONE answer must be correct based on the story.
       The other TWO must be clearly incorrect but plausible distractors.
+      For "Where" questions, use location phrases like "In the ocean", "At home", or "At school".
       If question is not answerable from the story, use "Not in this book" as the only correct option.
       Return strict JSON object: {"options":[{"text":"...","is_correct":true|false}, ...]}.
     `;
@@ -343,23 +391,16 @@ export const generateAnswerOptions = async (
       }
     }));
 
-    let text = response.text || "[]";
-    const firstOpen = text.indexOf('[');
-    const lastClose = text.lastIndexOf(']');
-    if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-      text = text.substring(firstOpen, lastClose + 1);
-    } else {
-      text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    }
+    let text = (response.text || "{}").replace(/```json/g, '').replace(/```/g, '').trim();
 
     try {
-      return normalizeOptionSet(text);
+      return normalizeOptionSet(text, question, metadata?.summary);
     } catch (e) {
-      return ["Not in this book", "Maybe", "No idea"];
+      return buildFallbackOptions(question, metadata?.summary);
     }
   } catch (error) {
     console.error("Error generating options:", error);
-    return ["Not in this book", "Maybe", "No idea"];
+    return buildFallbackOptions(question, metadata?.summary);
   }
 };
 
