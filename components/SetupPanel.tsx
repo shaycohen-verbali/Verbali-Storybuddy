@@ -83,7 +83,9 @@ const mergePrimerSources = (preferred: FileData[], fallback: FileData[]): FileDa
 
   for (const item of [...preferred, ...fallback]) {
     if (!item?.data || !item?.mimeType) continue;
-    const key = `${item.mimeType}:${item.data.slice(0, 64)}`;
+    const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 32);
+    const middle = item.data.slice(middleStart, middleStart + 64);
+    const key = `${item.mimeType}:${item.data.length}:${item.data.slice(0, 64)}:${middle}:${item.data.slice(-64)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(item);
