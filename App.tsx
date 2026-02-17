@@ -30,7 +30,17 @@ const App: React.FC = () => {
   const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
   const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
-  const { stories, publishers, activeManifest, activeAssets, selectStory, saveNewStory, deleteStory, createPublisher } = useLibrary();
+  const {
+    stories,
+    publishers,
+    activeManifest,
+    activeAssets,
+    selectStory,
+    saveNewStory,
+    deleteStory,
+    createPublisher,
+    updateStoryPublisher
+  } = useLibrary();
   const { prepareStory } = useStorySetup();
   const {
     processingStage,
@@ -254,6 +264,10 @@ const App: React.FC = () => {
     await createPublisher(trimmed);
   }, [createPublisher, publishers]);
 
+  const handleAssignStoryPublisher = useCallback(async (storyId: string, publisherId: string | null) => {
+    await updateStoryPublisher(storyId, publisherId);
+  }, [updateStoryPublisher]);
+
   if (!hasApiKey) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-kid-blue to-kid-orange flex items-center justify-center p-4">
@@ -312,6 +326,7 @@ const App: React.FC = () => {
             onAddNew={handleOpenNewRegularBookSetup}
             onAddBookToPublisher={handleOpenNewPublisherBookSetup}
             onCreatePublisher={handleCreatePublisher}
+            onAssignStoryPublisher={handleAssignStoryPublisher}
           />
         )}
 

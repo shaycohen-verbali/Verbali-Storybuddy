@@ -179,6 +179,33 @@ export const getStoryAssets = async (id: string): Promise<StoryAssets | null> =>
   });
 };
 
+export const updateStoryPublisher = async (id: string, publisherId: string | null): Promise<void> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([MANIFEST_STORE], 'readwrite');
+    const store = tx.objectStore(MANIFEST_STORE);
+    const request = store.get(id);
+
+    request.onsuccess = () => {
+      const manifest = request.result as StoryManifest | undefined;
+      if (!manifest) {
+        tx.abort();
+        reject('Story not found');
+        return;
+      }
+
+      store.put({
+        ...manifest,
+        publisherId: publisherId ?? null
+      });
+    };
+
+    request.onerror = () => reject('Error reading story manifest');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject('Error updating story publisher');
+  });
+};
+
 export const deleteStory = async (id: string): Promise<void> => {
   const db = await openDB();
   return new Promise((resolve, reject) => {

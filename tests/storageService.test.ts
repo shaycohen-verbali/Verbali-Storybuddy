@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getStoryAssets, getStoryManifests } from '../services/storageService';
+import { getStoryAssets, getStoryManifests, saveStory, updateStoryPublisher } from '../services/storageService';
 import { StoredStory } from '../types';
 
 const DB_NAME = 'StoryBuddyDB';
@@ -69,5 +69,38 @@ describe('storageService migration', () => {
     const assets = await getStoryAssets('legacy-1');
     expect(assets?.storyBrief).toBe('Legacy summary');
     expect(assets?.pdfData?.mimeType).toBe('application/pdf');
+  });
+
+  it('updates publisher assignment for existing book manifests', async () => {
+    const storyId = 'story-assign-1';
+    await saveStory(
+      {
+        id: storyId,
+        title: 'Book A',
+        createdAt: Date.now(),
+        summary: 'Summary A',
+        artStyle: 'Style A',
+        publisherId: null
+      },
+      {
+        id: storyId,
+        storyBrief: 'Brief A',
+        stylePrimer: [],
+        metadata: {
+          summary: 'Summary A',
+          artStyle: 'Style A',
+          characters: [],
+          objects: []
+        }
+      }
+    );
+
+    await updateStoryPublisher(storyId, 'publisher-1');
+    const withPublisher = await getStoryManifests();
+    expect(withPublisher.find((story) => story.id === storyId)?.publisherId).toBe('publisher-1');
+
+    await updateStoryPublisher(storyId, null);
+    const regularAgain = await getStoryManifests();
+    expect(regularAgain.find((story) => story.id === storyId)?.publisherId).toBeNull();
   });
 });

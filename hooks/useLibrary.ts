@@ -65,6 +65,29 @@ export const useLibrary = () => {
     setPublishers((prev) => [...prev, publisher].sort((a, b) => a.name.localeCompare(b.name)));
   }, []);
 
+  const updateStoryPublisher = useCallback(async (storyId: string, publisherId: string | null) => {
+    await StorageService.updateStoryPublisher(storyId, publisherId);
+    setStories((prev) =>
+      prev.map((story) =>
+        story.id === storyId
+          ? {
+              ...story,
+              publisherId: publisherId ?? null
+            }
+          : story
+      )
+    );
+
+    setActiveManifest((prev) =>
+      prev?.id === storyId
+        ? {
+            ...prev,
+            publisherId: publisherId ?? null
+          }
+        : prev
+    );
+  }, []);
+
   return {
     stories,
     publishers,
@@ -74,6 +97,7 @@ export const useLibrary = () => {
     selectStory,
     saveNewStory,
     deleteStory,
-    createPublisher
+    createPublisher,
+    updateStoryPublisher
   };
 };

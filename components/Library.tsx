@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { BookOpen, Calendar, FolderOpen, Plus, Trash2 } from 'lucide-react';
+import { BookOpen, Calendar, ChevronLeft, FolderOpen, Plus, Trash2 } from 'lucide-react';
 import { Publisher, StoryManifest } from '../types';
 
 interface LibraryProps {
@@ -11,6 +11,7 @@ interface LibraryProps {
   onAddNew: () => void;
   onAddBookToPublisher: (publisher: Publisher) => void;
   onCreatePublisher: (name: string) => Promise<void>;
+  onAssignStoryPublisher: (storyId: string, publisherId: string | null) => Promise<void>;
 }
 
 const Library: React.FC<LibraryProps> = ({
@@ -21,26 +22,44 @@ const Library: React.FC<LibraryProps> = ({
   onDeleteStory,
   onAddNew,
   onAddBookToPublisher,
-  onCreatePublisher
+  onCreatePublisher,
+  onAssignStoryPublisher
 }) => {
   const [showCreatePublisher, setShowCreatePublisher] = useState(false);
   const [newPublisherName, setNewPublisherName] = useState('');
   const [isSavingPublisher, setIsSavingPublisher] = useState(false);
   const [publisherError, setPublisherError] = useState<string | null>(null);
+  const [activePublisherId, setActivePublisherId] = useState<string | null>(null);
+  const [assigningStoryId, setAssigningStoryId] = useState<string | null>(null);
+  const [assignmentError, setAssignmentError] = useState<string | null>(null);
 
   const regularBooks = useMemo(
     () => stories.filter((story) => !story.publisherId),
     [stories]
   );
 
-  const publisherSections = useMemo(
-    () =>
-      publishers.map((publisher) => ({
-        publisher,
-        books: stories.filter((story) => story.publisherId === publisher.id)
-      })),
-    [publishers, stories]
+  const storiesByPublisher = useMemo(() => {
+    const grouped = new Map<string, StoryManifest[]>();
+    for (const publisher of publishers) {
+      grouped.set(
+        publisher.id,
+        stories.filter((story) => story.publisherId === publisher.id)
+      );
+    }
+    return grouped;
+  }, [publishers, stories]);
+
+  const activePublisher = useMemo(
+    () => publishers.find((publisher) => publisher.id === activePublisherId) || null,
+    [activePublisherId, publishers]
   );
+
+  const visibleStories = useMemo(() => {
+    if (!activePublisherId) {
+      return regularBooks;
+    }
+    return storiesByPublisher.get(activePublisherId) || [];
+  }, [activePublisherId, regularBooks, storiesByPublisher]);
 
   const handleCreatePublisher = async () => {
     const trimmed = newPublisherName.trim();
@@ -61,8 +80,69 @@ const Library: React.FC<LibraryProps> = ({
     }
   };
 
+  const handleAssignStoryPublisher = async (story: StoryManifest, nextPublisherId: string) => {
+    setAssignmentError(null);
+    setAssigningStoryId(story.id);
+    try {
+      await onAssignStoryPublisher(story.id, nextPublisherId || null);
+    } catch (error: any) {
+      setAssignmentError(error?.message || 'Failed to move book');
+    } finally {
+      setAssigningStoryId(null);
+    }
+  };
+
+  const renderPublisherCard = (publisher: Publisher) => {
+    const books = storiesByPublisher.get(publisher.id) || [];
+    const coverImage = books.find((book) => Boolean(book.coverImage))?.coverImage;
+
+    return (
+      <div key={`publisher-${publisher.id}`} className="group bg-white rounded-2xl p-4 shadow-sm hover:shadow-xl transition-all border border-gray-100 flex flex-col relative">
+        <div
+          onClick={() => setActivePublisherId(publisher.id)}
+          className="w-full aspect-[3/4] bg-gray-100 rounded-xl mb-4 overflow-hidden cursor-pointer relative"
+          title="Open publisher"
+        >
+          {coverImage ? (
+            <img src={coverImage} className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" />
+          ) : (
+            <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-orange-50 to-amber-100 text-amber-500">
+              <FolderOpen className="w-16 h-16 mb-3" />
+              <span className="text-xs font-bold uppercase tracking-wide">Publisher</span>
+            </div>
+          )}
+          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors" />
+        </div>
+
+        <div className="flex-1 cursor-pointer" onClick={() => setActivePublisherId(publisher.id)}>
+          <h3 className="font-bold text-gray-800 text-lg leading-tight mb-2 line-clamp-2">{publisher.name}</h3>
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <Calendar className="w-3 h-3" />
+            {new Date(publisher.createdAt).toLocaleDateString()}
+            <span className="ml-2">{books.length} books</span>
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            onClick={() => setActivePublisherId(publisher.id)}
+            className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-sm font-semibold hover:bg-gray-200 transition"
+          >
+            Open
+          </button>
+          <button
+            onClick={() => onAddBookToPublisher(publisher)}
+            className="px-3 py-2 rounded-lg bg-kid-orange text-white text-sm font-semibold hover:bg-orange-500 transition"
+          >
+            Add Book
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   const renderStoryCard = (story: StoryManifest) => (
-    <div key={story.id} className="group bg-white rounded-2xl p-4 shadow-sm hover:shadow-xl transition-all border border-gray-100 flex flex-col relative">
+    <div key={`story-${story.id}`} className="group bg-white rounded-2xl p-4 shadow-sm hover:shadow-xl transition-all border border-gray-100 flex flex-col relative">
       <div
         onClick={() => onOpenSetup(story)}
         className="w-full aspect-[3/4] bg-gray-100 rounded-xl mb-4 overflow-hidden cursor-pointer relative"
@@ -84,6 +164,27 @@ const Library: React.FC<LibraryProps> = ({
           <Calendar className="w-3 h-3" />
           {new Date(story.createdAt).toLocaleDateString()}
         </div>
+      </div>
+
+      <div className="mt-3">
+        <label className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 block mb-1">
+          Publisher
+        </label>
+        <select
+          value={story.publisherId || ''}
+          disabled={assigningStoryId === story.id}
+          onChange={(event) => {
+            void handleAssignStoryPublisher(story, event.target.value);
+          }}
+          className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm text-gray-700 bg-white"
+        >
+          <option value="">Regular Book</option>
+          {publishers.map((publisher) => (
+            <option key={publisher.id} value={publisher.id}>
+              {publisher.name}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2">
@@ -171,6 +272,32 @@ const Library: React.FC<LibraryProps> = ({
         </div>
       )}
 
+      {assignmentError && (
+        <div className="mb-6 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
+          {assignmentError}
+        </div>
+      )}
+
+      {activePublisher && (
+        <div className="mb-6 flex items-center justify-between bg-white border border-gray-200 rounded-xl p-3">
+          <button
+            onClick={() => setActivePublisherId(null)}
+            className="inline-flex items-center gap-2 text-sm font-semibold text-gray-600 hover:text-gray-800"
+          >
+            <ChevronLeft className="w-4 h-4" /> Back to Library
+          </button>
+          <div className="text-sm font-semibold text-gray-700">
+            {activePublisher.name}
+          </div>
+          <button
+            onClick={() => onAddBookToPublisher(activePublisher)}
+            className="px-3 py-2 rounded-lg bg-kid-orange text-white text-sm font-semibold hover:bg-orange-500 transition"
+          >
+            Add Book
+          </button>
+        </div>
+      )}
+
       {stories.length === 0 && publishers.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-200">
           <div className="w-24 h-24 bg-gray-50 rounded-full flex items-center justify-center mb-4">
@@ -188,55 +315,14 @@ const Library: React.FC<LibraryProps> = ({
           </div>
         </div>
       ) : (
-        <div className="space-y-8">
-          {publisherSections.map(({ publisher, books }) => (
-            <section key={publisher.id} className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <FolderOpen className="w-5 h-5 text-kid-orange" />
-                  <h3 className="text-xl font-bold text-gray-800">{publisher.name}</h3>
-                  <span className="text-xs font-semibold text-gray-400">{books.length} books</span>
-                </div>
-                <button
-                  onClick={() => onAddBookToPublisher(publisher)}
-                  className="px-3 py-2 rounded-lg bg-kid-orange text-white text-sm font-semibold hover:bg-orange-500 transition flex items-center gap-1"
-                >
-                  <Plus className="w-4 h-4" /> Add Book
-                </button>
-              </div>
-
-              {books.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-gray-200 p-6 text-sm text-gray-500">
-                  No books in this publisher yet.
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
-                  {books.map((story) => renderStoryCard(story))}
-                </div>
-              )}
-            </section>
-          ))}
-
-          <section className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-xl font-bold text-gray-800">Regular Books</h3>
-              <button
-                onClick={onAddNew}
-                className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-sm font-semibold hover:bg-gray-200 transition flex items-center gap-1"
-              >
-                <Plus className="w-4 h-4" /> Add Book
-              </button>
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
+          {!activePublisherId && publishers.map((publisher) => renderPublisherCard(publisher))}
+          {visibleStories.map((story) => renderStoryCard(story))}
+          {activePublisherId && visibleStories.length === 0 && (
+            <div className="sm:col-span-2 md:col-span-3 rounded-xl border border-dashed border-gray-200 p-8 bg-white text-center text-sm text-gray-500">
+              No books in this publisher yet.
             </div>
-            {regularBooks.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-gray-200 p-6 text-sm text-gray-500">
-                No regular books yet.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
-                {regularBooks.map((story) => renderStoryCard(story))}
-              </div>
-            )}
-          </section>
+          )}
         </div>
       )}
     </div>
