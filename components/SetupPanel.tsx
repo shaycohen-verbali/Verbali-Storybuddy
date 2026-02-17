@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles, FolderOpen } from 'lucide-react';
-import { FileData, Publisher, SetupStoryResponse, StoryPack } from '../types';
+import { FileData, Publisher, SetupStoryResponse, StoryPack, StyleReferenceAsset } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
-import { extractStyleScreenshotsFromPdf } from '../services/pdfService';
+import { extractStyleReferenceAssetsFromPdf } from '../services/pdfService';
 
 interface SetupInitialView {
   storyId?: string;
@@ -44,6 +44,95 @@ const parseDataUrl = (dataUrl: string): FileData => {
 
   return { mimeType: match[1], data: match[2] };
 };
+
+const STYLE_REF_SCENE_QUOTA = 6;
+const STYLE_REF_CHARACTER_QUOTA = 4;
+const STYLE_REF_OBJECT_QUOTA = 4;
+const STYLE_REF_TOTAL = 14;
+
+const toFingerprint = (item: FileData): string => {
+  const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 32);
+  return `${item.mimeType}:${item.data.length}:${item.data.slice(0, 64)}:${item.data.slice(middleStart, middleStart + 64)}:${item.data.slice(-64)}`;
+};
+
+const toStyleReferenceAsset = (
+  item: Partial<StyleReferenceAsset> & FileData,
+  fallback: Partial<StyleReferenceAsset> = {}
+): StyleReferenceAsset => ({
+  mimeType: item.mimeType,
+  data: item.data,
+  kind: item.kind || fallback.kind || 'scene',
+  source: item.source || fallback.source || 'upload',
+  characterName: item.characterName || fallback.characterName,
+  objectName: item.objectName || fallback.objectName,
+  pageIndex: item.pageIndex ?? fallback.pageIndex,
+  confidence: item.confidence ?? fallback.confidence ?? 0.5,
+  detectedCharacters: item.detectedCharacters || fallback.detectedCharacters || [],
+  detectedObjects: item.detectedObjects || fallback.detectedObjects || []
+});
+
+const stripStyleReferenceAsset = (item: StyleReferenceAsset): FileData => ({
+  mimeType: item.mimeType,
+  data: item.data
+});
+
+const mergeStyleReferenceAssets = (
+  preferred: StyleReferenceAsset[],
+  fallback: StyleReferenceAsset[]
+): StyleReferenceAsset[] => {
+  const merged: StyleReferenceAsset[] = [];
+  const seen = new Set<string>();
+
+  for (const item of [...preferred, ...fallback]) {
+    if (!item?.data || !item?.mimeType) continue;
+    const key = toFingerprint(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+
+  return merged.slice(0, 120);
+};
+
+const buildBalancedSetupPayload = (styleRefs: StyleReferenceAsset[]): StyleReferenceAsset[] => {
+  const refs = mergeStyleReferenceAssets(styleRefs, []);
+  const ranked = [...refs].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const selected: StyleReferenceAsset[] = [];
+  const used = new Set<string>();
+
+  const pick = (kind: StyleReferenceAsset['kind'], limit: number) => {
+    for (const ref of ranked) {
+      if (selected.length >= STYLE_REF_TOTAL) return;
+      if (ref.kind !== kind) continue;
+      const key = toFingerprint(ref);
+      if (used.has(key)) continue;
+      const countForKind = selected.filter((item) => item.kind === kind).length;
+      if (countForKind >= limit) continue;
+      selected.push(ref);
+      used.add(key);
+    }
+  };
+
+  pick('scene', STYLE_REF_SCENE_QUOTA);
+  pick('character', STYLE_REF_CHARACTER_QUOTA);
+  pick('object', STYLE_REF_OBJECT_QUOTA);
+
+  for (const ref of ranked) {
+    if (selected.length >= STYLE_REF_TOTAL) break;
+    const key = toFingerprint(ref);
+    if (used.has(key)) continue;
+    selected.push(ref);
+    used.add(key);
+  }
+
+  return selected.slice(0, STYLE_REF_TOTAL);
+};
+
+const getStyleRefCounts = (refs: StyleReferenceAsset[]) => ({
+  scene: refs.filter((ref) => ref.kind === 'scene').length,
+  character: refs.filter((ref) => ref.kind === 'character').length,
+  object: refs.filter((ref) => ref.kind === 'object').length
+});
 
 const fileToDataUrl = async (file: File): Promise<string> => {
   const reader = new FileReader();
@@ -118,7 +207,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const [currentStory, setCurrentStory] = useState<FileData | null>(null);
-  const [styleReferences, setStyleReferences] = useState<FileData[]>([]);
+  const [styleReferences, setStyleReferences] = useState<StyleReferenceAsset[]>([]);
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
   const [isReadOnlyView, setIsReadOnlyView] = useState(false);
   const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null);
@@ -140,7 +229,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     }
 
     setCurrentStory(initialView.storyFile || null);
-    setStyleReferences(initialView.styleImages || []);
+    const initialRefs = initialView.storyPack?.styleReferences?.length
+      ? initialView.storyPack.styleReferences
+      : (initialView.styleImages || []).map((item) => toStyleReferenceAsset(item, { kind: 'scene', source: 'upload' }));
+    setStyleReferences(initialRefs);
     setPreparedPack(initialView.storyPack || null);
     setIsReadOnlyView(Boolean(initialView.readOnly));
     setSelectedPublisherId(initialView.publisherId || null);
@@ -148,7 +240,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setIsProcessing(false);
   }, [initialView]);
 
-  const runSetupFromCurrentStory = async (sourceStory?: FileData | null, sourceStyles?: FileData[]) => {
+  const runSetupFromCurrentStory = async (sourceStory?: FileData | null, sourceStyles?: StyleReferenceAsset[]) => {
     const storySource = sourceStory || currentStory;
     if (!storySource) {
       setErrorMsg('Original PDF is required to re-run setup.');
@@ -161,25 +253,29 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     try {
       let effectiveStyles = sourceStyles ?? styleReferences;
       if (effectiveStyles.length === 0) {
-        const screenshots = await extractStyleScreenshotsFromPdf(storySource.data, 80);
-        effectiveStyles = screenshots
-          .map((dataUrl) => parseDataUrl(dataUrl))
-          .filter((item) => item.data.length > 0);
+        const extracted = await extractStyleReferenceAssetsFromPdf(storySource.data, 80);
+        effectiveStyles = extracted.filter((item) => item.data.length > 0);
       }
 
       if (effectiveStyles.length > 0) {
-        setStyleReferences(effectiveStyles);
+        setStyleReferences(mergeStyleReferenceAssets(effectiveStyles, []));
       }
 
-      const setupStyles = effectiveStyles.slice(0, 8);
-      const setupResponse = await onPrepareStory(storySource, setupStyles);
+      const setupPayload = buildBalancedSetupPayload(effectiveStyles).map(stripStyleReferenceAsset);
+      const setupResponse = await onPrepareStory(storySource, setupPayload);
       setPreparedPack((prev) => ({
         ...setupResponse.storyPack,
         coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
       }));
 
-      if (effectiveStyles.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
-        setStyleReferences(setupResponse.storyPack.stylePrimer);
+      if (setupResponse.storyPack.styleReferences?.length) {
+        setStyleReferences(setupResponse.storyPack.styleReferences);
+      } else if (effectiveStyles.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
+        setStyleReferences(
+          setupResponse.storyPack.stylePrimer.map((item) =>
+            toStyleReferenceAsset(item, { kind: 'scene', source: 'generated' })
+          )
+        );
       }
     } catch (error: any) {
       console.error(error);
@@ -212,10 +308,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       const dataUrl = await fileToDataUrl(file);
       const storyFile: FileData = { data: dataUrl.split(',')[1] || '', mimeType: file.type };
       setCurrentStory(storyFile);
-      const screenshots = await extractStyleScreenshotsFromPdf(storyFile.data, 80);
-      const screenshotReferences = screenshots
-        .map((value) => parseDataUrl(value))
-        .filter((item) => item.data.length > 0);
+      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(storyFile.data, 80);
       if (screenshotReferences.length > 0) {
         setStyleReferences(screenshotReferences);
       }
@@ -236,16 +329,17 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       return;
     }
 
-    const newStyles: FileData[] = [];
+    const newStyles: StyleReferenceAsset[] = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       if (!file.type.startsWith('image/')) {
         continue;
       }
-      newStyles.push(await compressImageFile(file));
+      const compressed = await compressImageFile(file);
+      newStyles.push(toStyleReferenceAsset(compressed, { kind: 'scene', source: 'upload', confidence: 0.7 }));
     }
 
-    setStyleReferences((prev) => [...prev, ...newStyles]);
+    setStyleReferences((prev) => mergeStyleReferenceAssets([...prev, ...newStyles], []));
   };
 
   const handleCoverUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -314,10 +408,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
-      const screenshots = await extractStyleScreenshotsFromPdf(currentStory.data, 80);
-      const screenshotReferences = screenshots
-        .map((value) => parseDataUrl(value))
-        .filter((item) => item.data.length > 0);
+      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(currentStory.data, 80);
       if (screenshotReferences.length > 0) {
         setStyleReferences(screenshotReferences);
       }
@@ -339,10 +430,22 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
-      const finalPrimer = mergePrimerSources(styleReferences, preparedPack.stylePrimer);
+      const preparedRefs = preparedPack.styleReferences?.length
+        ? preparedPack.styleReferences
+        : preparedPack.stylePrimer.map((item) =>
+            toStyleReferenceAsset(item, { kind: 'scene', source: 'generated' })
+          );
+      const finalStyleRefs = buildBalancedSetupPayload(
+        mergeStyleReferenceAssets(styleReferences, preparedRefs)
+      );
+      const finalPrimer = mergePrimerSources(
+        finalStyleRefs.map(stripStyleReferenceAsset),
+        preparedPack.stylePrimer
+      ).slice(0, STYLE_REF_TOTAL);
       const finalPack: StoryPack = {
         ...preparedPack,
-        stylePrimer: finalPrimer
+        stylePrimer: finalPrimer,
+        styleReferences: finalStyleRefs
       };
 
       if (isExistingStory && initialView?.storyId) {
@@ -374,6 +477,13 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
   const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+  const preparedStyleRefs = preparedPack?.styleReferences?.length
+    ? preparedPack.styleReferences
+    : (preparedPack?.stylePrimer || []).map((item) =>
+        toStyleReferenceAsset(item, { kind: 'scene', source: 'generated' })
+      );
+  const setupPreviewRefs = buildBalancedSetupPayload(styleReferences);
+  const styleCounts = getStyleRefCounts(setupPreviewRefs);
   const selectedPublisher = publishers.find((publisher) => publisher.id === selectedPublisherId) || null;
   const hasAnalysis = Boolean(summary || preparedPack) || isReadOnlyView;
 
@@ -578,8 +688,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                               );
                               const mappedIndexes = mapEntry?.styleRefIndexes || [];
                               const mappedRefs = mappedIndexes
-                                .map((index) => preparedPack?.stylePrimer?.[index] || null)
-                                .filter((entry): entry is FileData => Boolean(entry));
+                                .map((index) => preparedStyleRefs[index] || null)
+                                .filter((entry): entry is StyleReferenceAsset => Boolean(entry));
 
                               return (
                                 <div key={`${character.name}-${character.source}`} className="rounded-lg border border-gray-100 p-2">
@@ -602,6 +712,11 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                       ))}
                                     </div>
                                   )}
+                                  {mappedRefs.length === 0 && (
+                                    <p className="mt-2 text-[11px] text-amber-600 font-semibold">
+                                      No standalone crop found
+                                    </p>
+                                  )}
                                 </div>
                               );
                             })}
@@ -623,13 +738,30 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Style References
                 </h3>
                 <p className="text-gray-500 text-sm mb-6">
-                  Page screenshots from across the book plus uploaded references used for option image generation.
+                  Mixed references used for generation. Setup sends up to 14 refs (6 scene, 4 character, 4 object).
                 </p>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-bold">
+                    Setup Pack {setupPreviewRefs.length}/{STYLE_REF_TOTAL}
+                  </span>
+                  <span className="px-2 py-1 rounded-full bg-sky-50 text-sky-700 text-xs font-bold">
+                    Scene {styleCounts.scene}
+                  </span>
+                  <span className="px-2 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-bold">
+                    Character {styleCounts.character}
+                  </span>
+                  <span className="px-2 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-bold">
+                    Object {styleCounts.object}
+                  </span>
+                </div>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">
                   {styleReferences.map((style, idx) => (
                     <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
                       <img src={`data:${style.mimeType};base64,${style.data}`} className="w-full h-full object-cover" />
+                      <span className="absolute left-1 top-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-semibold uppercase">
+                        {style.kind}
+                      </span>
                       {canEdit && (
                         <button
                           onClick={() => removeStyleImage(idx)}

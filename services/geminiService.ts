@@ -255,7 +255,7 @@ export const generateCoverIllustration = async (
 
   try {
     const response = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
+        model: 'nano-banana-pro',
         contents: { parts },
         config: {
             imageConfig: { aspectRatio: "3:4" }
@@ -466,7 +466,7 @@ export const generateIllustration = async (
   // TRY FLASH FIRST for Speed in interaction loop
   try {
     const response = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
+        model: 'nano-banana-pro',
         contents: { parts },
         config: {
             imageConfig: { aspectRatio: "1:1" }

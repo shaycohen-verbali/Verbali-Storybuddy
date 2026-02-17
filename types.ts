@@ -3,6 +3,33 @@ export interface FileData {
   mimeType: string;
 }
 
+export type StyleReferenceKind = 'scene' | 'character' | 'object';
+export type StyleReferenceSource = 'pdf_page' | 'upload' | 'crop' | 'generated';
+
+export interface StyleReferenceBox {
+  x: number; // 0..1 normalized
+  y: number; // 0..1 normalized
+  width: number; // 0..1 normalized
+  height: number; // 0..1 normalized
+}
+
+export interface StyleReferenceDetection {
+  name: string;
+  confidence: number; // 0..1
+  box?: StyleReferenceBox;
+}
+
+export interface StyleReferenceAsset extends FileData {
+  kind: StyleReferenceKind;
+  source: StyleReferenceSource;
+  characterName?: string;
+  objectName?: string;
+  pageIndex?: number;
+  confidence?: number;
+  detectedCharacters?: StyleReferenceDetection[];
+  detectedObjects?: StyleReferenceDetection[];
+}
+
 export interface StoryContext {
   storyContent: FileData | null;
   styleImages: FileData[];
@@ -62,12 +89,14 @@ export interface StoryPack {
   storyFacts: StoryFacts;
   coverImage?: string | null;
   stylePrimer: FileData[];
+  styleReferences?: StyleReferenceAsset[];
 }
 
 export interface StoryFacts {
   characters: string[];
   characterCatalog: StoryCharacterFact[];
   characterImageMap?: StoryCharacterImageMap[];
+  objectImageMap?: StoryObjectImageMap[];
   places: string[];
   objects: string[];
   events: string[];
@@ -77,6 +106,11 @@ export interface StoryFacts {
 
 export interface StoryCharacterImageMap {
   characterName: string;
+  styleRefIndexes: number[];
+}
+
+export interface StoryObjectImageMap {
+  objectName: string;
   styleRefIndexes: number[];
 }
 
@@ -106,6 +140,7 @@ export interface StoryAssets {
   id: string;
   storyBrief: string;
   stylePrimer: FileData[];
+  styleReferences?: StyleReferenceAsset[];
   pdfData?: FileData;
   metadata: StoryMetadata;
 }
@@ -142,6 +177,7 @@ export interface TurnRequest {
   storyFacts?: StoryFacts;
   artStyle: string;
   stylePrimer: FileData[];
+  styleReferences?: StyleReferenceAsset[];
   history: ChatTurn[];
 }
 

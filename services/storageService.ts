@@ -13,6 +13,7 @@ const createDefaultStoryFacts = (source: string) => ({
   characters: [],
   characterCatalog: [],
   characterImageMap: [],
+  objectImageMap: [],
   places: [],
   objects: [],
   events: [],
@@ -41,7 +42,8 @@ const legacyToAssets = (legacy: StoredStory): StoryAssets => ({
     ...legacy.metadata,
     storyBrief: legacy.metadata.storyBrief || legacy.metadata.summary,
     storyFacts: legacy.metadata.storyFacts || createDefaultStoryFacts(legacy.metadata.storyBrief || legacy.metadata.summary)
-  }
+  },
+  styleReferences: []
 });
 
 const normalizeManifest = (manifest: StoryManifest): StoryManifest => ({

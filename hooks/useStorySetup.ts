@@ -43,6 +43,8 @@ export const useStorySetup = () => {
           storyFacts: {
             characters: [],
             characterCatalog: [],
+            characterImageMap: [],
+            objectImageMap: [],
             places: [],
             objects: [],
             events: [],

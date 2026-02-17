@@ -19,6 +19,8 @@ describe('apiClient', () => {
             storyFacts: {
               characters: ['Milo'],
               characterCatalog: [{ name: 'Milo', source: 'mentioned' }],
+              characterImageMap: [{ characterName: 'Milo', styleRefIndexes: [1] }],
+              objectImageMap: [{ objectName: 'shell', styleRefIndexes: [2] }],
               places: ['ocean reef'],
               objects: ['shell'],
               events: ['Milo finds a shell'],
@@ -26,7 +28,11 @@ describe('apiClient', () => {
               worldTags: ['ocean']
             },
             coverImage: null,
-            stylePrimer: []
+            stylePrimer: [],
+            styleReferences: [
+              { mimeType: 'image/jpeg', data: 'a', kind: 'scene', source: 'pdf_page' },
+              { mimeType: 'image/jpeg', data: 'b', kind: 'character', source: 'crop', characterName: 'Milo' }
+            ]
           },
           timings: { analyzeMs: 10, coverMs: 20, totalMs: 30 },
           payloadBytes: 123
@@ -41,6 +47,7 @@ describe('apiClient', () => {
 
     expect(response.storyPack.summary).toBe('A short story');
     expect(response.storyPack.storyFacts.places[0]).toBe('ocean reef');
+    expect(response.storyPack.styleReferences?.[1].characterName).toBe('Milo');
     expect(response.timings.totalMs).toBe(30);
   });
 
@@ -75,14 +82,20 @@ describe('apiClient', () => {
       storyFacts: {
         characters: ['Milo'],
         characterCatalog: [{ name: 'Milo', source: 'mentioned' }],
+        characterImageMap: [{ characterName: 'Milo', styleRefIndexes: [0] }],
+        objectImageMap: [{ objectName: 'shell', styleRefIndexes: [1] }],
         places: ['reef'],
-        objects: [],
+        objects: ['shell'],
         events: [],
         setting: 'Ocean reef',
         worldTags: ['ocean']
       },
       artStyle: 'style',
       stylePrimer: [],
+      styleReferences: [
+        { mimeType: 'image/jpeg', data: 'x', kind: 'scene', source: 'pdf_page' },
+        { mimeType: 'image/jpeg', data: 'y', kind: 'object', source: 'crop', objectName: 'shell' }
+      ],
       history: []
     });
 

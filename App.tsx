@@ -120,6 +120,7 @@ const App: React.FC = () => {
             characters: [],
             characterCatalog: [],
             characterImageMap: [],
+            objectImageMap: [],
             places: [],
             objects: [],
             events: [],
@@ -127,7 +128,8 @@ const App: React.FC = () => {
             worldTags: []
           },
           coverImage: story.coverImage || null,
-          stylePrimer: assets.stylePrimer
+          stylePrimer: assets.stylePrimer,
+          styleReferences: assets.styleReferences || []
         }
       });
       setCurrentMode(AppMode.SETUP);
@@ -181,6 +183,7 @@ const App: React.FC = () => {
       id,
       storyBrief: storyPack.storyBrief,
       stylePrimer: storyPack.stylePrimer,
+      styleReferences: storyPack.styleReferences || [],
       pdfData: storyFile,
       metadata
     };
@@ -226,6 +229,7 @@ const App: React.FC = () => {
       id: payload.storyId,
       storyBrief: payload.storyPack.storyBrief,
       stylePrimer: payload.storyPack.stylePrimer,
+      styleReferences: payload.storyPack.styleReferences || [],
       pdfData: payload.storyFile || existingAssetsPdf || undefined,
       metadata
     };

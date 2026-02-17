@@ -11,8 +11,12 @@ const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
-const MAX_STYLE_REFS_FOR_MAPPING = 8;
-const MAX_STYLE_REFS_PER_IMAGE = 2;
+const IMAGE_MODEL = 'nano-banana-pro';
+const STYLE_REF_MAX_TOTAL = 14;
+const STYLE_REF_SCENE_QUOTA = 6;
+const STYLE_REF_CHARACTER_QUOTA = 4;
+const STYLE_REF_OBJECT_QUOTA = 4;
+const MAX_CHARACTER_REFS_PER_CHARACTER = 3;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -198,6 +202,344 @@ const normalizeCharacterImageMap = (imageMap, characterCatalog, maxRefCount) => 
   }));
 };
 
+const normalizeObjectImageMap = (imageMap, objects, maxRefCount) => {
+  const allowed = new Map(
+    normalizeFactList(objects, 40)
+      .map((name) => [name.toLowerCase(), name])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const normalized = new Map();
+
+  for (const item of Array.isArray(imageMap) ? imageMap : []) {
+    const key = String(item?.objectName || item?.object_name || '').trim().toLowerCase();
+    const canonicalName = allowed.get(key);
+    if (!canonicalName) continue;
+
+    const sourceIndexes = Array.isArray(item?.styleRefIndexes)
+      ? item.styleRefIndexes
+      : Array.isArray(item?.style_ref_indexes)
+        ? item.style_ref_indexes
+        : [];
+
+    const validIndexes = sourceIndexes
+      .map((index) => Number(index))
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < maxRefCount);
+
+    if (validIndexes.length === 0) continue;
+
+    const existing = normalized.get(canonicalName) || [];
+    const merged = [...existing, ...validIndexes];
+    const deduped = [...new Set(merged)].slice(0, 6);
+
+    normalized.set(canonicalName, deduped);
+  }
+
+  return Array.from(normalized.entries()).map(([objectName, styleRefIndexes]) => ({
+    objectName,
+    styleRefIndexes
+  }));
+};
+
+const normalizeStyleReferenceKind = (value, fallback = 'scene') => {
+  const kind = String(value || '').toLowerCase();
+  if (kind === 'character') return 'character';
+  if (kind === 'object') return 'object';
+  if (kind === 'scene') return 'scene';
+  return fallback;
+};
+
+const normalizeStyleReferenceSource = (value, fallback = 'upload') => {
+  const source = String(value || '').toLowerCase();
+  if (source === 'pdf_page') return 'pdf_page';
+  if (source === 'upload') return 'upload';
+  if (source === 'crop') return 'crop';
+  if (source === 'generated') return 'generated';
+  return fallback;
+};
+
+const normalizeConfidence = (value, fallback = 0.5) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+};
+
+const styleRefFingerprint = (item) => {
+  if (!item?.data || !item?.mimeType) return '';
+  const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 24);
+  return [
+    item.mimeType,
+    item.data.length,
+    item.data.slice(0, 40),
+    item.data.slice(middleStart, middleStart + 48),
+    item.data.slice(-40)
+  ].join(':');
+};
+
+const normalizeStyleReferenceAssets = (styleRefs, fallbackSource = 'upload', dedupe = true) => {
+  const normalized = [];
+  const seen = new Set();
+
+  for (const ref of Array.isArray(styleRefs) ? styleRefs : []) {
+    if (!ref?.data || !ref?.mimeType) continue;
+
+    const fingerprint = styleRefFingerprint(ref);
+    if (!fingerprint) continue;
+    if (dedupe && seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+
+    normalized.push({
+      mimeType: ref.mimeType,
+      data: ref.data,
+      kind: normalizeStyleReferenceKind(ref.kind, 'scene'),
+      source: normalizeStyleReferenceSource(ref.source, fallbackSource),
+      characterName: normalizePhrase(ref.characterName || ''),
+      objectName: normalizePhrase(ref.objectName || ''),
+      pageIndex: Number.isInteger(ref.pageIndex) ? Number(ref.pageIndex) : undefined,
+      confidence: normalizeConfidence(ref.confidence, 0.5),
+      detectedCharacters: Array.isArray(ref.detectedCharacters)
+        ? ref.detectedCharacters
+            .map((entry) => ({
+              name: normalizePhrase(entry?.name || ''),
+              confidence: normalizeConfidence(entry?.confidence, 0.5)
+            }))
+            .filter((entry) => entry.name)
+            .slice(0, 4)
+        : [],
+      detectedObjects: Array.isArray(ref.detectedObjects)
+        ? ref.detectedObjects
+            .map((entry) => ({
+              name: normalizePhrase(entry?.name || ''),
+              confidence: normalizeConfidence(entry?.confidence, 0.5)
+            }))
+            .filter((entry) => entry.name)
+            .slice(0, 4)
+        : []
+    });
+  }
+
+  return normalized;
+};
+
+const buildAllowedCharacterMap = (storyFacts) =>
+  new Map(
+    (storyFacts?.characterCatalog || [])
+      .map((entry) => [String(entry?.name || '').trim().toLowerCase(), String(entry?.name || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+
+const buildAllowedObjectMap = (storyFacts) =>
+  new Map(
+    (storyFacts?.objects || [])
+      .map((entry) => [String(entry || '').trim().toLowerCase(), String(entry || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+
+const normalizeToAllowedName = (value, allowedMap) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  return allowedMap.get(normalized) || '';
+};
+
+const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
+  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
+  if (references.length === 0) {
+    return [];
+  }
+
+  const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
+  const allowedObjects = (storyFacts?.objects || []).slice(0, 20);
+
+  const parts = [
+    {
+      text: [
+        'Classify each style reference image.',
+        `Character names allowed: ${allowedCharacters.join(', ') || 'none'}.`,
+        `Object names allowed: ${allowedObjects.join(', ') || 'none'}.`,
+        `You will receive ${references.length} images in order.`,
+        'Return strict JSON with classifications array.',
+        'Each item must contain:',
+        '- image_index (number)',
+        '- kind (scene | character | object)',
+        '- confidence (0..1)',
+        '- characters (array of exact allowed names)',
+        '- objects (array of exact allowed object names)',
+        'Rules:',
+        '- If image is a character crop, use kind=character.',
+        '- If image highlights a key object, use kind=object.',
+        '- Use kind=scene for page-wide or environmental references.'
+      ].join('\n')
+    }
+  ];
+
+  references.forEach((reference, index) => {
+    parts.push({ text: `Reference image index ${index}` });
+    parts.push({ inlineData: { mimeType: reference.mimeType, data: reference.data } });
+  });
+
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: { parts },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              classifications: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    image_index: { type: Type.NUMBER },
+                    kind: { type: Type.STRING },
+                    confidence: { type: Type.NUMBER },
+                    characters: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    objects: { type: Type.ARRAY, items: { type: Type.STRING } }
+                  },
+                  required: ['image_index', 'kind', 'confidence', 'characters', 'objects']
+                }
+              }
+            },
+            required: ['classifications']
+          }
+        }
+      })
+    );
+
+    return parseJsonSafe(response.text, { classifications: [] }).classifications || [];
+  } catch (error) {
+    console.warn('[setup] style reference classification failed', error?.message || error);
+    return [];
+  }
+};
+
+const mergeStyleReferenceClassification = (styleRefs, classifications, storyFacts) => {
+  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
+  const classificationMap = new Map();
+  for (const item of Array.isArray(classifications) ? classifications : []) {
+    const idx = Number(item?.image_index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= references.length) continue;
+    classificationMap.set(idx, item);
+  }
+
+  const allowedCharacters = buildAllowedCharacterMap(storyFacts);
+  const allowedObjects = buildAllowedObjectMap(storyFacts);
+
+  return references.map((reference, index) => {
+    const classification = classificationMap.get(index);
+    const characters = (Array.isArray(classification?.characters) ? classification.characters : [])
+      .map((name) => normalizeToAllowedName(name, allowedCharacters))
+      .filter(Boolean);
+    const objects = (Array.isArray(classification?.objects) ? classification.objects : [])
+      .map((name) => normalizeToAllowedName(name, allowedObjects))
+      .filter(Boolean);
+
+    const characterName = characters[0] || normalizeToAllowedName(reference.characterName, allowedCharacters);
+    const objectName = objects[0] || normalizeToAllowedName(reference.objectName, allowedObjects);
+
+    let kind = normalizeStyleReferenceKind(classification?.kind, reference.kind || 'scene');
+    if (characterName) kind = 'character';
+    else if (objectName && kind !== 'character') kind = 'object';
+
+    return {
+      ...reference,
+      kind,
+      characterName: characterName || undefined,
+      objectName: objectName || undefined,
+      confidence: normalizeConfidence(classification?.confidence, reference.confidence ?? 0.5),
+      detectedCharacters: characters.map((name) => ({ name, confidence: normalizeConfidence(classification?.confidence, 0.6) })),
+      detectedObjects: objects.map((name) => ({ name, confidence: normalizeConfidence(classification?.confidence, 0.6) }))
+    };
+  });
+};
+
+const sortStyleRefs = (refs) =>
+  [...refs].sort((a, b) => {
+    const confidenceDelta = (b.confidence || 0) - (a.confidence || 0);
+    if (confidenceDelta !== 0) return confidenceDelta;
+    return (a.pageIndex ?? Number.MAX_SAFE_INTEGER) - (b.pageIndex ?? Number.MAX_SAFE_INTEGER);
+  });
+
+const buildCanonicalStyleReferencePack = (styleRefs) => {
+  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
+  const selected = [];
+  const used = new Set();
+
+  const pickKind = (kind, limit) => {
+    for (const ref of sortStyleRefs(references).filter((item) => item.kind === kind)) {
+      const key = styleRefFingerprint(ref);
+      if (!key || used.has(key)) continue;
+      selected.push(ref);
+      used.add(key);
+      if (selected.length >= STYLE_REF_MAX_TOTAL) return;
+      const pickedOfKind = selected.filter((item) => item.kind === kind).length;
+      if (pickedOfKind >= limit) return;
+    }
+  };
+
+  pickKind('scene', STYLE_REF_SCENE_QUOTA);
+  pickKind('character', STYLE_REF_CHARACTER_QUOTA);
+  pickKind('object', STYLE_REF_OBJECT_QUOTA);
+
+  for (const ref of sortStyleRefs(references)) {
+    if (selected.length >= STYLE_REF_MAX_TOTAL) break;
+    const key = styleRefFingerprint(ref);
+    if (!key || used.has(key)) continue;
+    selected.push(ref);
+    used.add(key);
+  }
+
+  return selected.slice(0, STYLE_REF_MAX_TOTAL);
+};
+
+const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
+  const characterBuckets = new Map();
+  const objectBuckets = new Map();
+  const allowedCharacters = buildAllowedCharacterMap(storyFacts);
+  const allowedObjects = buildAllowedObjectMap(storyFacts);
+
+  (Array.isArray(styleRefs) ? styleRefs : []).forEach((reference, index) => {
+    const characterName = normalizeToAllowedName(reference?.characterName, allowedCharacters);
+    if (characterName) {
+      const list = characterBuckets.get(characterName) || [];
+      if (list.length < MAX_CHARACTER_REFS_PER_CHARACTER) {
+        list.push(index);
+        characterBuckets.set(characterName, list);
+      }
+    }
+
+    const objectName = normalizeToAllowedName(reference?.objectName, allowedObjects);
+    if (objectName) {
+      const list = objectBuckets.get(objectName) || [];
+      if (list.length < 4) {
+        list.push(index);
+        objectBuckets.set(objectName, list);
+      }
+    }
+  });
+
+  return {
+    characterImageMap: normalizeCharacterImageMap(
+      Array.from(characterBuckets.entries()).map(([characterName, styleRefIndexes]) => ({
+        characterName,
+        styleRefIndexes
+      })),
+      storyFacts?.characterCatalog || [],
+      styleRefs.length
+    ),
+    objectImageMap: normalizeObjectImageMap(
+      Array.from(objectBuckets.entries()).map(([objectName, styleRefIndexes]) => ({
+        objectName,
+        styleRefIndexes
+      })),
+      storyFacts?.objects || [],
+      styleRefs.length
+    )
+  };
+};
+
 const inferLocationFromStory = (storyBrief) => {
   const brief = (storyBrief || '').toLowerCase();
   if (/(ocean|sea|underwater|reef|shark|whale|fish)/.test(brief)) return 'In the ocean';
@@ -238,7 +580,12 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     characterImageMap: normalizeCharacterImageMap(
       facts?.characterImageMap || facts?.character_image_map,
       characterCatalog,
-      MAX_STYLE_REFS_FOR_MAPPING
+      STYLE_REF_MAX_TOTAL
+    ),
+    objectImageMap: normalizeObjectImageMap(
+      facts?.objectImageMap || facts?.object_image_map,
+      facts?.objects,
+      STYLE_REF_MAX_TOTAL
     ),
     places: normalizeFactList(facts?.places, 12),
     objects: normalizeFactList(facts?.objects, 12),
@@ -279,6 +626,10 @@ const compactFactsForPrompt = (storyFacts) => {
     })),
     characterImageMap: (normalized.characterImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
       characterName: entry.characterName,
+      styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
+    })),
+    objectImageMap: (normalized.objectImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      objectName: entry.objectName,
       styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
     })),
     places: normalized.places.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
@@ -798,134 +1149,110 @@ const inferOptionCharacters = (optionText, storyFacts) => {
   return matches.slice(0, 2);
 };
 
-const selectStyleRefsForOption = (stylePrimer, storyFacts, optionText) => {
-  const safePrimer = Array.isArray(stylePrimer) ? stylePrimer : [];
-  const selected = [];
-  const seenIndexes = new Set();
-
-  if (safePrimer.length > 0) {
-    selected.push(safePrimer[0]);
-    seenIndexes.add(0);
+const inferOptionObjects = (optionText, storyFacts) => {
+  const normalizedOption = canonicalOption(optionText);
+  if (!normalizedOption) {
+    return [];
   }
 
-  const optionCharacters = inferOptionCharacters(optionText, storyFacts);
-  const styleMap = storyFacts?.characterImageMap || [];
-
-  for (const optionCharacter of optionCharacters) {
-    const mapping = styleMap.find(
-      (entry) => String(entry.characterName || '').toLowerCase() === optionCharacter.toLowerCase()
-    );
-    if (!mapping) continue;
-
-    for (const idx of mapping.styleRefIndexes || []) {
-      if (seenIndexes.has(idx)) continue;
-      if (!safePrimer[idx]) continue;
-      selected.push(safePrimer[idx]);
-      seenIndexes.add(idx);
-      if (selected.length >= MAX_STYLE_REFS_PER_IMAGE) {
-        return { refs: selected, optionCharacters };
-      }
+  const matches = [];
+  for (const value of storyFacts?.objects || []) {
+    const normalizedValue = canonicalOption(value);
+    if (!normalizedValue) continue;
+    if (normalizedOption.includes(normalizedValue) || normalizedValue.includes(normalizedOption)) {
+      matches.push(value);
     }
   }
 
-  for (let i = 0; i < safePrimer.length && selected.length < MAX_STYLE_REFS_PER_IMAGE; i += 1) {
-    if (seenIndexes.has(i)) continue;
-    selected.push(safePrimer[i]);
-    seenIndexes.add(i);
-  }
-
-  return { refs: selected, optionCharacters };
+  return matches.slice(0, 2);
 };
 
-const buildCharacterImageMapFromStyleRefs = async (ai, styleRefs, storyFacts) => {
-  const references = (Array.isArray(styleRefs) ? styleRefs : []).slice(0, MAX_STYLE_REFS_FOR_MAPPING);
-  const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
+const pickStyleRefByIndexList = (selectedIndexes, indexList, limit, refs, selectedRefs) => {
+  for (const index of indexList || []) {
+    if (selectedRefs.length >= limit) return;
+    if (!Number.isInteger(index)) continue;
+    if (index < 0 || index >= refs.length) continue;
+    if (selectedIndexes.has(index)) continue;
+    selectedIndexes.add(index);
+    selectedRefs.push(refs[index]);
+  }
+};
 
-  if (references.length === 0 || allowedCharacters.length === 0) {
-    return [];
+const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, optionText) => {
+  const refsSource = Array.isArray(styleReferences) && styleReferences.length > 0
+    ? styleReferences
+    : (Array.isArray(stylePrimer) ? stylePrimer.map((item) => ({ ...item, kind: 'scene', source: 'upload' })) : []);
+  const refsWithMeta = normalizeStyleReferenceAssets(
+    refsSource,
+    'upload',
+    false
+  ).slice(0, STYLE_REF_MAX_TOTAL);
+  const selectedRefs = [];
+  const selectedIndexes = new Set();
+
+  const sceneIndexes = refsWithMeta
+    .map((ref, index) => ({ ref, index }))
+    .filter((entry) => entry.ref.kind === 'scene')
+    .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
+    .slice(0, STYLE_REF_SCENE_QUOTA)
+    .map((entry) => entry.index);
+  pickStyleRefByIndexList(selectedIndexes, sceneIndexes, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+
+  const optionCharacters = inferOptionCharacters(optionText, storyFacts);
+  const optionObjects = inferOptionObjects(optionText, storyFacts);
+
+  const charMap = storyFacts?.characterImageMap || [];
+  for (const character of optionCharacters) {
+    const mapping = charMap.find((entry) => String(entry.characterName || '').toLowerCase() === character.toLowerCase());
+    pickStyleRefByIndexList(selectedIndexes, mapping?.styleRefIndexes || [], STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+    if (selectedRefs.length >= STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA) break;
   }
 
-  const parts = [
-    {
-      text: [
-        'Map known story characters to reference images.',
-        `Allowed character names (must use exact names): ${allowedCharacters.join(', ')}`,
-        `You will receive ${references.length} reference images in order.`,
-        'Return strict JSON only as:',
-        '{"image_mappings":[{"image_index":0,"characters":["Exact Name"]}]}',
-        'Rules:',
-        '- image_index must be a valid index.',
-        '- characters must contain only allowed names.',
-        '- If no known characters appear in an image, return empty array for that image.'
-      ].join('\n')
-    }
-  ];
-
-  references.forEach((reference, index) => {
-    parts.push({ text: `Reference image index ${index}` });
-    parts.push({ inlineData: { mimeType: reference.mimeType, data: reference.data } });
-  });
-
-  try {
-    const response = await retryWithBackoff(() =>
-      ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: { parts },
-        config: {
-          responseMimeType: 'application/json',
-          thinkingConfig: { thinkingBudget: 0 },
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              image_mappings: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    image_index: { type: Type.NUMBER },
-                    characters: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
-                    }
-                  },
-                  required: ['image_index', 'characters']
-                }
-              }
-            },
-            required: ['image_mappings']
-          }
-        }
-      })
+  if (selectedRefs.length < STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA) {
+    const fallbackCharacterIndexes = refsWithMeta
+      .map((ref, index) => ({ ref, index }))
+      .filter((entry) => entry.ref.kind === 'character')
+      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
+      .map((entry) => entry.index);
+    pickStyleRefByIndexList(
+      selectedIndexes,
+      fallbackCharacterIndexes,
+      STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA,
+      refsWithMeta,
+      selectedRefs
     );
-
-    const payload = parseJsonSafe(response.text, { image_mappings: [] });
-    const perCharacter = new Map();
-
-    for (const imageMapping of payload.image_mappings || []) {
-      const imageIndex = Number(imageMapping?.image_index);
-      if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= references.length) {
-        continue;
-      }
-
-      for (const characterName of imageMapping.characters || []) {
-        const key = String(characterName || '').trim();
-        if (!key) continue;
-        const list = perCharacter.get(key) || [];
-        list.push(imageIndex);
-        perCharacter.set(key, list);
-      }
-    }
-
-    const rawMappings = Array.from(perCharacter.entries()).map(([characterName, styleRefIndexes]) => ({
-      characterName,
-      styleRefIndexes
-    }));
-
-    return normalizeCharacterImageMap(rawMappings, storyFacts?.characterCatalog || [], references.length);
-  } catch (error) {
-    console.warn('[setup] character-image mapping failed', error?.message || error);
-    return [];
   }
+
+  const objectMap = storyFacts?.objectImageMap || [];
+  for (const objectName of optionObjects) {
+    const mapping = objectMap.find((entry) => String(entry.objectName || '').toLowerCase() === objectName.toLowerCase());
+    pickStyleRefByIndexList(selectedIndexes, mapping?.styleRefIndexes || [], STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+    if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
+  }
+
+  if (selectedRefs.length < STYLE_REF_MAX_TOTAL) {
+    const fallbackObjectIndexes = refsWithMeta
+      .map((ref, index) => ({ ref, index }))
+      .filter((entry) => entry.ref.kind === 'object')
+      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
+      .map((entry) => entry.index);
+    pickStyleRefByIndexList(selectedIndexes, fallbackObjectIndexes, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+  }
+
+  if (selectedRefs.length < STYLE_REF_MAX_TOTAL) {
+    const remaining = refsWithMeta
+      .map((ref, index) => ({ ref, index }))
+      .filter((entry) => !selectedIndexes.has(entry.index))
+      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
+      .map((entry) => entry.index);
+    pickStyleRefByIndexList(selectedIndexes, remaining, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+  }
+
+  return {
+    refs: selectedRefs.slice(0, STYLE_REF_MAX_TOTAL),
+    optionCharacters,
+    optionObjects
+  };
 };
 
 export const setupStoryPack = async (storyFile, styleImages) => {
@@ -1068,11 +1395,27 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     storyBrief
   );
 
+  const incomingStyleRefs = normalizeStyleReferenceAssets(
+    (Array.isArray(styleImages) ? styleImages : []).slice(0, STYLE_REF_MAX_TOTAL).map((item) => ({
+      ...item,
+      kind: item.kind || 'scene',
+      source: item.source || 'upload'
+    })),
+    'upload'
+  );
+  const classification = await classifyStyleReferences(ai, incomingStyleRefs, storyFacts);
+  const classifiedStyleRefs = mergeStyleReferenceClassification(incomingStyleRefs, classification, storyFacts);
+  const canonicalStyleRefs = buildCanonicalStyleReferencePack(classifiedStyleRefs);
+
   const coverStart = performance.now();
   const coverParts = [];
-  const styleInputs = styleImages.length > 0 ? styleImages : [storyFile];
+  const coverStyleInputs = canonicalStyleRefs.length > 0
+    ? canonicalStyleRefs
+    : incomingStyleRefs.length > 0
+      ? incomingStyleRefs
+      : [{ ...storyFile, kind: 'scene', source: 'pdf_page', confidence: 0.5 }];
 
-  for (const img of styleInputs.slice(0, 4)) {
+  for (const img of coverStyleInputs.slice(0, 6)) {
     coverParts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
   }
 
@@ -1087,7 +1430,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
 
   const coverResponse = await retryWithBackoff(() =>
     ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
+      model: IMAGE_MODEL,
       contents: { parts: coverParts },
       config: { imageConfig: { aspectRatio: '3:4' } }
     })
@@ -1098,15 +1441,27 @@ export const setupStoryPack = async (storyFile, styleImages) => {
 
   const coverImage = extractImageDataUrl(coverResponse);
   const coverPrimer = toFileDataFromDataUrl(coverImage);
-  const stylePrimer = [
-    ...styleImages.slice(0, 4),
-    ...(coverPrimer ? [coverPrimer] : [])
-  ].slice(0, 8);
-  const characterImageMap = await buildCharacterImageMapFromStyleRefs(ai, stylePrimer, storyFacts);
+  let finalStyleReferences = canonicalStyleRefs;
+  if (finalStyleReferences.length === 0 && coverPrimer) {
+    finalStyleReferences = [
+      {
+        ...coverPrimer,
+        kind: 'scene',
+        source: 'generated',
+        confidence: 0.7
+      }
+    ];
+  }
+  const stylePrimer = finalStyleReferences.map((reference) => ({
+    mimeType: reference.mimeType,
+    data: reference.data
+  }));
+  const { characterImageMap, objectImageMap } = buildEntityImageMapsFromStyleRefs(finalStyleReferences, storyFacts);
   const storyFactsWithImageMap = normalizeStoryFacts(
     {
       ...storyFacts,
-      characterImageMap
+      characterImageMap,
+      objectImageMap
     },
     storyBrief
   );
@@ -1118,7 +1473,8 @@ export const setupStoryPack = async (storyFile, styleImages) => {
       storyBrief,
       storyFacts: storyFactsWithImageMap,
       coverImage,
-      stylePrimer
+      stylePrimer,
+      styleReferences: finalStyleReferences
     },
     timings: {
       analyzeMs,
@@ -1135,11 +1491,25 @@ export const runTurnPipeline = async (
   storyFacts,
   artStyle,
   stylePrimer,
+  styleReferences,
   history
 ) => {
   const ai = getClient();
   const totalStart = performance.now();
   const normalizedFacts = normalizeStoryFacts(storyFacts, storyBrief);
+  const effectiveStyleReferences = normalizeStyleReferenceAssets(
+    Array.isArray(styleReferences) && styleReferences.length > 0
+      ? styleReferences
+      : (Array.isArray(stylePrimer)
+          ? stylePrimer.map((ref) => ({ ...ref, kind: 'scene', source: 'upload', confidence: 0.45 }))
+          : []),
+    'upload',
+    false
+  ).slice(0, STYLE_REF_MAX_TOTAL);
+  const effectiveStylePrimer = effectiveStyleReferences.map((ref) => ({
+    mimeType: ref.mimeType,
+    data: ref.data
+  }));
 
   const transcribeStart = performance.now();
   const transcribeResponse = await retryWithBackoff(() =>
@@ -1242,7 +1612,8 @@ export const runTurnPipeline = async (
       const start = performance.now();
       const parts = [];
       const { refs: refsForOption, optionCharacters } = selectStyleRefsForOption(
-        stylePrimer,
+        effectiveStylePrimer,
+        effectiveStyleReferences,
         normalizedFacts,
         card.text
       );
@@ -1266,7 +1637,7 @@ export const runTurnPipeline = async (
         const imageResponse = await retryWithBackoff(
           () =>
             ai.models.generateContent({
-              model: 'gemini-2.5-flash-image',
+              model: IMAGE_MODEL,
               contents: { parts },
               config: { imageConfig: { aspectRatio: '1:1' } }
             }),

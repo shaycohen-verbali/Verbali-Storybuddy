@@ -26,6 +26,7 @@ export default async function handler(req, res) {
       body.storyFacts || null,
       body.artStyle,
       body.stylePrimer || [],
+      body.styleReferences || [],
       body.history || []
     );
 
