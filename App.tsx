@@ -119,6 +119,7 @@ const App: React.FC = () => {
           storyFacts: assets.metadata.storyFacts || {
             characters: [],
             characterCatalog: [],
+            characterImageMap: [],
             places: [],
             objects: [],
             events: [],

@@ -67,11 +67,17 @@ export interface StoryPack {
 export interface StoryFacts {
   characters: string[];
   characterCatalog: StoryCharacterFact[];
+  characterImageMap?: StoryCharacterImageMap[];
   places: string[];
   objects: string[];
   events: string[];
   setting: string;
   worldTags: string[];
+}
+
+export interface StoryCharacterImageMap {
+  characterName: string;
+  styleRefIndexes: number[];
 }
 
 export interface StoryCharacterFact {

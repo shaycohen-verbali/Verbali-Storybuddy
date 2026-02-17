@@ -11,6 +11,8 @@ const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
+const MAX_STYLE_REFS_FOR_MAPPING = 8;
+const MAX_STYLE_REFS_PER_IMAGE = 2;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -158,6 +160,44 @@ const normalizeCharacterCatalog = (catalog, fallbackCharacters) => {
   return Array.from(merged.values()).slice(0, 20);
 };
 
+const normalizeCharacterImageMap = (imageMap, characterCatalog, maxRefCount) => {
+  const allowed = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [String(entry?.name || '').toLowerCase(), String(entry?.name || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const normalized = new Map();
+
+  for (const item of Array.isArray(imageMap) ? imageMap : []) {
+    const key = String(item?.characterName || item?.character_name || '').trim().toLowerCase();
+    const canonicalName = allowed.get(key);
+    if (!canonicalName) continue;
+
+    const sourceIndexes = Array.isArray(item?.styleRefIndexes)
+      ? item.styleRefIndexes
+      : Array.isArray(item?.style_ref_indexes)
+        ? item.style_ref_indexes
+        : [];
+
+    const validIndexes = sourceIndexes
+      .map((index) => Number(index))
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < maxRefCount);
+
+    if (validIndexes.length === 0) continue;
+
+    const existing = normalized.get(canonicalName) || [];
+    const merged = [...existing, ...validIndexes];
+    const deduped = [...new Set(merged)].slice(0, 6);
+
+    normalized.set(canonicalName, deduped);
+  }
+
+  return Array.from(normalized.entries()).map(([characterName, styleRefIndexes]) => ({
+    characterName,
+    styleRefIndexes
+  }));
+};
+
 const inferLocationFromStory = (storyBrief) => {
   const brief = (storyBrief || '').toLowerCase();
   if (/(ocean|sea|underwater|reef|shark|whale|fish)/.test(brief)) return 'In the ocean';
@@ -195,6 +235,11 @@ const normalizeStoryFacts = (facts, storyBrief) => {
   const normalized = {
     characters: characterCatalog.map((entry) => entry.name),
     characterCatalog,
+    characterImageMap: normalizeCharacterImageMap(
+      facts?.characterImageMap || facts?.character_image_map,
+      characterCatalog,
+      MAX_STYLE_REFS_FOR_MAPPING
+    ),
     places: normalizeFactList(facts?.places, 12),
     objects: normalizeFactList(facts?.objects, 12),
     events: normalizeFactList(facts?.events, 14),
@@ -231,6 +276,10 @@ const compactFactsForPrompt = (storyFacts) => {
     characters: normalized.characterCatalog.slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
       name: truncate(entry.name, 36),
       source: entry.source
+    })),
+    characterImageMap: (normalized.characterImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      characterName: entry.characterName,
+      styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
     })),
     places: normalized.places.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
     objects: normalized.objects.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
@@ -663,7 +712,7 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
   return RENDER_MODE_STANDALONE;
 };
 
-const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts }) => {
+const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, optionCharacters }) => {
   const allowedCharacterEntries = (storyFacts?.characterCatalog || [])
     .map((entry) => ({
       name: normalizePhrase(entry?.name),
@@ -702,6 +751,9 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     'STYLE LAYER:',
     `- Match the attached style references exactly.`,
     `- Art style description: ${artStyle || 'Children\'s book illustration'}.`,
+    optionCharacters?.length
+      ? `- Character visual anchors from references: ${optionCharacters.join(', ')}.`
+      : '- Use reference style consistency for all visible characters.',
     '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
     '- Composition must be easy for a non-verbal child to recognize quickly.',
     ...characterRules
@@ -726,6 +778,154 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
         ];
 
   return [...styleLayer, ...semanticLayer].join('\n');
+};
+
+const inferOptionCharacters = (optionText, storyFacts) => {
+  const normalizedOption = canonicalOption(optionText);
+  if (!normalizedOption) {
+    return [];
+  }
+
+  const matches = [];
+  for (const entry of storyFacts?.characterCatalog || []) {
+    const normalizedName = canonicalOption(entry?.name || '');
+    if (!normalizedName) continue;
+    if (normalizedOption.includes(normalizedName) || normalizedName.includes(normalizedOption)) {
+      matches.push(entry.name);
+    }
+  }
+
+  return matches.slice(0, 2);
+};
+
+const selectStyleRefsForOption = (stylePrimer, storyFacts, optionText) => {
+  const safePrimer = Array.isArray(stylePrimer) ? stylePrimer : [];
+  const selected = [];
+  const seenIndexes = new Set();
+
+  if (safePrimer.length > 0) {
+    selected.push(safePrimer[0]);
+    seenIndexes.add(0);
+  }
+
+  const optionCharacters = inferOptionCharacters(optionText, storyFacts);
+  const styleMap = storyFacts?.characterImageMap || [];
+
+  for (const optionCharacter of optionCharacters) {
+    const mapping = styleMap.find(
+      (entry) => String(entry.characterName || '').toLowerCase() === optionCharacter.toLowerCase()
+    );
+    if (!mapping) continue;
+
+    for (const idx of mapping.styleRefIndexes || []) {
+      if (seenIndexes.has(idx)) continue;
+      if (!safePrimer[idx]) continue;
+      selected.push(safePrimer[idx]);
+      seenIndexes.add(idx);
+      if (selected.length >= MAX_STYLE_REFS_PER_IMAGE) {
+        return { refs: selected, optionCharacters };
+      }
+    }
+  }
+
+  for (let i = 0; i < safePrimer.length && selected.length < MAX_STYLE_REFS_PER_IMAGE; i += 1) {
+    if (seenIndexes.has(i)) continue;
+    selected.push(safePrimer[i]);
+    seenIndexes.add(i);
+  }
+
+  return { refs: selected, optionCharacters };
+};
+
+const buildCharacterImageMapFromStyleRefs = async (ai, styleRefs, storyFacts) => {
+  const references = (Array.isArray(styleRefs) ? styleRefs : []).slice(0, MAX_STYLE_REFS_FOR_MAPPING);
+  const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
+
+  if (references.length === 0 || allowedCharacters.length === 0) {
+    return [];
+  }
+
+  const parts = [
+    {
+      text: [
+        'Map known story characters to reference images.',
+        `Allowed character names (must use exact names): ${allowedCharacters.join(', ')}`,
+        `You will receive ${references.length} reference images in order.`,
+        'Return strict JSON only as:',
+        '{"image_mappings":[{"image_index":0,"characters":["Exact Name"]}]}',
+        'Rules:',
+        '- image_index must be a valid index.',
+        '- characters must contain only allowed names.',
+        '- If no known characters appear in an image, return empty array for that image.'
+      ].join('\n')
+    }
+  ];
+
+  references.forEach((reference, index) => {
+    parts.push({ text: `Reference image index ${index}` });
+    parts.push({ inlineData: { mimeType: reference.mimeType, data: reference.data } });
+  });
+
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: { parts },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              image_mappings: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    image_index: { type: Type.NUMBER },
+                    characters: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                    }
+                  },
+                  required: ['image_index', 'characters']
+                }
+              }
+            },
+            required: ['image_mappings']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { image_mappings: [] });
+    const perCharacter = new Map();
+
+    for (const imageMapping of payload.image_mappings || []) {
+      const imageIndex = Number(imageMapping?.image_index);
+      if (!Number.isInteger(imageIndex) || imageIndex < 0 || imageIndex >= references.length) {
+        continue;
+      }
+
+      for (const characterName of imageMapping.characters || []) {
+        const key = String(characterName || '').trim();
+        if (!key) continue;
+        const list = perCharacter.get(key) || [];
+        list.push(imageIndex);
+        perCharacter.set(key, list);
+      }
+    }
+
+    const rawMappings = Array.from(perCharacter.entries()).map(([characterName, styleRefIndexes]) => ({
+      characterName,
+      styleRefIndexes
+    }));
+
+    return normalizeCharacterImageMap(rawMappings, storyFacts?.characterCatalog || [], references.length);
+  } catch (error) {
+    console.warn('[setup] character-image mapping failed', error?.message || error);
+    return [];
+  }
 };
 
 export const setupStoryPack = async (storyFile, styleImages) => {
@@ -902,13 +1102,21 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     ...styleImages.slice(0, 4),
     ...(coverPrimer ? [coverPrimer] : [])
   ].slice(0, 8);
+  const characterImageMap = await buildCharacterImageMapFromStyleRefs(ai, stylePrimer, storyFacts);
+  const storyFactsWithImageMap = normalizeStoryFacts(
+    {
+      ...storyFacts,
+      characterImageMap
+    },
+    storyBrief
+  );
 
   return {
     storyPack: {
       summary,
       artStyle,
       storyBrief,
-      storyFacts,
+      storyFacts: storyFactsWithImageMap,
       coverImage,
       stylePrimer
     },
@@ -1033,8 +1241,13 @@ export const runTurnPipeline = async (
     cards.map(async (card) => {
       const start = performance.now();
       const parts = [];
+      const { refs: refsForOption, optionCharacters } = selectStyleRefsForOption(
+        stylePrimer,
+        normalizedFacts,
+        card.text
+      );
 
-      for (const ref of stylePrimer.slice(0, 1)) {
+      for (const ref of refsForOption) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
       }
 
@@ -1044,7 +1257,8 @@ export const runTurnPipeline = async (
           renderMode: card.renderMode,
           storyBrief,
           artStyle,
-          storyFacts: normalizedFacts
+          storyFacts: normalizedFacts,
+          optionCharacters
         })
       });
 

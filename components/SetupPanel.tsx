@@ -571,15 +571,40 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                       <div>
                         <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Character Mapping</label>
                         {characterCatalog.length > 0 ? (
-                          <div className="mt-2 flex flex-wrap gap-2">
-                            {characterCatalog.map((character) => (
-                              <span
-                                key={`${character.name}-${character.source}`}
-                                className="px-3 py-1 rounded-full bg-kid-teal/10 text-kid-teal text-xs font-bold"
-                              >
-                                {character.name} ({character.source})
-                              </span>
-                            ))}
+                          <div className="mt-2 space-y-2">
+                            {characterCatalog.map((character) => {
+                              const mapEntry = (preparedPack?.storyFacts?.characterImageMap || []).find(
+                                (entry) => entry.characterName.toLowerCase() === character.name.toLowerCase()
+                              );
+                              const mappedIndexes = mapEntry?.styleRefIndexes || [];
+                              const mappedRefs = mappedIndexes
+                                .map((index) => preparedPack?.stylePrimer?.[index] || null)
+                                .filter((entry): entry is FileData => Boolean(entry));
+
+                              return (
+                                <div key={`${character.name}-${character.source}`} className="rounded-lg border border-gray-100 p-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="px-3 py-1 rounded-full bg-kid-teal/10 text-kid-teal text-xs font-bold">
+                                      {character.name} ({character.source})
+                                    </span>
+                                    <span className="text-[11px] text-gray-500 font-semibold">
+                                      {mappedIndexes.length} mapped refs
+                                    </span>
+                                  </div>
+                                  {mappedRefs.length > 0 && (
+                                    <div className="mt-2 flex gap-2">
+                                      {mappedRefs.slice(0, 3).map((ref, index) => (
+                                        <img
+                                          key={`${character.name}-ref-${index}`}
+                                          src={`data:${ref.mimeType};base64,${ref.data}`}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                        />
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
                           </div>
                         ) : (
                           <p className="text-sm text-gray-500 mt-1">No characters mapped yet.</p>
