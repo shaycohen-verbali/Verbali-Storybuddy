@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
 import { FileData, ChatTurn, StoryMetadata } from '../types';
+const IMAGE_MODEL = (import.meta.env.VITE_IMAGE_MODEL || 'gemini-2.5-flash-image').trim();
 
 // Singleton AudioContext to prevent "Max AudioContexts reached" error
 let audioContext: AudioContext | null = null;
@@ -255,7 +256,7 @@ export const generateCoverIllustration = async (
 
   try {
     const response = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
-        model: 'nano-banana-pro',
+        model: IMAGE_MODEL,
         contents: { parts },
         config: {
             imageConfig: { aspectRatio: "3:4" }
@@ -466,7 +467,7 @@ export const generateIllustration = async (
   // TRY FLASH FIRST for Speed in interaction loop
   try {
     const response = await retryWithBackoff<GenerateContentResponse>(() => ai.models.generateContent({
-        model: 'nano-banana-pro',
+        model: IMAGE_MODEL,
         contents: { parts },
         config: {
             imageConfig: { aspectRatio: "1:1" }
