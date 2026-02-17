@@ -1,10 +1,11 @@
-import { StoryAssets, StoryManifest, StoredStory } from '../types';
+import { Publisher, StoryAssets, StoryManifest, StoredStory } from '../types';
 
 const DB_NAME = 'StoryBuddyDB';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const LEGACY_STORE = 'stories';
 const MANIFEST_STORE = 'story_manifests';
 const ASSETS_STORE = 'story_assets';
+const PUBLISHER_STORE = 'publishers';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -24,7 +25,8 @@ const legacyToManifest = (legacy: StoredStory): StoryManifest => ({
   coverImage: legacy.coverImage,
   createdAt: legacy.createdAt,
   summary: legacy.metadata.summary,
-  artStyle: legacy.metadata.artStyle || 'Children\'s book illustration'
+  artStyle: legacy.metadata.artStyle || 'Children\'s book illustration',
+  publisherId: null
 });
 
 const legacyToAssets = (legacy: StoredStory): StoryAssets => ({
@@ -41,6 +43,11 @@ const legacyToAssets = (legacy: StoredStory): StoryAssets => ({
   }
 });
 
+const normalizeManifest = (manifest: StoryManifest): StoryManifest => ({
+  ...manifest,
+  publisherId: manifest.publisherId ?? null
+});
+
 const openDB = (): Promise<IDBDatabase> => {
   if (dbPromise) {
     return dbPromise;
@@ -54,6 +61,7 @@ const openDB = (): Promise<IDBDatabase> => {
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
       const tx = (event.target as IDBOpenDBRequest).transaction;
+      const oldVersion = event.oldVersion;
 
       if (!db.objectStoreNames.contains(MANIFEST_STORE)) {
         db.createObjectStore(MANIFEST_STORE, { keyPath: 'id' });
@@ -63,25 +71,49 @@ const openDB = (): Promise<IDBDatabase> => {
         db.createObjectStore(ASSETS_STORE, { keyPath: 'id' });
       }
 
-      if (!tx || !db.objectStoreNames.contains(LEGACY_STORE)) {
+      if (!db.objectStoreNames.contains(PUBLISHER_STORE)) {
+        db.createObjectStore(PUBLISHER_STORE, { keyPath: 'id' });
+      }
+
+      if (!tx) {
         return;
       }
 
-      const oldStore = tx.objectStore(LEGACY_STORE);
       const manifestStore = tx.objectStore(MANIFEST_STORE);
       const assetsStore = tx.objectStore(ASSETS_STORE);
 
-      oldStore.openCursor().onsuccess = (cursorEvent) => {
-        const cursor = (cursorEvent.target as IDBRequest<IDBCursorWithValue | null>).result;
-        if (!cursor) {
-          return;
-        }
+      if (oldVersion < 2 && db.objectStoreNames.contains(LEGACY_STORE)) {
+        const oldStore = tx.objectStore(LEGACY_STORE);
+        oldStore.openCursor().onsuccess = (cursorEvent) => {
+          const cursor = (cursorEvent.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor) {
+            return;
+          }
 
-        const legacy = cursor.value as StoredStory;
-        manifestStore.put(legacyToManifest(legacy));
-        assetsStore.put(legacyToAssets(legacy));
-        cursor.continue();
-      };
+          const legacy = cursor.value as StoredStory;
+          manifestStore.put(legacyToManifest(legacy));
+          assetsStore.put(legacyToAssets(legacy));
+          cursor.continue();
+        };
+      }
+
+      if (oldVersion >= 2 && oldVersion < 3) {
+        manifestStore.openCursor().onsuccess = (cursorEvent) => {
+          const cursor = (cursorEvent.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor) {
+            return;
+          }
+
+          const value = cursor.value as StoryManifest;
+          if (value.publisherId === undefined) {
+            cursor.update({
+              ...value,
+              publisherId: null
+            });
+          }
+          cursor.continue();
+        };
+      }
     };
 
     request.onsuccess = (event) => resolve((event.target as IDBOpenDBRequest).result);
@@ -94,7 +126,7 @@ export const saveStory = async (manifest: StoryManifest, assets: StoryAssets): P
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction([MANIFEST_STORE, ASSETS_STORE], 'readwrite');
-    tx.objectStore(MANIFEST_STORE).put(manifest);
+    tx.objectStore(MANIFEST_STORE).put(normalizeManifest(manifest));
     tx.objectStore(ASSETS_STORE).put(assets);
 
     tx.oncomplete = () => resolve();
@@ -108,8 +140,31 @@ export const getStoryManifests = async (): Promise<StoryManifest[]> => {
     const tx = db.transaction([MANIFEST_STORE], 'readonly');
     const request = tx.objectStore(MANIFEST_STORE).getAll();
 
-    request.onsuccess = () => resolve((request.result || []).sort((a, b) => b.createdAt - a.createdAt));
+    request.onsuccess = () =>
+      resolve((request.result || []).map((manifest) => normalizeManifest(manifest)).sort((a, b) => b.createdAt - a.createdAt));
     request.onerror = () => reject('Error getting story manifests');
+  });
+};
+
+export const savePublisher = async (publisher: Publisher): Promise<void> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([PUBLISHER_STORE], 'readwrite');
+    tx.objectStore(PUBLISHER_STORE).put(publisher);
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject('Error saving publisher');
+  });
+};
+
+export const getPublishers = async (): Promise<Publisher[]> => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([PUBLISHER_STORE], 'readonly');
+    const request = tx.objectStore(PUBLISHER_STORE).getAll();
+
+    request.onsuccess = () => resolve((request.result || []).sort((a, b) => a.name.localeCompare(b.name)));
+    request.onerror = () => reject('Error getting publishers');
   });
 };
 

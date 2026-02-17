@@ -86,6 +86,13 @@ export interface StoryManifest {
   createdAt: number;
   summary: string;
   artStyle: string;
+  publisherId?: string | null;
+}
+
+export interface Publisher {
+  id: string;
+  name: string;
+  createdAt: number;
 }
 
 export interface StoryAssets {

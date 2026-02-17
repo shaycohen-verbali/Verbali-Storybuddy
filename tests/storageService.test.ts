@@ -57,13 +57,14 @@ describe('storageService migration', () => {
     });
   });
 
-  it('migrates legacy v1 stories into v2 manifest/assets stores', async () => {
+  it('migrates legacy v1 stories into manifest/assets stores with publisher support', async () => {
     await createLegacyRecord();
 
     const manifests = await getStoryManifests();
     expect(manifests.length).toBe(1);
     expect(manifests[0].id).toBe('legacy-1');
     expect(manifests[0].summary).toBe('Legacy summary');
+    expect(manifests[0].publisherId).toBeNull();
 
     const assets = await getStoryAssets('legacy-1');
     expect(assets?.storyBrief).toBe('Legacy summary');

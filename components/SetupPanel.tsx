@@ -9,6 +9,8 @@ interface SetupInitialView {
   createdAt?: number;
   readOnly?: boolean;
   title?: string;
+  publisherId?: string | null;
+  publisherName?: string;
   storyFile?: FileData | null;
   styleImages?: FileData[];
   storyPack?: StoryPack | null;
@@ -352,6 +354,9 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
             </h2>
             {initialView?.title && (
               <p className="text-sm text-gray-500 mt-1">{initialView.title}</p>
+            )}
+            {initialView?.publisherName && (
+              <p className="text-xs text-kid-orange font-semibold mt-1">Publisher: {initialView.publisherName}</p>
             )}
           </div>
 

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BookOpen, Key, ArrowRight, RotateCcw, RefreshCw, AlertCircle, Library as LibraryIcon } from 'lucide-react';
-import { AppMode, FileData, StoryAssets, StoryManifest, StoryMetadata, StoryPack } from './types';
+import { AppMode, FileData, Publisher, StoryAssets, StoryManifest, StoryMetadata, StoryPack } from './types';
 import { USE_BACKEND_PIPELINE } from './services/apiClient';
 import RecordButton from './components/RecordButton';
 import OptionCard from './components/OptionCard';
@@ -16,6 +16,8 @@ interface SetupViewState {
   createdAt?: number;
   readOnly: boolean;
   title?: string;
+  publisherId?: string | null;
+  publisherName?: string;
   storyFile?: FileData | null;
   styleImages?: FileData[];
   storyPack?: StoryPack | null;
@@ -28,7 +30,7 @@ const App: React.FC = () => {
   const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
   const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
-  const { stories, activeManifest, activeAssets, selectStory, saveNewStory, deleteStory } = useLibrary();
+  const { stories, publishers, activeManifest, activeAssets, selectStory, saveNewStory, deleteStory, createPublisher } = useLibrary();
   const { prepareStory } = useStorySetup();
   const {
     processingStage,
@@ -90,11 +92,14 @@ const App: React.FC = () => {
   const handleOpenStorySetup = useCallback(async (story: StoryManifest) => {
     try {
       const assets = await selectStory(story);
+      const storyPublisher = publishers.find((publisher) => publisher.id === (story.publisherId || null));
       setSetupView({
         storyId: story.id,
         createdAt: story.createdAt,
         readOnly: true,
         title: story.title,
+        publisherId: story.publisherId ?? null,
+        publisherName: storyPublisher?.name,
         storyFile: assets.pdfData || null,
         styleImages: assets.stylePrimer,
         storyPack: {
@@ -119,7 +124,7 @@ const App: React.FC = () => {
       console.error('Failed to open setup view', error);
       alert('Failed to open setup view. Please try again.');
     }
-  }, [selectStory]);
+  }, [publishers, selectStory]);
 
   const handleDeleteStory = useCallback(async (id: string) => {
     if (!confirm('Are you sure you want to delete this story?')) {
@@ -156,7 +161,8 @@ const App: React.FC = () => {
       coverImage: storyPack.coverImage || undefined,
       createdAt: Date.now(),
       summary: storyPack.summary,
-      artStyle: storyPack.artStyle
+      artStyle: storyPack.artStyle,
+      publisherId: setupView?.publisherId ?? null
     };
 
     const assets: StoryAssets = {
@@ -171,7 +177,7 @@ const App: React.FC = () => {
     resetConversation();
     setSetupView(null);
     setCurrentMode(AppMode.STORY);
-  }, [resetConversation, saveNewStory]);
+  }, [resetConversation, saveNewStory, setupView?.publisherId]);
 
   const handleOptionClick = useCallback(async (option: (typeof options)[number]) => {
     await selectOption(option);
@@ -200,7 +206,8 @@ const App: React.FC = () => {
       coverImage: payload.storyPack.coverImage || undefined,
       createdAt: existingManifest?.createdAt || payload.createdAt,
       summary: payload.storyPack.summary,
-      artStyle: payload.storyPack.artStyle
+      artStyle: payload.storyPack.artStyle,
+      publisherId: existingManifest?.publisherId ?? setupView?.publisherId ?? null
     };
 
     const assets: StoryAssets = {
@@ -215,6 +222,37 @@ const App: React.FC = () => {
     setSetupView(null);
     setCurrentMode(AppMode.LIBRARY);
   }, [activeAssets, saveNewStory, setupView, stories]);
+
+  const handleOpenNewRegularBookSetup = useCallback(() => {
+    setSetupView({
+      readOnly: false,
+      publisherId: null
+    });
+    setCurrentMode(AppMode.SETUP);
+  }, []);
+
+  const handleOpenNewPublisherBookSetup = useCallback((publisher: Publisher) => {
+    setSetupView({
+      readOnly: false,
+      publisherId: publisher.id,
+      publisherName: publisher.name
+    });
+    setCurrentMode(AppMode.SETUP);
+  }, []);
+
+  const handleCreatePublisher = useCallback(async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const exists = publishers.some((publisher) => publisher.name.toLowerCase() === trimmed.toLowerCase());
+    if (exists) {
+      throw new Error('Publisher already exists.');
+    }
+
+    await createPublisher(trimmed);
+  }, [createPublisher, publishers]);
 
   if (!hasApiKey) {
     return (
@@ -267,13 +305,13 @@ const App: React.FC = () => {
         {currentMode === AppMode.LIBRARY && (
           <Library
             stories={stories}
+            publishers={publishers}
             onSelectStory={handleStorySelect}
             onOpenSetup={handleOpenStorySetup}
             onDeleteStory={handleDeleteStory}
-            onAddNew={() => {
-              setSetupView(null);
-              setCurrentMode(AppMode.SETUP);
-            }}
+            onAddNew={handleOpenNewRegularBookSetup}
+            onAddBookToPublisher={handleOpenNewPublisherBookSetup}
+            onCreatePublisher={handleCreatePublisher}
           />
         )}
 

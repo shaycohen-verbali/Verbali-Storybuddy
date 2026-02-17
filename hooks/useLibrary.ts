@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
-import { StoryAssets, StoryManifest } from '../types';
+import { Publisher, StoryAssets, StoryManifest } from '../types';
 import * as StorageService from '../services/storageService';
 
 export const useLibrary = () => {
   const [stories, setStories] = useState<StoryManifest[]>([]);
+  const [publishers, setPublishers] = useState<Publisher[]>([]);
   const [activeManifest, setActiveManifest] = useState<StoryManifest | null>(null);
   const [activeAssets, setActiveAssets] = useState<StoryAssets | null>(null);
 
   const refreshStories = useCallback(async () => {
-    const manifests = await StorageService.getStoryManifests();
+    const [manifests, nextPublishers] = await Promise.all([
+      StorageService.getStoryManifests(),
+      StorageService.getPublishers()
+    ]);
     setStories(manifests);
+    setPublishers(nextPublishers);
   }, []);
 
   useEffect(() => {
@@ -44,13 +49,31 @@ export const useLibrary = () => {
     setActiveAssets((prev) => (prev?.id === id ? null : prev));
   }, []);
 
+  const createPublisher = useCallback(async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const publisher: Publisher = {
+      id: crypto.randomUUID(),
+      name: trimmed,
+      createdAt: Date.now()
+    };
+
+    await StorageService.savePublisher(publisher);
+    setPublishers((prev) => [...prev, publisher].sort((a, b) => a.name.localeCompare(b.name)));
+  }, []);
+
   return {
     stories,
+    publishers,
     activeManifest,
     activeAssets,
     refreshStories,
     selectStory,
     saveNewStory,
-    deleteStory
+    deleteStory,
+    createPublisher
   };
 };
