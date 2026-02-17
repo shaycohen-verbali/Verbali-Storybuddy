@@ -11,7 +11,14 @@ const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
-const IMAGE_MODEL = (process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image').trim();
+const GOOGLE_IMAGE_MODEL = (process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image').trim();
+const REPLICATE_IMAGE_MODEL = (
+  process.env.REPLICATE_IMAGE_MODEL ||
+  'google/nano-banana-pro:d71e2df08d6ef4c4fb6d3773e9e557de6312e04444940dbb81fd73366ed83941'
+).trim();
+const USE_REPLICATE_IMAGE_MODEL = Boolean(process.env.REPLICATE_API_TOKEN);
+const IMAGE_MODEL = USE_REPLICATE_IMAGE_MODEL ? REPLICATE_IMAGE_MODEL : GOOGLE_IMAGE_MODEL;
+const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
 const STYLE_REF_SCENE_QUOTA = 6;
 const STYLE_REF_CHARACTER_QUOTA = 4;
@@ -51,6 +58,162 @@ const extractImageDataUrl = (response) => {
     }
   }
   return null;
+};
+
+const getReplicateToken = () => {
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) {
+    throw new Error('Server missing REPLICATE_API_TOKEN');
+  }
+  return token;
+};
+
+const partsToReplicateInput = (parts, aspectRatio) => {
+  const safeParts = Array.isArray(parts) ? parts : [];
+  const prompt = safeParts
+    .map((part) => String(part?.text || '').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  const imageInput = safeParts
+    .filter((part) => part?.inlineData?.mimeType && part?.inlineData?.data)
+    .map((part) => `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`)
+    .slice(0, STYLE_REF_MAX_TOTAL);
+
+  const input = {
+    prompt: prompt || 'Children illustration in storybook style',
+    aspect_ratio: aspectRatio,
+    output_format: 'jpg'
+  };
+
+  if (imageInput.length > 0) {
+    input.image_input = imageInput;
+  }
+
+  return input;
+};
+
+const extractReplicateOutputUrl = (prediction) => {
+  const output = prediction?.output;
+  if (!output) return null;
+
+  if (typeof output === 'string') {
+    return output;
+  }
+
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      if (typeof item === 'string') return item;
+      if (item && typeof item === 'object' && typeof item.url === 'string') return item.url;
+    }
+    return null;
+  }
+
+  if (output && typeof output === 'object') {
+    if (typeof output.url === 'string') return output.url;
+    if (typeof output.image === 'string') return output.image;
+  }
+
+  return null;
+};
+
+const fetchRemoteImageAsDataUrl = async (url) => {
+  if (!url) return null;
+  if (url.startsWith('data:')) return url;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Replicate image download failed: ${response.status}`);
+  }
+
+  const mimeType = response.headers.get('content-type') || 'image/jpeg';
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return `data:${mimeType};base64,${buffer.toString('base64')}`;
+};
+
+const waitForReplicatePrediction = async (predictionUrl, token) => {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await delay(1200);
+
+    const pollResponse = await fetch(predictionUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Token ${token}`
+      }
+    });
+
+    const payload = await pollResponse.json().catch(() => ({}));
+    if (!pollResponse.ok) {
+      throw new Error(payload?.detail || payload?.error || `Replicate polling failed (${pollResponse.status})`);
+    }
+
+    if (payload?.status === 'succeeded') {
+      return payload;
+    }
+
+    if (payload?.status === 'failed' || payload?.status === 'canceled') {
+      throw new Error(payload?.error || payload?.detail || 'Replicate prediction failed');
+    }
+  }
+
+  throw new Error('Replicate prediction timed out');
+};
+
+const generateImageWithReplicate = async (parts, aspectRatio) => {
+  const token = getReplicateToken();
+  const input = partsToReplicateInput(parts, aspectRatio);
+
+  const response = await fetch(REPLICATE_PREDICTIONS_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Token ${token}`,
+      'Content-Type': 'application/json',
+      Prefer: 'wait=60'
+    },
+    body: JSON.stringify({
+      version: REPLICATE_IMAGE_MODEL,
+      input
+    })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.detail || payload?.error || `Replicate request failed (${response.status})`);
+  }
+
+  let completedPayload = payload;
+  if (payload?.status !== 'succeeded') {
+    if (payload?.status === 'failed' || payload?.status === 'canceled') {
+      throw new Error(payload?.error || payload?.detail || 'Replicate prediction failed');
+    }
+    if (payload?.urls?.get) {
+      completedPayload = await waitForReplicatePrediction(payload.urls.get, token);
+    }
+  }
+
+  const outputUrl = extractReplicateOutputUrl(completedPayload);
+  if (!outputUrl) {
+    return null;
+  }
+
+  return fetchRemoteImageAsDataUrl(outputUrl);
+};
+
+const generateImageDataUrl = async (ai, parts, aspectRatio) => {
+  if (USE_REPLICATE_IMAGE_MODEL) {
+    return generateImageWithReplicate(parts, aspectRatio);
+  }
+
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: IMAGE_MODEL,
+      contents: { parts },
+      config: { imageConfig: { aspectRatio } }
+    })
+  );
+
+  return extractImageDataUrl(response);
 };
 
 const toFileDataFromDataUrl = (dataUrl) => {
@@ -1428,18 +1591,11 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     ].join('\n')
   });
 
-  const coverResponse = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: IMAGE_MODEL,
-      contents: { parts: coverParts },
-      config: { imageConfig: { aspectRatio: '3:4' } }
-    })
-  );
+  const coverImage = await generateImageDataUrl(ai, coverParts, '3:4');
 
   const coverMs = Math.round(performance.now() - coverStart);
   const totalMs = Math.round(performance.now() - setupStart);
 
-  const coverImage = extractImageDataUrl(coverResponse);
   const coverPrimer = toFileDataFromDataUrl(coverImage);
   let finalStyleReferences = canonicalStyleRefs;
   if (finalStyleReferences.length === 0 && coverPrimer) {
@@ -1634,18 +1790,9 @@ export const runTurnPipeline = async (
       });
 
       try {
-        const imageResponse = await retryWithBackoff(
-          () =>
-            ai.models.generateContent({
-              model: IMAGE_MODEL,
-              contents: { parts },
-              config: { imageConfig: { aspectRatio: '1:1' } }
-            }),
-          1,
-          350
-        );
-
-        card.imageUrl = extractImageDataUrl(imageResponse) || undefined;
+        card.imageUrl = (
+          await retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1'), 1, 350)
+        ) || undefined;
       } catch (error) {
         console.warn('[image] generation failed', card.id, error?.message || error);
         card.imageUrl = undefined;
