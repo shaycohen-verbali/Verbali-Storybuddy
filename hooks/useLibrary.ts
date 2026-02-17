@@ -65,6 +65,25 @@ export const useLibrary = () => {
     setPublishers((prev) => [...prev, publisher].sort((a, b) => a.name.localeCompare(b.name)));
   }, []);
 
+  const updatePublisherImage = useCallback(async (publisherId: string, coverImage: string) => {
+    const existing = publishers.find((publisher) => publisher.id === publisherId);
+    if (!existing) {
+      throw new Error('Publisher not found.');
+    }
+
+    const updated: Publisher = {
+      ...existing,
+      coverImage
+    };
+
+    await StorageService.savePublisher(updated);
+    setPublishers((prev) =>
+      prev
+        .map((publisher) => (publisher.id === publisherId ? updated : publisher))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    );
+  }, [publishers]);
+
   const updateStoryPublisher = useCallback(async (storyId: string, publisherId: string | null) => {
     await StorageService.updateStoryPublisher(storyId, publisherId);
     setStories((prev) =>
@@ -98,6 +117,7 @@ export const useLibrary = () => {
     saveNewStory,
     deleteStory,
     createPublisher,
+    updatePublisherImage,
     updateStoryPublisher
   };
 };

@@ -93,6 +93,7 @@ export interface Publisher {
   id: string;
   name: string;
   createdAt: number;
+  coverImage?: string;
 }
 
 export interface StoryAssets {

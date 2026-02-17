@@ -39,7 +39,7 @@ const App: React.FC = () => {
     saveNewStory,
     deleteStory,
     createPublisher,
-    updateStoryPublisher
+    updatePublisherImage
   } = useLibrary();
   const { prepareStory } = useStorySetup();
   const {
@@ -151,7 +151,8 @@ const App: React.FC = () => {
   const handleSetupComplete = useCallback(async (
     storyFile: FileData,
     styleImages: FileData[],
-    storyPack: StoryPack
+    storyPack: StoryPack,
+    publisherId: string | null
   ) => {
     const id = crypto.randomUUID();
     const title = storyPack.summary.substring(0, 50) || 'Untitled Story';
@@ -172,7 +173,7 @@ const App: React.FC = () => {
       createdAt: Date.now(),
       summary: storyPack.summary,
       artStyle: storyPack.artStyle,
-      publisherId: setupView?.publisherId ?? null
+      publisherId
     };
 
     const assets: StoryAssets = {
@@ -187,7 +188,7 @@ const App: React.FC = () => {
     resetConversation();
     setSetupView(null);
     setCurrentMode(AppMode.STORY);
-  }, [resetConversation, saveNewStory, setupView?.publisherId]);
+  }, [resetConversation, saveNewStory]);
 
   const handleOptionClick = useCallback(async (option: (typeof options)[number]) => {
     await selectOption(option);
@@ -217,7 +218,7 @@ const App: React.FC = () => {
       createdAt: existingManifest?.createdAt || payload.createdAt,
       summary: payload.storyPack.summary,
       artStyle: payload.storyPack.artStyle,
-      publisherId: existingManifest?.publisherId ?? setupView?.publisherId ?? null
+      publisherId: payload.publisherId
     };
 
     const assets: StoryAssets = {
@@ -264,9 +265,9 @@ const App: React.FC = () => {
     await createPublisher(trimmed);
   }, [createPublisher, publishers]);
 
-  const handleAssignStoryPublisher = useCallback(async (storyId: string, publisherId: string | null) => {
-    await updateStoryPublisher(storyId, publisherId);
-  }, [updateStoryPublisher]);
+  const handleUpdatePublisherImage = useCallback(async (publisherId: string, coverImage: string) => {
+    await updatePublisherImage(publisherId, coverImage);
+  }, [updatePublisherImage]);
 
   if (!hasApiKey) {
     return (
@@ -326,7 +327,7 @@ const App: React.FC = () => {
             onAddNew={handleOpenNewRegularBookSetup}
             onAddBookToPublisher={handleOpenNewPublisherBookSetup}
             onCreatePublisher={handleCreatePublisher}
-            onAssignStoryPublisher={handleAssignStoryPublisher}
+            onUpdatePublisherImage={handleUpdatePublisherImage}
           />
         )}
 
@@ -392,9 +393,11 @@ const App: React.FC = () => {
 
       {currentMode === AppMode.SETUP && (
         <SetupPanel
+          publishers={publishers}
           onPrepareStory={prepareStory}
           onComplete={handleSetupComplete}
           onSaveExisting={handleSaveExistingSetup}
+          onUpdatePublisherImage={handleUpdatePublisherImage}
           onStartFromSetup={() => {
             resetConversation();
             setSetupView(null);

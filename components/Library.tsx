@@ -11,7 +11,7 @@ interface LibraryProps {
   onAddNew: () => void;
   onAddBookToPublisher: (publisher: Publisher) => void;
   onCreatePublisher: (name: string) => Promise<void>;
-  onAssignStoryPublisher: (storyId: string, publisherId: string | null) => Promise<void>;
+  onUpdatePublisherImage: (publisherId: string, coverImage: string) => Promise<void>;
 }
 
 const Library: React.FC<LibraryProps> = ({
@@ -23,15 +23,15 @@ const Library: React.FC<LibraryProps> = ({
   onAddNew,
   onAddBookToPublisher,
   onCreatePublisher,
-  onAssignStoryPublisher
+  onUpdatePublisherImage
 }) => {
   const [showCreatePublisher, setShowCreatePublisher] = useState(false);
   const [newPublisherName, setNewPublisherName] = useState('');
   const [isSavingPublisher, setIsSavingPublisher] = useState(false);
   const [publisherError, setPublisherError] = useState<string | null>(null);
   const [activePublisherId, setActivePublisherId] = useState<string | null>(null);
-  const [assigningStoryId, setAssigningStoryId] = useState<string | null>(null);
-  const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const [updatingPublisherId, setUpdatingPublisherId] = useState<string | null>(null);
+  const [publisherImageError, setPublisherImageError] = useState<string | null>(null);
 
   const regularBooks = useMemo(
     () => stories.filter((story) => !story.publisherId),
@@ -61,6 +61,15 @@ const Library: React.FC<LibraryProps> = ({
     return storiesByPublisher.get(activePublisherId) || [];
   }, [activePublisherId, regularBooks, storiesByPublisher]);
 
+  const fileToDataUrl = async (file: File): Promise<string> => {
+    const reader = new FileReader();
+    return new Promise((resolve, reject) => {
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
   const handleCreatePublisher = async () => {
     const trimmed = newPublisherName.trim();
     if (!trimmed) {
@@ -80,21 +89,26 @@ const Library: React.FC<LibraryProps> = ({
     }
   };
 
-  const handleAssignStoryPublisher = async (story: StoryManifest, nextPublisherId: string) => {
-    setAssignmentError(null);
-    setAssigningStoryId(story.id);
+  const handlePublisherImageUpload = async (publisher: Publisher, file: File | null) => {
+    if (!file || !file.type.startsWith('image/')) {
+      return;
+    }
+
+    setPublisherImageError(null);
+    setUpdatingPublisherId(publisher.id);
     try {
-      await onAssignStoryPublisher(story.id, nextPublisherId || null);
+      const dataUrl = await fileToDataUrl(file);
+      await onUpdatePublisherImage(publisher.id, dataUrl);
     } catch (error: any) {
-      setAssignmentError(error?.message || 'Failed to move book');
+      setPublisherImageError(error?.message || 'Failed to update publisher image');
     } finally {
-      setAssigningStoryId(null);
+      setUpdatingPublisherId(null);
     }
   };
 
   const renderPublisherCard = (publisher: Publisher) => {
     const books = storiesByPublisher.get(publisher.id) || [];
-    const coverImage = books.find((book) => Boolean(book.coverImage))?.coverImage;
+    const coverImage = publisher.coverImage || books.find((book) => Boolean(book.coverImage))?.coverImage;
 
     return (
       <div key={`publisher-${publisher.id}`} className="group bg-white rounded-2xl p-4 shadow-sm hover:shadow-xl transition-all border border-gray-100 flex flex-col relative">
@@ -130,12 +144,19 @@ const Library: React.FC<LibraryProps> = ({
           >
             Open
           </button>
-          <button
-            onClick={() => onAddBookToPublisher(publisher)}
-            className="px-3 py-2 rounded-lg bg-kid-orange text-white text-sm font-semibold hover:bg-orange-500 transition"
-          >
-            Add Book
-          </button>
+          <label className="px-3 py-2 rounded-lg bg-kid-orange text-white text-sm font-semibold hover:bg-orange-500 transition text-center cursor-pointer">
+            {updatingPublisherId === publisher.id ? 'Updating...' : 'Edit Image'}
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0] || null;
+                void handlePublisherImageUpload(publisher, file);
+                event.currentTarget.value = '';
+              }}
+            />
+          </label>
         </div>
       </div>
     );
@@ -164,27 +185,6 @@ const Library: React.FC<LibraryProps> = ({
           <Calendar className="w-3 h-3" />
           {new Date(story.createdAt).toLocaleDateString()}
         </div>
-      </div>
-
-      <div className="mt-3">
-        <label className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 block mb-1">
-          Publisher
-        </label>
-        <select
-          value={story.publisherId || ''}
-          disabled={assigningStoryId === story.id}
-          onChange={(event) => {
-            void handleAssignStoryPublisher(story, event.target.value);
-          }}
-          className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm text-gray-700 bg-white"
-        >
-          <option value="">Regular Book</option>
-          {publishers.map((publisher) => (
-            <option key={publisher.id} value={publisher.id}>
-              {publisher.name}
-            </option>
-          ))}
-        </select>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2">
@@ -272,9 +272,9 @@ const Library: React.FC<LibraryProps> = ({
         </div>
       )}
 
-      {assignmentError && (
+      {publisherImageError && (
         <div className="mb-6 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-medium text-red-600">
-          {assignmentError}
+          {publisherImageError}
         </div>
       )}
 

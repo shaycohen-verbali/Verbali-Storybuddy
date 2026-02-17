@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles } from 'lucide-react';
-import { FileData, SetupStoryResponse, StoryPack } from '../types';
+import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles, FolderOpen } from 'lucide-react';
+import { FileData, Publisher, SetupStoryResponse, StoryPack } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
 import { extractStyleScreenshotsFromPdf } from '../services/pdfService';
 
@@ -22,12 +22,15 @@ export interface ExistingSetupUpdatePayload {
   storyFile: FileData | null;
   styleImages: FileData[];
   storyPack: StoryPack;
+  publisherId: string | null;
 }
 
 interface SetupPanelProps {
+  publishers: Publisher[];
   onPrepareStory: (storyFile: FileData, styleImages: FileData[]) => Promise<SetupStoryResponse>;
-  onComplete: (storyFile: FileData, styleImages: FileData[], storyPack: StoryPack) => void;
+  onComplete: (storyFile: FileData, styleImages: FileData[], storyPack: StoryPack, publisherId: string | null) => void;
   onSaveExisting?: (payload: ExistingSetupUpdatePayload) => Promise<void> | void;
+  onUpdatePublisherImage?: (publisherId: string, coverImage: string) => Promise<void> | void;
   onStartFromSetup?: () => void;
   initialView?: SetupInitialView | null;
   onClose: () => void;
@@ -97,9 +100,11 @@ const mergePrimerSources = (preferred: FileData[], fallback: FileData[]): FileDa
 };
 
 const SetupPanel: React.FC<SetupPanelProps> = ({
+  publishers,
   onPrepareStory,
   onComplete,
   onSaveExisting,
+  onUpdatePublisherImage,
   onStartFromSetup,
   initialView,
   onClose
@@ -107,6 +112,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const storyInputRef = useRef<HTMLInputElement>(null);
   const styleInputRef = useRef<HTMLInputElement>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
+  const publisherImageInputRef = useRef<HTMLInputElement>(null);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -115,6 +121,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [styleReferences, setStyleReferences] = useState<FileData[]>([]);
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
   const [isReadOnlyView, setIsReadOnlyView] = useState(false);
+  const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null);
 
   const isExistingStory = Boolean(initialView?.storyId);
   const canEdit = !isReadOnlyView;
@@ -126,6 +133,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       setStyleReferences([]);
       setPreparedPack(null);
       setIsReadOnlyView(false);
+      setSelectedPublisherId(null);
       setErrorMsg(null);
       setIsProcessing(false);
       return;
@@ -135,6 +143,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setStyleReferences(initialView.styleImages || []);
     setPreparedPack(initialView.storyPack || null);
     setIsReadOnlyView(Boolean(initialView.readOnly));
+    setSelectedPublisherId(initialView.publisherId || null);
     setErrorMsg(null);
     setIsProcessing(false);
   }, [initialView]);
@@ -267,6 +276,29 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     }
   };
 
+  const handlePublisherImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canEdit || !selectedPublisherId) {
+      return;
+    }
+
+    const file = e.target.files?.[0];
+    if (!file || !file.type.startsWith('image/')) {
+      return;
+    }
+
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      await onUpdatePublisherImage?.(selectedPublisherId, dataUrl);
+    } catch (error: any) {
+      console.error(error);
+      setErrorMsg(error?.message || 'Failed to update publisher image');
+    } finally {
+      if (publisherImageInputRef.current) {
+        publisherImageInputRef.current.value = '';
+      }
+    }
+  };
+
   const removeStyleImage = (index: number) => {
     if (!canEdit) {
       return;
@@ -319,7 +351,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
           createdAt: initialView.createdAt || Date.now(),
           storyFile: currentStory,
           styleImages: finalPrimer,
-          storyPack: finalPack
+          storyPack: finalPack,
+          publisherId: selectedPublisherId
         });
         onClose();
         return;
@@ -330,7 +363,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
-      await Promise.resolve(onComplete(currentStory, finalPrimer, finalPack));
+      await Promise.resolve(onComplete(currentStory, finalPrimer, finalPack, selectedPublisherId));
       onClose();
     } catch (error: any) {
       console.error(error);
@@ -341,6 +374,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
   const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+  const selectedPublisher = publishers.find((publisher) => publisher.id === selectedPublisherId) || null;
   const hasAnalysis = Boolean(summary || preparedPack) || isReadOnlyView;
 
   return (
@@ -355,8 +389,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
             {initialView?.title && (
               <p className="text-sm text-gray-500 mt-1">{initialView.title}</p>
             )}
-            {initialView?.publisherName && (
-              <p className="text-xs text-kid-orange font-semibold mt-1">Publisher: {initialView.publisherName}</p>
+            {(selectedPublisher?.name || initialView?.publisherName) && (
+              <p className="text-xs text-kid-orange font-semibold mt-1">
+                Publisher: {selectedPublisher?.name || initialView?.publisherName}
+              </p>
             )}
           </div>
 
@@ -475,6 +511,60 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                               <Sparkles className="w-4 h-4" /> Re-run Analysis
                             </button>
                           )}
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Book Publisher</label>
+                        {canEdit ? (
+                          <select
+                            value={selectedPublisherId || ''}
+                            onChange={(event) => setSelectedPublisherId(event.target.value || null)}
+                            className="mt-2 w-full px-3 py-2 rounded-lg border border-gray-200 text-sm text-gray-700 bg-white"
+                          >
+                            <option value="">Regular Book (No Publisher)</option>
+                            {publishers.map((publisher) => (
+                              <option key={publisher.id} value={publisher.id}>
+                                {publisher.name}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <p className="text-sm text-gray-600 mt-1">{selectedPublisher?.name || 'Regular Book'}</p>
+                        )}
+                      </div>
+
+                      {selectedPublisher && (
+                        <div>
+                          <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+                            Publisher Image
+                          </label>
+                          <div className="mt-2 flex items-center gap-3">
+                            <div className="w-14 h-14 rounded-lg overflow-hidden border border-gray-200 bg-gray-50 flex items-center justify-center text-gray-300">
+                              {selectedPublisher.coverImage ? (
+                                <img src={selectedPublisher.coverImage} className="w-full h-full object-cover" />
+                              ) : (
+                                <FolderOpen className="w-6 h-6" />
+                              )}
+                            </div>
+                            {canEdit && (
+                              <>
+                                <button
+                                  onClick={() => publisherImageInputRef.current?.click()}
+                                  className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-sm font-bold hover:bg-gray-200 transition"
+                                >
+                                  Update Publisher Image
+                                </button>
+                                <input
+                                  type="file"
+                                  ref={publisherImageInputRef}
+                                  onChange={handlePublisherImageUpload}
+                                  className="hidden"
+                                  accept="image/*"
+                                />
+                              </>
+                            )}
+                          </div>
                         </div>
                       )}
 
