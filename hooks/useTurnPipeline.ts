@@ -7,6 +7,7 @@ import * as GeminiService from '../services/geminiService';
 
 const MAX_HISTORY_TURNS_FOR_BACKEND = 6;
 const MAX_HISTORY_TEXT_CHARS = 120;
+const MAX_TURN_STYLE_REFS = 48;
 
 type TtsResponse = { audioBase64: string; mimeType: string; audioBuffer?: AudioBuffer } | null;
 
@@ -109,7 +110,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
           stylePrimer: activeAssets.stylePrimer.slice(0, 14),
-          styleReferences: (activeAssets.styleReferences || []).slice(0, 120),
+          styleReferences: (activeAssets.styleReferences || []).slice(0, MAX_TURN_STYLE_REFS),
           history: compactHistoryForBackend(stateRef.current.conversationHistory)
         });
 

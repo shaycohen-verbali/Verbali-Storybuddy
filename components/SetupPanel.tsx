@@ -49,6 +49,8 @@ const STYLE_REF_SCENE_QUOTA = 6;
 const STYLE_REF_CHARACTER_QUOTA = 4;
 const STYLE_REF_OBJECT_QUOTA = 4;
 const STYLE_REF_TOTAL = 14;
+const STYLE_REF_LIBRARY_TOTAL = 120;
+const STYLE_REF_SETUP_UPLOAD_LIMIT = 48;
 
 const toFingerprint = (item: FileData): string => {
   const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 32);
@@ -79,6 +81,8 @@ const stripStyleReferenceAsset = (item: StyleReferenceAsset): FileData => ({
   mimeType: item.mimeType,
   data: item.data
 });
+
+const toStyleDataUrl = (item: StyleReferenceAsset): string => `data:${item.mimeType};base64,${item.data}`;
 
 const mergeStyleReferenceAssets = (
   preferred: StyleReferenceAsset[],
@@ -216,6 +220,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [isReadOnlyView, setIsReadOnlyView] = useState(false);
   const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null);
   const [warningsAcknowledged, setWarningsAcknowledged] = useState(false);
+  const [expandedImage, setExpandedImage] = useState<{ src: string; label?: string } | null>(null);
 
   const isExistingStory = Boolean(initialView?.storyId);
   const canEdit = !isReadOnlyView;
@@ -229,6 +234,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       setIsReadOnlyView(false);
       setSelectedPublisherId(null);
       setWarningsAcknowledged(false);
+      setExpandedImage(null);
       setErrorMsg(null);
       setIsProcessing(false);
       return;
@@ -243,6 +249,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setIsReadOnlyView(Boolean(initialView.readOnly));
     setSelectedPublisherId(initialView.publisherId || null);
     setWarningsAcknowledged(false);
+    setExpandedImage(null);
     setErrorMsg(null);
     setIsProcessing(false);
   }, [initialView]);
@@ -268,7 +275,9 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         setStyleReferences(mergeStyleReferenceAssets(effectiveStyles, []));
       }
 
-      const setupPayload = buildBalancedSetupPayload(effectiveStyles).map(stripStyleReferenceAsset);
+      const setupPayload = mergeStyleReferenceAssets(effectiveStyles, [])
+        .slice(0, STYLE_REF_SETUP_UPLOAD_LIMIT)
+        .map(stripStyleReferenceAsset);
       const setupResponse = await onPrepareStory(storySource, setupPayload);
       setPreparedPack((prev) => ({
         ...setupResponse.storyPack,
@@ -448,11 +457,11 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         : preparedPack.stylePrimer.map((item) =>
             toStyleReferenceAsset(item, { kind: 'scene', source: 'generated' })
           );
-      const finalStyleRefs = buildBalancedSetupPayload(
-        mergeStyleReferenceAssets(styleReferences, preparedRefs)
-      );
+      const finalStyleRefs = mergeStyleReferenceAssets(styleReferences, preparedRefs)
+        .slice(0, STYLE_REF_LIBRARY_TOTAL);
+      const runtimePrimerRefs = buildBalancedSetupPayload(finalStyleRefs);
       const finalPrimer = mergePrimerSources(
-        finalStyleRefs.map(stripStyleReferenceAsset),
+        runtimePrimerRefs.map(stripStyleReferenceAsset),
         preparedPack.stylePrimer
       ).slice(0, STYLE_REF_TOTAL);
       const finalPack: StoryPack = {
@@ -551,8 +560,11 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setWarningsAcknowledged(false);
   }, [hasMappingWarnings, preparedPack?.summary, preparedStyleRefs.length]);
 
-  const setupPreviewRefs = buildBalancedSetupPayload(styleReferences);
-  const styleCounts = getStyleRefCounts(setupPreviewRefs);
+  const storedStyleRefs = mergeStyleReferenceAssets(styleReferences, preparedStyleRefs)
+    .slice(0, STYLE_REF_LIBRARY_TOTAL);
+  const runtimePreviewRefs = buildBalancedSetupPayload(storedStyleRefs);
+  const styleCounts = getStyleRefCounts(storedStyleRefs);
+  const runtimeCounts = getStyleRefCounts(runtimePreviewRefs);
   const selectedPublisher = publishers.find((publisher) => publisher.id === selectedPublisherId) || null;
   const hasAnalysis = Boolean(summary || preparedPack) || isReadOnlyView;
 
@@ -661,7 +673,17 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                         <div>
                           <label className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2 block">Cover</label>
                           <div className="relative aspect-[3/4] w-48 rounded-xl overflow-hidden shadow-lg">
-                            <img src={generatedCover} alt="Cover" className="w-full h-full object-cover" />
+                            <img
+                              src={generatedCover}
+                              alt="Cover"
+                              className="w-full h-full object-cover cursor-zoom-in"
+                              onClick={() =>
+                                setExpandedImage({
+                                  src: generatedCover,
+                                  label: 'Book cover'
+                                })
+                              }
+                            />
                           </div>
                         </div>
                       )}
@@ -721,7 +743,16 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                           <div className="mt-2 flex items-center gap-3">
                             <div className="w-14 h-14 rounded-lg overflow-hidden border border-gray-200 bg-gray-50 flex items-center justify-center text-gray-300">
                               {selectedPublisher.coverImage ? (
-                                <img src={selectedPublisher.coverImage} className="w-full h-full object-cover" />
+                                <img
+                                  src={selectedPublisher.coverImage}
+                                  className="w-full h-full object-cover cursor-zoom-in"
+                                  onClick={() =>
+                                    setExpandedImage({
+                                      src: selectedPublisher.coverImage!,
+                                      label: 'Publisher image'
+                                    })
+                                  }
+                                />
                               ) : (
                                 <FolderOpen className="w-6 h-6" />
                               )}
@@ -775,8 +806,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                       {mappedRefs.slice(0, 3).map((ref, index) => (
                                         <img
                                           key={`${character.name}-ref-${index}`}
-                                          src={`data:${ref.mimeType};base64,${ref.data}`}
-                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                          src={toStyleDataUrl(ref)}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200 cursor-zoom-in"
+                                          onClick={() =>
+                                            setExpandedImage({
+                                              src: toStyleDataUrl(ref),
+                                              label: `${character.name} mapped reference`
+                                            })
+                                          }
                                         />
                                       ))}
                                     </div>
@@ -823,8 +860,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                       {mappedRefs.slice(0, 3).map((ref, index) => (
                                         <img
                                           key={`${objectName}-ref-${index}`}
-                                          src={`data:${ref.mimeType};base64,${ref.data}`}
-                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                          src={toStyleDataUrl(ref)}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200 cursor-zoom-in"
+                                          onClick={() =>
+                                            setExpandedImage({
+                                              src: toStyleDataUrl(ref),
+                                              label: `${objectName} mapped reference`
+                                            })
+                                          }
                                         />
                                       ))}
                                     </div>
@@ -871,8 +914,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                       {mappedRefs.slice(0, 3).map((ref, index) => (
                                         <img
                                           key={`${scene.id}-ref-${index}`}
-                                          src={`data:${ref.mimeType};base64,${ref.data}`}
-                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                          src={toStyleDataUrl(ref)}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200 cursor-zoom-in"
+                                          onClick={() =>
+                                            setExpandedImage({
+                                              src: toStyleDataUrl(ref),
+                                              label: `${scene.title} mapped reference`
+                                            })
+                                          }
                                         />
                                       ))}
                                     </div>
@@ -943,7 +992,16 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                               <div className="mt-2 flex flex-wrap gap-2">
                                 {mappingWarnings.lowConfidenceRefs.map(({ index, ref }) => (
                                   <div key={`warning-ref-${index}`} className="relative w-12 h-12 rounded-md overflow-hidden border border-amber-200 bg-white">
-                                    <img src={`data:${ref.mimeType};base64,${ref.data}`} className="w-full h-full object-cover" />
+                                    <img
+                                      src={toStyleDataUrl(ref)}
+                                      className="w-full h-full object-cover cursor-zoom-in"
+                                      onClick={() =>
+                                        setExpandedImage({
+                                          src: toStyleDataUrl(ref),
+                                          label: 'Low-confidence reference'
+                                        })
+                                      }
+                                    />
                                     <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[9px] text-center">
                                       {Math.round((ref.qualityScore ?? ref.confidence ?? 0) * 100)}%
                                     </span>
@@ -978,11 +1036,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   Style References
                 </h3>
                 <p className="text-gray-500 text-sm mb-6">
-                  Mixed references used for generation. Setup sends up to 14 refs (6 scene, 4 character, 4 object).
+                  Stored references can include many screenshots. Runtime still sends up to 14 refs per generated image.
                 </p>
                 <div className="flex flex-wrap gap-2 mb-4">
                   <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-bold">
-                    Setup Pack {setupPreviewRefs.length}/{STYLE_REF_TOTAL}
+                    Stored {storedStyleRefs.length}/{STYLE_REF_LIBRARY_TOTAL}
+                  </span>
+                  <span className="px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 text-xs font-bold">
+                    Runtime Pack {runtimePreviewRefs.length}/{STYLE_REF_TOTAL}
                   </span>
                   <span className="px-2 py-1 rounded-full bg-sky-50 text-sky-700 text-xs font-bold">
                     Scene {styleCounts.scene}
@@ -993,12 +1054,24 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                   <span className="px-2 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-bold">
                     Object {styleCounts.object}
                   </span>
+                  <span className="px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 text-xs font-bold">
+                    Runtime Mix S{runtimeCounts.scene} C{runtimeCounts.character} O{runtimeCounts.object}
+                  </span>
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">
                   {styleReferences.map((style, idx) => (
                     <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
-                      <img src={`data:${style.mimeType};base64,${style.data}`} className="w-full h-full object-cover" />
+                      <img
+                        src={toStyleDataUrl(style)}
+                        className="w-full h-full object-cover cursor-zoom-in"
+                        onClick={() =>
+                          setExpandedImage({
+                            src: toStyleDataUrl(style),
+                            label: `${style.kind} reference`
+                          })
+                        }
+                      />
                       <span className="absolute left-1 top-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-semibold uppercase">
                         {style.kind}
                       </span>
@@ -1042,6 +1115,35 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
           </div>
         </div>
       </div>
+
+      {expandedImage && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
+          onClick={() => setExpandedImage(null)}
+        >
+          <div
+            className="relative bg-white rounded-2xl p-3 max-w-4xl w-full max-h-[88vh] shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              onClick={() => setExpandedImage(null)}
+              className="absolute top-3 right-3 z-10 p-2 rounded-full bg-black/70 text-white hover:bg-black"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <img
+              src={expandedImage.src}
+              alt={expandedImage.label || 'Reference preview'}
+              className="w-full max-h-[78vh] object-contain rounded-lg bg-gray-50"
+            />
+            {expandedImage.label && (
+              <p className="mt-2 text-xs font-semibold text-gray-600 text-center">
+                {expandedImage.label}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

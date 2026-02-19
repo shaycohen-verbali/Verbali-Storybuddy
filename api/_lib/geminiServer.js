@@ -22,13 +22,14 @@ const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
 const STYLE_REF_INDEX_LIMIT = 240;
 const STYLE_REF_POOL_LIMIT = 120;
+const STYLE_REF_CLASSIFY_BATCH_SIZE = 12;
 const STYLE_REF_SCENE_QUOTA = 6;
 const STYLE_REF_CHARACTER_QUOTA = 4;
 const STYLE_REF_OBJECT_QUOTA = 4;
 const MAX_CHARACTER_REFS_PER_CHARACTER = 3;
 const MAX_OBJECT_REFS_PER_OBJECT = 4;
 const MAX_SCENE_REFS_PER_SCENE = 4;
-const MIN_DETECTION_CONFIDENCE = 0.6;
+const MIN_DETECTION_CONFIDENCE = 0.45;
 const LOW_CONFIDENCE_WARNING_THRESHOLD = 0.7;
 const MAX_SCENE_ALIASES = 5;
 const MAX_SCENE_FACTS = 16;
@@ -669,9 +670,53 @@ const buildAllowedObjectMap = (storyFacts) =>
   );
 
 const normalizeToAllowedName = (value, allowedMap) => {
-  const normalized = String(value || '').trim().toLowerCase();
+  const normalizeKey = (input) =>
+    String(input || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const normalized = normalizeKey(value);
   if (!normalized) return '';
-  return allowedMap.get(normalized) || '';
+
+  const exact = allowedMap.get(normalized);
+  if (exact) {
+    return exact;
+  }
+
+  const queryTokens = normalized
+    .split(' ')
+    .filter((token) => token && token.length > 1 && !STOP_WORDS.has(token));
+
+  let bestName = '';
+  let bestScore = 0;
+
+  for (const [allowedKey, canonicalName] of allowedMap.entries()) {
+    if (!allowedKey) continue;
+
+    let score = 0;
+    if (allowedKey.includes(normalized) || normalized.includes(allowedKey)) {
+      score = 0.82;
+    } else {
+      const allowedTokens = allowedKey
+        .split(' ')
+        .filter((token) => token && token.length > 1 && !STOP_WORDS.has(token));
+
+      if (queryTokens.length > 0 && allowedTokens.length > 0) {
+        const overlap = queryTokens.filter((token) => allowedTokens.includes(token)).length;
+        const denominator = Math.max(queryTokens.length, allowedTokens.length);
+        score = overlap / denominator;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestName = canonicalName;
+    }
+  }
+
+  return bestScore >= 0.55 ? bestName : '';
 };
 
 const inferSceneIdFromEvidence = (sceneCatalog, pageIndex) => {
@@ -702,14 +747,13 @@ const inferSceneIdFromEvidence = (sceneCatalog, pageIndex) => {
   return '';
 };
 
-const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
-  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
-  if (references.length === 0) {
+const classifyStyleReferenceBatch = async (ai, references, storyFacts, indexOffset = 0) => {
+  if (!Array.isArray(references) || references.length === 0) {
     return [];
   }
 
   const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
-  const allowedObjects = (storyFacts?.objects || []).slice(0, 20);
+  const allowedObjects = (storyFacts?.objects || []).slice(0, 24);
   const allowedScenes = (storyFacts?.sceneCatalog || []).map((entry) => ({ id: entry.id, title: entry.title }));
 
   const parts = [
@@ -720,9 +764,10 @@ const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
         `Object names allowed: ${allowedObjects.join(', ') || 'none'}.`,
         `Scene IDs allowed: ${allowedScenes.map((scene) => `${scene.id}:${scene.title}`).join(', ') || 'none'}.`,
         `You will receive ${references.length} images in order.`,
+        'Use LOCAL image indexes from 0 to image_count - 1.',
         'Return strict JSON with classifications array.',
         'Each item must contain:',
-        '- image_index (number)',
+        '- image_index (number, local index)',
         '- kind (scene | character | object)',
         '- scene_id (optional, must be one of allowed scene IDs if provided)',
         '- asset_role (scene_anchor | character_form | object_anchor)',
@@ -738,92 +783,129 @@ const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
     }
   ];
 
-  references.forEach((reference, index) => {
-    parts.push({ text: `Reference image index ${index}` });
+  references.forEach((reference, localIndex) => {
+    parts.push({ text: `Reference image local index ${localIndex}` });
     parts.push({ inlineData: { mimeType: reference.mimeType, data: reference.data } });
   });
 
-  try {
-    const response = await retryWithBackoff(() =>
-      ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: { parts },
-        config: {
-          responseMimeType: 'application/json',
-          thinkingConfig: { thinkingBudget: 0 },
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              classifications: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    image_index: { type: Type.NUMBER },
-                    kind: { type: Type.STRING },
-                    scene_id: { type: Type.STRING },
-                    asset_role: { type: Type.STRING },
-                    confidence: { type: Type.NUMBER },
-                    characters: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          name: { type: Type.STRING },
-                          confidence: { type: Type.NUMBER },
-                          box: {
-                            type: Type.OBJECT,
-                            properties: {
-                              x: { type: Type.NUMBER },
-                              y: { type: Type.NUMBER },
-                              width: { type: Type.NUMBER },
-                              height: { type: Type.NUMBER }
-                            }
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: { parts },
+      config: {
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            classifications: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  image_index: { type: Type.NUMBER },
+                  kind: { type: Type.STRING },
+                  scene_id: { type: Type.STRING },
+                  asset_role: { type: Type.STRING },
+                  confidence: { type: Type.NUMBER },
+                  characters: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        name: { type: Type.STRING },
+                        confidence: { type: Type.NUMBER },
+                        box: {
+                          type: Type.OBJECT,
+                          properties: {
+                            x: { type: Type.NUMBER },
+                            y: { type: Type.NUMBER },
+                            width: { type: Type.NUMBER },
+                            height: { type: Type.NUMBER }
                           }
-                        },
-                        required: ['name', 'confidence']
-                      }
-                    },
-                    objects: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          name: { type: Type.STRING },
-                          confidence: { type: Type.NUMBER },
-                          box: {
-                            type: Type.OBJECT,
-                            properties: {
-                              x: { type: Type.NUMBER },
-                              y: { type: Type.NUMBER },
-                              width: { type: Type.NUMBER },
-                              height: { type: Type.NUMBER }
-                            }
-                          }
-                        },
-                        required: ['name', 'confidence']
-                      }
+                        }
+                      },
+                      required: ['name', 'confidence']
                     }
                   },
-                  required: ['image_index', 'kind', 'asset_role', 'confidence', 'characters', 'objects']
-                }
+                  objects: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        name: { type: Type.STRING },
+                        confidence: { type: Type.NUMBER },
+                        box: {
+                          type: Type.OBJECT,
+                          properties: {
+                            x: { type: Type.NUMBER },
+                            y: { type: Type.NUMBER },
+                            width: { type: Type.NUMBER },
+                            height: { type: Type.NUMBER }
+                          }
+                        }
+                      },
+                      required: ['name', 'confidence']
+                    }
+                  }
+                },
+                required: ['image_index', 'kind', 'asset_role', 'confidence', 'characters', 'objects']
               }
-            },
-            required: ['classifications']
-          }
+            }
+          },
+          required: ['classifications']
         }
-      })
-    );
+      }
+    })
+  );
 
-    return parseJsonSafe(response.text, { classifications: [] }).classifications || [];
-  } catch (error) {
-    console.warn('[setup] style reference classification failed', error?.message || error);
+  const localClassifications = parseJsonSafe(response.text, { classifications: [] }).classifications || [];
+  return localClassifications
+    .map((entry) => {
+      const rawIndex = Number(entry?.image_index);
+      if (!Number.isInteger(rawIndex)) {
+        return null;
+      }
+
+      let globalIndex = -1;
+      if (rawIndex >= 0 && rawIndex < references.length) {
+        globalIndex = indexOffset + rawIndex;
+      } else if (rawIndex >= indexOffset && rawIndex < indexOffset + references.length) {
+        globalIndex = rawIndex;
+      }
+
+      if (globalIndex < 0) return null;
+
+      return {
+        ...entry,
+        image_index: globalIndex
+      };
+    })
+    .filter(Boolean);
+};
+
+const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
+  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_POOL_LIMIT);
+  if (references.length === 0) {
     return [];
   }
+
+  const classifications = [];
+  for (let start = 0; start < references.length; start += STYLE_REF_CLASSIFY_BATCH_SIZE) {
+    const batch = references.slice(start, start + STYLE_REF_CLASSIFY_BATCH_SIZE);
+    try {
+      const batchClassifications = await classifyStyleReferenceBatch(ai, batch, storyFacts, start);
+      classifications.push(...batchClassifications);
+    } catch (error) {
+      console.warn('[setup] style reference classification batch failed', start, error?.message || error);
+    }
+  }
+
+  return classifications;
 };
 
 const mergeStyleReferenceClassification = (styleRefs, classifications, storyFacts) => {
-  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
+  const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_POOL_LIMIT);
   const classificationMap = new Map();
   for (const item of Array.isArray(classifications) ? classifications : []) {
     const idx = Number(item?.image_index);
@@ -955,6 +1037,25 @@ const buildCanonicalStyleReferencePack = (styleRefs) => {
   }
 
   return selected.slice(0, STYLE_REF_MAX_TOTAL);
+};
+
+const mergeStyleReferencePools = (...groups) => {
+  const merged = [];
+  const seen = new Set();
+
+  for (const group of groups) {
+    for (const ref of Array.isArray(group) ? group : []) {
+      const fingerprint = styleRefFingerprint(ref);
+      if (!fingerprint || seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+      merged.push(ref);
+      if (merged.length >= STYLE_REF_POOL_LIMIT) {
+        return merged;
+      }
+    }
+  }
+
+  return merged;
 };
 
 const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
@@ -2202,7 +2303,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   );
 
   const incomingStyleRefs = normalizeStyleReferenceAssets(
-    (Array.isArray(styleImages) ? styleImages : []).slice(0, STYLE_REF_MAX_TOTAL).map((item) => ({
+    (Array.isArray(styleImages) ? styleImages : []).slice(0, STYLE_REF_POOL_LIMIT).map((item) => ({
       ...item,
       kind: item.kind || 'scene',
       source: item.source || 'upload'
@@ -2240,18 +2341,28 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   const totalMs = Math.round(performance.now() - setupStart);
 
   const coverPrimer = toFileDataFromDataUrl(coverImage);
-  let finalStyleReferences = canonicalStyleRefs;
+  let finalStyleReferences = mergeStyleReferencePools(
+    canonicalStyleRefs,
+    classifiedStyleRefs,
+    incomingStyleRefs
+  );
   if (finalStyleReferences.length === 0 && coverPrimer) {
-    finalStyleReferences = [
+    finalStyleReferences = mergeStyleReferencePools([
       {
         ...coverPrimer,
         kind: 'scene',
         source: 'generated',
-        confidence: 0.7
+        confidence: 0.7,
+        qualityScore: 0.7,
+        assetRole: 'scene_anchor'
       }
-    ];
+    ]);
   }
-  const stylePrimer = finalStyleReferences.map((reference) => ({
+
+  const stylePrimerSource = canonicalStyleRefs.length > 0
+    ? canonicalStyleRefs
+    : finalStyleReferences;
+  const stylePrimer = stylePrimerSource.slice(0, STYLE_REF_MAX_TOTAL).map((reference) => ({
     mimeType: reference.mimeType,
     data: reference.data
   }));
