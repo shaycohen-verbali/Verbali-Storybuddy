@@ -730,6 +730,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         unmappedCharacters: [] as string[],
         unmappedObjects: [] as string[],
         unmappedScenes: [] as string[],
+        lowConfidenceScenes: [] as string[],
         characterWideOnly: [] as string[],
         objectWideOnly: [] as string[],
         characterNoTightCrop: [] as string[],
@@ -756,6 +757,14 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       .filter((name) => (objectMap.get(name.toLowerCase()) || []).length === 0);
     const unmappedScenes = (facts.sceneCatalog || [])
       .filter((scene) => (sceneMap.get(scene.id.toLowerCase()) || []).length === 0)
+      .map((scene) => scene.title);
+    const lowConfidenceSceneIds = new Set(
+      (facts.sceneImageMap || [])
+        .filter((entry) => (entry.confidence ?? 0) > 0 && (entry.confidence ?? 0) < 0.7)
+        .map((entry) => entry.sceneId.toLowerCase())
+    );
+    const lowConfidenceScenes = (facts.sceneCatalog || [])
+      .filter((scene) => lowConfidenceSceneIds.has(scene.id.toLowerCase()))
       .map((scene) => scene.title);
     const lowConfidenceRefs = preparedStyleRefs
       .map((ref, index) => ({ index, ref }))
@@ -811,6 +820,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       unmappedCharacters,
       unmappedObjects,
       unmappedScenes,
+      lowConfidenceScenes,
       characterWideOnly,
       objectWideOnly,
       characterNoTightCrop,
@@ -822,6 +832,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     mappingWarnings.unmappedCharacters.length > 0 ||
     mappingWarnings.unmappedObjects.length > 0 ||
     mappingWarnings.unmappedScenes.length > 0 ||
+    mappingWarnings.lowConfidenceScenes.length > 0 ||
     mappingWarnings.characterWideOnly.length > 0 ||
     mappingWarnings.objectWideOnly.length > 0 ||
     mappingWarnings.characterNoTightCrop.length > 0 ||
@@ -1269,6 +1280,19 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                               <div className="mt-1 flex flex-wrap gap-2">
                                 {mappingWarnings.unmappedScenes.map((name) => (
                                   <span key={name} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.lowConfidenceScenes.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Low-Confidence Scene Mapping</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.lowConfidenceScenes.map((name) => (
+                                  <span key={`low-scene-${name}`} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
                                     {name}
                                   </span>
                                 ))}

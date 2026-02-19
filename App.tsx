@@ -443,6 +443,12 @@ const App: React.FC = () => {
                   {options.map((option: Option) => {
                     const debug = option.debug;
                     if (!debug) return null;
+                    const selectedRefMeta = debug.selectedStyleRefs || [];
+                    const selectedRefMetaByIndex = new Map(
+                      selectedRefMeta
+                        .filter((entry) => Number.isInteger(entry.index) && entry.index >= 0)
+                        .map((entry) => [entry.index, entry] as const)
+                    );
 
                     const selectedRefs = (debug.selectedStyleRefIndexes || [])
                       .map((idx) => {
@@ -480,6 +486,7 @@ const App: React.FC = () => {
                           <div className="flex flex-wrap gap-2 mb-3">
                             {selectedRefs.map(({ idx, ref }) => {
                               const src = toDataUrl(ref);
+                              const meta = selectedRefMetaByIndex.get(idx);
                               return (
                                 <button
                                   key={`${option.id}-ref-${idx}`}
@@ -490,9 +497,29 @@ const App: React.FC = () => {
                                   <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[10px] text-center">
                                     #{idx}
                                   </span>
+                                  {meta?.kind && (
+                                    <span className="absolute top-0 left-0 right-0 bg-black/55 text-white text-[9px] text-center uppercase">
+                                      {meta.kind}
+                                    </span>
+                                  )}
                                 </button>
                               );
                             })}
+                          </div>
+                        )}
+
+                        {selectedRefMeta.length > 0 && (
+                          <div className="text-[11px] text-gray-600 font-mono mb-3 space-y-1">
+                            {selectedRefMeta.map((entry, index) => (
+                              <div key={`${option.id}-meta-${index}`} className="break-words">
+                                ref#{entry.index >= 0 ? entry.index : '?'} {entry.kind}/{entry.source}
+                                {entry.sceneId ? ` scene=${entry.sceneId}` : ''}
+                                {entry.characterName ? ` char=${entry.characterName}` : ''}
+                                {entry.objectName ? ` obj=${entry.objectName}` : ''}
+                                {typeof entry.cropCoverage === 'number' ? ` crop=${Math.round(entry.cropCoverage * 100)}%` : ''}
+                                {typeof entry.confidence === 'number' ? ` conf=${Math.round(entry.confidence * 100)}%` : ''}
+                              </div>
+                            ))}
                           </div>
                         )}
 

@@ -11,15 +11,14 @@ const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
-const GOOGLE_IMAGE_MODEL = (process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image').trim();
 const REPLICATE_IMAGE_MODEL = (
   process.env.REPLICATE_IMAGE_MODEL ||
   'google/nano-banana-pro:d71e2df08d6ef4c4fb6d3773e9e557de6312e04444940dbb81fd73366ed83941'
 ).trim();
-const USE_REPLICATE_IMAGE_MODEL = Boolean(process.env.REPLICATE_API_TOKEN);
-const IMAGE_MODEL = USE_REPLICATE_IMAGE_MODEL ? REPLICATE_IMAGE_MODEL : GOOGLE_IMAGE_MODEL;
+const IMAGE_MODEL = REPLICATE_IMAGE_MODEL;
 const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
+const MIN_STYLE_REF_GROUNDING = 4;
 const STYLE_REF_INDEX_LIMIT = 240;
 const STYLE_REF_POOL_LIMIT = 120;
 const STYLE_REF_CLASSIFY_BATCH_SIZE = 12;
@@ -61,19 +60,10 @@ const getClient = () => {
   return new GoogleGenAI({ apiKey });
 };
 
-const extractImageDataUrl = (response) => {
-  for (const part of response.candidates?.[0]?.content?.parts || []) {
-    if (part.inlineData) {
-      return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-    }
-  }
-  return null;
-};
-
 const getReplicateToken = () => {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) {
-    throw new Error('Server missing REPLICATE_API_TOKEN');
+    throw new Error('Image generation is configured for Replicate nano-banana-pro only. Missing REPLICATE_API_TOKEN.');
   }
   return token;
 };
@@ -211,19 +201,11 @@ const generateImageWithReplicate = async (parts, aspectRatio) => {
 };
 
 const generateImageDataUrl = async (ai, parts, aspectRatio) => {
-  if (USE_REPLICATE_IMAGE_MODEL) {
-    return generateImageWithReplicate(parts, aspectRatio);
+  if (!REPLICATE_IMAGE_MODEL) {
+    throw new Error('Image generation is configured for Replicate nano-banana-pro only. Missing REPLICATE_IMAGE_MODEL.');
   }
 
-  const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: IMAGE_MODEL,
-      contents: { parts },
-      config: { imageConfig: { aspectRatio } }
-    })
-  );
-
-  return extractImageDataUrl(response);
+  return generateImageWithReplicate(parts, aspectRatio);
 };
 
 const toFileDataFromDataUrl = (dataUrl) => {
@@ -777,6 +759,101 @@ const inferSceneIdFromEvidence = (sceneCatalog, pageIndex) => {
   return '';
 };
 
+const resolveSceneIdFromCatalog = (sceneCatalog, sceneCandidate) => {
+  const candidateText = normalizePhrase(sceneCandidate);
+  if (!candidateText) return '';
+
+  const candidateSlug = toSceneId(candidateText, '');
+  if (!candidateSlug) return '';
+
+  let bestSceneId = '';
+  let bestScore = 0;
+
+  for (const scene of Array.isArray(sceneCatalog) ? sceneCatalog : []) {
+    const sceneId = normalizePhrase(scene?.id);
+    if (!sceneId) continue;
+
+    const labels = [sceneId, scene?.title, ...(Array.isArray(scene?.aliases) ? scene.aliases : [])]
+      .map((value) => normalizePhrase(value))
+      .filter(Boolean);
+
+    for (const label of labels) {
+      const labelSlug = toSceneId(label, '');
+      if (!labelSlug) continue;
+
+      let score = 0;
+      if (labelSlug === candidateSlug) {
+        score = 1;
+      } else if (labelSlug.includes(candidateSlug) || candidateSlug.includes(labelSlug)) {
+        score = 0.78;
+      } else {
+        const candidateTokens = candidateSlug.split('-').filter(Boolean);
+        const labelTokens = labelSlug.split('-').filter(Boolean);
+        if (candidateTokens.length > 0 && labelTokens.length > 0) {
+          const overlap = candidateTokens.filter((token) => labelTokens.includes(token)).length;
+          const denominator = Math.max(candidateTokens.length, labelTokens.length);
+          score = overlap / denominator;
+        }
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestSceneId = sceneId;
+      }
+    }
+  }
+
+  return bestScore >= 0.55 ? bestSceneId : '';
+};
+
+const assignSceneIdsToUnboundRefs = (references, sceneCatalog) => {
+  const normalizedRefs = Array.isArray(references) ? references : [];
+  if (normalizedRefs.length === 0) return normalizedRefs;
+
+  const catalog = Array.isArray(sceneCatalog) ? sceneCatalog : [];
+  if (catalog.length === 0) return normalizedRefs;
+
+  const sceneByPage = new Map();
+  for (const ref of normalizedRefs) {
+    if (ref?.kind !== 'scene' || !ref?.sceneId || !Number.isInteger(ref?.pageIndex)) continue;
+    sceneByPage.set(Number(ref.pageIndex), ref.sceneId);
+  }
+
+  const singleSceneId = catalog.length === 1 ? normalizePhrase(catalog[0]?.id) : '';
+
+  return normalizedRefs.map((ref) => {
+    if (!ref || ref.kind !== 'scene' || ref.sceneId) {
+      return ref;
+    }
+
+    let resolvedSceneId = inferSceneIdFromEvidence(catalog, ref.pageIndex);
+
+    if (!resolvedSceneId && Number.isInteger(ref.pageIndex)) {
+      for (const delta of [0, -1, 1, -2, 2]) {
+        const byPage = sceneByPage.get(Number(ref.pageIndex) + delta);
+        if (byPage) {
+          resolvedSceneId = byPage;
+          break;
+        }
+      }
+    }
+
+    if (!resolvedSceneId && singleSceneId) {
+      resolvedSceneId = singleSceneId;
+    }
+
+    if (!resolvedSceneId) {
+      return ref;
+    }
+
+    return {
+      ...ref,
+      sceneId: resolvedSceneId,
+      confidence: normalizeConfidence(ref.confidence, 0.5)
+    };
+  });
+};
+
 const classifyStyleReferenceBatch = async (ai, references, storyFacts, indexOffset = 0) => {
   if (!Array.isArray(references) || references.length === 0) {
     return [];
@@ -808,6 +885,7 @@ const classifyStyleReferenceBatch = async (ai, references, storyFacts, indexOffs
         '- If image is a character crop, use kind=character.',
         '- If image highlights a key object, use kind=object.',
         '- Use kind=scene for page-wide or environmental references.',
+        '- If kind=scene, set scene_id to the closest allowed scene id whenever plausible.',
         '- box must be normalized 0..1 coordinates and only for visible entities.'
       ].join('\n')
     }
@@ -945,13 +1023,14 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
 
   const allowedCharacters = buildAllowedCharacterMap(storyFacts);
   const allowedObjects = buildAllowedObjectMap(storyFacts);
+  const sceneCatalog = storyFacts?.sceneCatalog || [];
   const allowedScenes = new Map(
-    (storyFacts?.sceneCatalog || [])
+    sceneCatalog
       .map((scene) => [String(scene?.id || '').toLowerCase(), String(scene?.id || '').trim()])
       .filter((entry) => entry[0] && entry[1])
   );
 
-  return references.map((reference, index) => {
+  const merged = references.map((reference, index) => {
     const classification = classificationMap.get(index);
     const characters = (Array.isArray(classification?.characters) ? classification.characters : [])
       .map((item) => {
@@ -980,10 +1059,12 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
 
     const characterName = characters[0]?.name || normalizeToAllowedName(reference.characterName, allowedCharacters);
     const objectName = objects[0]?.name || normalizeToAllowedName(reference.objectName, allowedObjects);
-    const sceneIdCandidate = String(classification?.scene_id || reference.sceneId || '').toLowerCase().trim();
+    const rawSceneCandidate = normalizePhrase(classification?.scene_id || reference.sceneId || '');
+    const sceneIdCandidate = rawSceneCandidate.toLowerCase().trim();
     const sceneId =
       allowedScenes.get(sceneIdCandidate) ||
-      inferSceneIdFromEvidence(storyFacts?.sceneCatalog || [], reference?.pageIndex) ||
+      resolveSceneIdFromCatalog(sceneCatalog, rawSceneCandidate) ||
+      inferSceneIdFromEvidence(sceneCatalog, reference?.pageIndex) ||
       '';
 
     let kind = normalizeStyleReferenceKind(classification?.kind, reference.kind || 'scene');
@@ -1006,10 +1087,14 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
       computeCropCoverage(reference.box, reference.cropCoverage)
     );
 
+    const resolvedSceneId = kind === 'scene' && !sceneId && sceneCatalog.length === 1
+      ? normalizePhrase(sceneCatalog[0]?.id)
+      : sceneId;
+
     return {
       ...reference,
       kind,
-      sceneId: sceneId || undefined,
+      sceneId: resolvedSceneId || undefined,
       assetRole: normalizeStyleAssetRole(
         classification?.asset_role,
         kind === 'character' ? 'character_form' : kind === 'object' ? 'object_anchor' : 'scene_anchor'
@@ -1032,6 +1117,8 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
       }))
     };
   });
+
+  return assignSceneIdsToUnboundRefs(merged, sceneCatalog);
 };
 
 const sortStyleRefs = (refs) =>
@@ -1130,11 +1217,12 @@ const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
 
     const normalizedSceneId = allowedScenes.get(String(reference?.sceneId || '').toLowerCase().trim());
     if (normalizedSceneId) {
-      const list = sceneBuckets.get(normalizedSceneId) || [];
-      if (list.length < MAX_SCENE_REFS_PER_SCENE) {
-        list.push(index);
-        sceneBuckets.set(normalizedSceneId, list);
+      const entry = sceneBuckets.get(normalizedSceneId) || { styleRefIndexes: [], confidenceSamples: [] };
+      if (!entry.styleRefIndexes.includes(index) && entry.styleRefIndexes.length < MAX_SCENE_REFS_PER_SCENE) {
+        entry.styleRefIndexes.push(index);
       }
+      entry.confidenceSamples.push(normalizeConfidence(reference?.confidence, 0.65));
+      sceneBuckets.set(normalizedSceneId, entry);
     }
 
     const detectedCharacterNames = [
@@ -1206,10 +1294,15 @@ const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
       styleRefs.length
     ),
     sceneImageMap: normalizeSceneImageMap(
-      Array.from(sceneBuckets.entries()).map(([sceneId, styleRefIndexes]) => ({
+      Array.from(sceneBuckets.entries()).map(([sceneId, entry]) => ({
         sceneId,
-        styleRefIndexes,
-        confidence: 0.75
+        styleRefIndexes: entry.styleRefIndexes,
+        confidence: normalizeConfidence(
+          entry.confidenceSamples.length > 0
+            ? entry.confidenceSamples.reduce((sum, value) => sum + value, 0) / entry.confidenceSamples.length
+            : 0.65,
+          0.65
+        )
       })),
       storyFacts?.sceneCatalog || [],
       styleRefs.length
@@ -2249,6 +2342,45 @@ const selectStyleRefsForOption = async (ai, stylePrimer, styleReferences, storyF
     });
   }
 
+  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
+    const groundingTarget = Math.min(STYLE_REF_MAX_TOTAL, MIN_STYLE_REF_GROUNDING);
+
+    pickRankedRefs({
+      refsWithMeta,
+      selectedIndexes,
+      selectedRefs,
+      predicate: (reference) => reference.kind === 'scene',
+      targetCount: groundingTarget,
+      participants: {
+        ...participants,
+        scenes: participants.scenes.length > 0
+          ? participants.scenes
+          : (Array.isArray(questionParticipants?.scenes) ? questionParticipants.scenes : [])
+      },
+      categoryPenaltyTracker
+    });
+
+    pickRankedRefs({
+      refsWithMeta,
+      selectedIndexes,
+      selectedRefs,
+      predicate: (reference) => isTightMappedRef(reference, 'character'),
+      targetCount: groundingTarget,
+      participants,
+      categoryPenaltyTracker
+    });
+
+    pickRankedRefs({
+      refsWithMeta,
+      selectedIndexes,
+      selectedRefs,
+      predicate: (reference) => isTightMappedRef(reference, 'object'),
+      targetCount: groundingTarget,
+      participants,
+      categoryPenaltyTracker
+    });
+  }
+
   return {
     refs: selectedRefs.slice(0, STYLE_REF_MAX_TOTAL),
     participants,
@@ -2780,6 +2912,17 @@ export const runTurnPipeline = async (
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
       }
 
+      const selectedStyleRefs = refsForOption.map((ref, idx) => ({
+        index: Number.isInteger(selectedStyleRefIndexes[idx]) ? selectedStyleRefIndexes[idx] : -1,
+        kind: ref.kind,
+        source: ref.source,
+        sceneId: ref.sceneId || undefined,
+        characterName: ref.characterName || undefined,
+        objectName: ref.objectName || undefined,
+        cropCoverage: Number.isFinite(Number(ref.cropCoverage)) ? Number(ref.cropCoverage) : undefined,
+        confidence: Number.isFinite(Number(ref.confidence)) ? Number(ref.confidence) : undefined
+      }));
+
       const imagePrompt = buildImagePrompt({
         optionText: card.text,
         renderMode: card.renderMode,
@@ -2808,6 +2951,7 @@ export const runTurnPipeline = async (
       card.isLoadingImage = false;
       card.debug = {
         selectedStyleRefIndexes,
+        selectedStyleRefs,
         selectedParticipants: participants,
         imagePrompt,
         imageModel: IMAGE_MODEL,

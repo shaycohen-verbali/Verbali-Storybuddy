@@ -166,8 +166,20 @@ export interface TurnContextParticipants {
   inferredObjects: string[];
 }
 
+export interface SelectedStyleRefDebug {
+  index: number;
+  kind: StyleReferenceKind;
+  source: StyleReferenceSource;
+  sceneId?: string;
+  characterName?: string;
+  objectName?: string;
+  cropCoverage?: number;
+  confidence?: number;
+}
+
 export interface TurnCardDebug {
   selectedStyleRefIndexes?: number[];
+  selectedStyleRefs?: SelectedStyleRefDebug[];
   selectedParticipants?: TurnContextParticipants;
   imagePrompt?: string;
   imageModel?: string;
