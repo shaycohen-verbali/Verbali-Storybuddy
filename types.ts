@@ -75,6 +75,7 @@ export interface StoryMetadata {
   objects: StoryObject[];
   artStyle?: string;
   storyBrief?: string;
+  storyText?: string;
   storyFacts?: StoryFacts;
 }
 
@@ -101,6 +102,7 @@ export interface StoryPack {
   summary: string;
   artStyle: string;
   storyBrief: string;
+  storyText?: string;
   storyFacts: StoryFacts;
   coverImage?: string | null;
   stylePrimer: FileData[];
@@ -249,7 +251,8 @@ export interface SetupStoryResponse {
 export interface TurnRequest {
   audioBase64: string;
   mimeType: string;
-  storyPdf: FileData;
+  storyText: string;
+  storyPdf?: FileData;
   storyBrief: string;
   storyFacts?: StoryFacts;
   artStyle: string;

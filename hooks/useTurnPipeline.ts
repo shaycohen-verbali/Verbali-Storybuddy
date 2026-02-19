@@ -127,10 +127,11 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       const audioBase64 = await readBlobAsBase64(audioBlob);
 
       if (USE_BACKEND_PIPELINE) {
-        if (!activeAssets.pdfData?.data || !activeAssets.pdfData?.mimeType) {
+        const storyText = String(activeAssets.metadata.storyText || activeAssets.storyBrief || '').trim();
+        if (!storyText) {
           dispatch({
             type: 'SET_ERROR',
-            error: 'This story is missing original PDF. Open setup and save with original PDF.'
+            error: 'This story is missing extracted book text. Open setup and save again.'
           });
           return;
         }
@@ -138,7 +139,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
         const baseTurnPayload = {
           audioBase64,
           mimeType: audioBlob.type,
-          storyPdf: activeAssets.pdfData,
+          storyText,
           storyBrief: activeAssets.storyBrief,
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',

@@ -40,6 +40,7 @@ export const useStorySetup = () => {
           summary: analysis.summary,
           artStyle: analysis.artStyle,
           storyBrief: analysis.summary,
+          storyText: analysis.summary,
           storyFacts: {
             characters: [],
             characterCatalog: [],

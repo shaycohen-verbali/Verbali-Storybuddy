@@ -8,6 +8,7 @@ const STOP_WORDS = new Set([
 const MAX_OPTION_WORDS = 10;
 const MAX_TTS_WORDS = 10;
 const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
+const MAX_STORY_TEXT_PROMPT_CHARS = 32000;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
@@ -1424,6 +1425,9 @@ const normalizeStoryFacts = (facts, storyBrief) => {
 const compactStoryBriefForPrompt = (storyBrief) =>
   truncate(storyBrief || '', MAX_STORY_BRIEF_PROMPT_CHARS);
 
+const compactStoryTextForPrompt = (storyText) =>
+  truncate(storyText || '', MAX_STORY_TEXT_PROMPT_CHARS);
+
 const compactFactsForPrompt = (storyFacts) => {
   const normalized = normalizeStoryFacts(storyFacts, '');
   return {
@@ -1705,10 +1709,10 @@ const enforceThreeAnswerOptions = ({
   return [{ ...correct, isCorrect: true }, ...distractors.slice(0, 2)];
 };
 
-const buildAnswerAgentPrompt = ({ question, compactHistory, compactStoryFacts }) =>
+const buildAnswerAgentPrompt = ({ question, compactHistory, compactStoryFacts, storyText }) =>
   [
     'You are an answer generator for a non-verbal child reading-comprehension activity.',
-    'Use the attached story PDF as the primary source of truth.',
+    'Use the extracted story text as the primary source of truth.',
     'Generate exactly 3 options for the parent question.',
     'Rules:',
     '- Exactly 3 options total.',
@@ -1716,6 +1720,7 @@ const buildAnswerAgentPrompt = ({ question, compactHistory, compactStoryFacts })
     '- Each option max 10 words, child-friendly wording.',
     '- Wrong options should be plausible but still incorrect.',
     '- Keep text concrete and easy to illustrate.',
+    `Story text:\n${storyText || 'No story text provided.'}`,
     `Story facts helper: ${JSON.stringify(compactStoryFacts)}`,
     `Conversation:\n${compactHistory || 'None yet.'}`,
     `Parent question: ${question}`,
@@ -1724,25 +1729,34 @@ const buildAnswerAgentPrompt = ({ question, compactHistory, compactStoryFacts })
     '{ "answers": [ { "text": string, "is_correct": boolean, "evidence": string, "support_level": number } ] }'
   ].join('\n');
 
-const generateAnswersFromPdf = async (ai, { question, storyPdf, history, storyFacts, storyBrief }) => {
+const generateAnswersFromStoryText = async (ai, { question, storyText, history, storyFacts, storyBrief, storyPdf }) => {
   const compactHistory = compactHistoryForPrompt(history);
   const compactStoryFacts = compactFactsForPrompt(storyFacts);
-  const answerAgentPrompt = buildAnswerAgentPrompt({ question, compactHistory, compactStoryFacts });
+  const compactStoryText = compactStoryTextForPrompt(storyText);
+  const answerAgentPrompt = buildAnswerAgentPrompt({
+    question,
+    compactHistory,
+    compactStoryFacts,
+    storyText: compactStoryText
+  });
 
   const runAgent = async () => {
+    const parts = [];
+    if (storyPdf?.mimeType && storyPdf?.data) {
+      parts.push({
+        inlineData: {
+          mimeType: storyPdf.mimeType,
+          data: storyPdf.data
+        }
+      });
+    }
+    parts.push({ text: answerAgentPrompt });
+
     const response = await retryWithBackoff(() =>
       ai.models.generateContent({
         model: ANSWER_AGENT_MODEL,
         contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: storyPdf.mimeType,
-                data: storyPdf.data
-              }
-            },
-            { text: answerAgentPrompt }
-          ]
+          parts
         },
         config: {
           responseMimeType: 'application/json',
@@ -2808,6 +2822,55 @@ const extractSceneCatalogFromStory = async (ai, storyFile, storyBrief, storyFact
   }
 };
 
+const extractStoryTextFromPdf = async (ai, storyFile, storyBrief) => {
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
+            {
+              text: [
+                'Extract the readable book text from this children story PDF in reading order.',
+                'Focus on story sentences and dialog.',
+                'Skip page numbers, copyright lines, and decorative non-story text.',
+                'Return strict JSON only with one field: story_text.'
+              ].join('\n')
+            }
+          ]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              story_text: { type: Type.STRING }
+            },
+            required: ['story_text']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { story_text: '' });
+    const normalized = String(payload.story_text || '')
+      .replace(/\r/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    const compact = compactStoryTextForPrompt(normalized);
+
+    if (compact) {
+      return compact;
+    }
+  } catch (error) {
+    console.warn('[setup] story text extraction failed', error?.message || error);
+  }
+
+  return compactStoryTextForPrompt(storyBrief || '');
+};
+
 const enrichSceneEvidenceFromStyleRefs = (sceneCatalog, styleReferences) => {
   const byScene = new Map(
     (Array.isArray(sceneCatalog) ? sceneCatalog : []).map((scene) => [scene.id, { ...scene }])
@@ -2916,6 +2979,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   const summary = parsed.summary || 'Story analyzed.';
   const artStyle = parsed.art_style || 'Children\'s book illustration';
   const storyBrief = parsed.story_brief || summary;
+  const storyTextPromise = extractStoryTextFromPdf(ai, storyFile, storyBrief);
 
   let extractedCharacterCatalog = [];
   try {
@@ -3076,12 +3140,14 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     },
     storyBrief
   );
+  const storyText = await storyTextPromise;
 
   return {
     storyPack: {
       summary,
       artStyle,
       storyBrief,
+      storyText,
       storyFacts: storyFactsWithImageMap,
       coverImage,
       stylePrimer,
@@ -3098,6 +3164,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
 export const runTurnPipeline = async (
   audioBase64,
   mimeType,
+  storyText,
   storyPdf,
   storyBrief,
   storyFacts,
@@ -3106,8 +3173,8 @@ export const runTurnPipeline = async (
   styleReferences,
   history
 ) => {
-  if (!storyPdf?.data || !storyPdf?.mimeType) {
-    throw new Error('This story is missing original PDF. Open setup and save with original PDF.');
+  if (!String(storyText || '').trim()) {
+    throw new Error('This story is missing extracted book text. Open setup and save again.');
   }
 
   const ai = getClient();
@@ -3173,8 +3240,9 @@ export const runTurnPipeline = async (
     effectiveStyleReferences,
     null
   );
-  const answerAgentResult = await generateAnswersFromPdf(ai, {
+  const answerAgentResult = await generateAnswersFromStoryText(ai, {
     question,
+    storyText,
     storyPdf,
     history,
     storyFacts: normalizedFacts,

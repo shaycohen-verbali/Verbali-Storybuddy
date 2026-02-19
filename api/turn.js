@@ -15,17 +15,14 @@ export default async function handler(req, res) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const payloadBytes = Buffer.byteLength(JSON.stringify(body || {}), 'utf8');
 
-    if (!body?.audioBase64 || !body.mimeType || !body.storyBrief) {
-      return send(res, 400, { error: 'audioBase64, mimeType, and storyBrief are required' });
-    }
-
-    if (!body?.storyPdf?.data || !body?.storyPdf?.mimeType) {
-      return send(res, 400, { error: 'This story is missing original PDF. Open setup and save with original PDF.' });
+    if (!body?.audioBase64 || !body.mimeType || !body.storyBrief || !String(body?.storyText || '').trim()) {
+      return send(res, 400, { error: 'audioBase64, mimeType, storyBrief, and storyText are required' });
     }
 
     const result = await runTurnPipeline(
       body.audioBase64,
       body.mimeType,
+      body.storyText,
       body.storyPdf,
       body.storyBrief,
       body.storyFacts || null,

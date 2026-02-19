@@ -118,6 +118,7 @@ const App: React.FC = () => {
           summary: assets.metadata.summary || story.summary,
           artStyle: assets.metadata.artStyle || story.artStyle,
           storyBrief: assets.storyBrief,
+          storyText: assets.metadata.storyText || assets.storyBrief,
           storyFacts: assets.metadata.storyFacts || {
             characters: [],
             characterCatalog: [],
@@ -171,6 +172,7 @@ const App: React.FC = () => {
       summary: storyPack.summary,
       artStyle: storyPack.artStyle,
       storyBrief: storyPack.storyBrief,
+      storyText: storyPack.storyText || storyPack.storyBrief,
       storyFacts: storyPack.storyFacts,
       characters: [],
       objects: []
@@ -244,6 +246,7 @@ const App: React.FC = () => {
       summary: payload.storyPack.summary,
       artStyle: payload.storyPack.artStyle,
       storyBrief: payload.storyPack.storyBrief,
+      storyText: payload.storyPack.storyText || payload.storyPack.storyBrief,
       storyFacts: payload.storyPack.storyFacts,
       characters: [],
       objects: []
