@@ -7,7 +7,9 @@ import * as GeminiService from '../services/geminiService';
 
 const MAX_HISTORY_TURNS_FOR_BACKEND = 6;
 const MAX_HISTORY_TEXT_CHARS = 120;
-const MAX_TURN_STYLE_REFS = 120;
+const MAX_TURN_STYLE_REFS = 14;
+const MAX_TURN_STYLE_PRIMER = 14;
+const TURN_REQUEST_SOFT_LIMIT_BYTES = 4 * 1024 * 1024;
 
 type TtsResponse = { audioBase64: string; mimeType: string; audioBuffer?: AudioBuffer } | null;
 
@@ -39,6 +41,28 @@ const compactHistoryForBackend = (history: ChatTurn[]): ChatTurn[] =>
 
 const ttsCacheKey = (text: string): string =>
   String(text || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+const estimatePayloadBytes = (payload: unknown): number => new Blob([JSON.stringify(payload || {})]).size;
+
+const toUserFacingTurnError = (error: unknown): string => {
+  const raw = String((error as any)?.message || error || '').trim();
+  const lowered = raw.toLowerCase();
+
+  if (
+    lowered.includes('function_payload_too_large') ||
+    lowered.includes('request entity too large') ||
+    lowered.includes('payload too large') ||
+    lowered.includes('body exceeded')
+  ) {
+    return 'This book is too large for cloud turn processing. Re-open setup with a smaller PDF or fewer style images.';
+  }
+
+  if (raw) {
+    return raw;
+  }
+
+  return 'Something went wrong processing your request.';
+};
 
 export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
   const [state, dispatch] = useReducer(turnSessionReducer, initialTurnSessionState);
@@ -111,17 +135,48 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           return;
         }
 
-        const turnResponse = await runTurnWithBackend({
+        const baseTurnPayload = {
           audioBase64,
           mimeType: audioBlob.type,
           storyPdf: activeAssets.pdfData,
           storyBrief: activeAssets.storyBrief,
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
-          stylePrimer: activeAssets.stylePrimer.slice(0, 14),
+          stylePrimer: activeAssets.stylePrimer.slice(0, MAX_TURN_STYLE_PRIMER),
+          // Avoid sending the full style reference pool each turn; this commonly exceeds Vercel payload limits.
           styleReferences: (activeAssets.styleReferences || []).slice(0, MAX_TURN_STYLE_REFS),
           history: compactHistoryForBackend(stateRef.current.conversationHistory)
-        });
+        };
+
+        let turnPayload = baseTurnPayload;
+        let payloadBytes = estimatePayloadBytes(turnPayload);
+
+        if (payloadBytes > TURN_REQUEST_SOFT_LIMIT_BYTES) {
+          turnPayload = {
+            ...baseTurnPayload,
+            styleReferences: [],
+            stylePrimer: activeAssets.stylePrimer.slice(0, 8)
+          };
+          payloadBytes = estimatePayloadBytes(turnPayload);
+        }
+
+        if (payloadBytes > TURN_REQUEST_SOFT_LIMIT_BYTES) {
+          turnPayload = {
+            ...turnPayload,
+            stylePrimer: activeAssets.stylePrimer.slice(0, 4)
+          };
+          payloadBytes = estimatePayloadBytes(turnPayload);
+        }
+
+        if (payloadBytes > TURN_REQUEST_SOFT_LIMIT_BYTES) {
+          dispatch({
+            type: 'SET_ERROR',
+            error: 'This story is too large for cloud turn processing. Open setup and save a smaller PDF.'
+          });
+          return;
+        }
+
+        const turnResponse = await runTurnWithBackend(turnPayload);
 
         if (!turnResponse.question) {
           dispatch({ type: 'SET_ERROR', error: "I couldn't hear the question. Please try again." });
@@ -209,7 +264,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       dispatch({ type: 'SET_STAGE', stage: 'completed' });
     } catch (error) {
       console.error('Turn pipeline failed', error);
-      dispatch({ type: 'SET_ERROR', error: 'Something went wrong processing your request.' });
+      dispatch({ type: 'SET_ERROR', error: toUserFacingTurnError(error) });
     }
   }, [activeAssets, warmTtsCache]);
 
