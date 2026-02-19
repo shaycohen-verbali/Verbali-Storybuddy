@@ -21,23 +21,14 @@ interface ConvertPdfOptions {
   quality?: number;
 }
 
-interface CropTemplate {
+interface RegionCandidate {
   x: number;
   y: number;
   width: number;
   height: number;
-  kind: 'character' | 'object';
 }
 
 let pdfJsPromise: Promise<PdfJsModule> | null = null;
-
-const CROP_TEMPLATES: CropTemplate[] = [
-  { x: 0.12, y: 0.12, width: 0.44, height: 0.62, kind: 'character' },
-  { x: 0.44, y: 0.12, width: 0.44, height: 0.62, kind: 'character' },
-  { x: 0.23, y: 0.2, width: 0.54, height: 0.66, kind: 'character' },
-  { x: 0.1, y: 0.54, width: 0.33, height: 0.33, kind: 'object' },
-  { x: 0.57, y: 0.54, width: 0.33, height: 0.33, kind: 'object' }
-];
 
 const getPdfJs = async (): Promise<PdfJsModule> => {
   if (!pdfJsPromise) {
@@ -92,38 +83,67 @@ const loadImage = async (dataUrl: string): Promise<HTMLImageElement> => {
 };
 
 const computeVisualScore = (ctx: CanvasRenderingContext2D, width: number, height: number): number => {
-  const sampleWidth = Math.max(24, Math.min(96, Math.floor(width / 4)));
-  const sampleHeight = Math.max(24, Math.min(96, Math.floor(height / 4)));
+  const sampleWidth = Math.max(24, Math.min(140, Math.floor(width / 3)));
+  const sampleHeight = Math.max(24, Math.min(140, Math.floor(height / 3)));
   const sampled = ctx.getImageData(0, 0, sampleWidth, sampleHeight).data;
-  const lumaValues: number[] = [];
+  if (sampled.length === 0) {
+    return 0;
+  }
 
-  for (let i = 0; i < sampled.length; i += 16) {
+  let lumaSum = 0;
+  let lumaSq = 0;
+  let edgeSum = 0;
+  let count = 0;
+
+  for (let i = 0; i < sampled.length; i += 4) {
     const r = sampled[i];
     const g = sampled[i + 1];
     const b = sampled[i + 2];
     const luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
-    lumaValues.push(luma);
+    lumaSum += luma;
+    lumaSq += luma * luma;
+    count += 1;
+    if (i >= 4) {
+      edgeSum += Math.abs(luma - (sampled[i - 4] * 0.2126 + sampled[i - 3] * 0.7152 + sampled[i - 2] * 0.0722));
+    }
   }
 
-  if (lumaValues.length === 0) {
-    return 0;
-  }
-
-  const avg = lumaValues.reduce((sum, value) => sum + value, 0) / lumaValues.length;
-  const variance = lumaValues.reduce((sum, value) => sum + (value - avg) ** 2, 0) / lumaValues.length;
-  return variance;
+  const mean = lumaSum / Math.max(1, count);
+  const variance = lumaSq / Math.max(1, count) - mean * mean;
+  return variance + edgeSum / Math.max(1, count);
 };
 
-const cropFromTemplate = (
-  sourceImage: HTMLImageElement,
-  template: CropTemplate
-): { dataUrl: string; score: number } | null => {
-  const sx = Math.max(0, Math.floor(sourceImage.width * template.x));
-  const sy = Math.max(0, Math.floor(sourceImage.height * template.y));
-  const sw = Math.max(1, Math.floor(sourceImage.width * template.width));
-  const sh = Math.max(1, Math.floor(sourceImage.height * template.height));
+const buildRegionCandidates = (): RegionCandidate[] => {
+  const regions: RegionCandidate[] = [];
+  const widths = [0.28, 0.34, 0.42, 0.5];
+  const heights = [0.28, 0.34, 0.46, 0.58];
+  const anchors = [0.08, 0.18, 0.28, 0.38, 0.48, 0.58];
 
-  if (sw < 80 || sh < 80) {
+  for (const width of widths) {
+    for (const height of heights) {
+      for (const x of anchors) {
+        for (const y of anchors) {
+          if (x + width > 0.96 || y + height > 0.96) continue;
+          regions.push({ x, y, width, height });
+        }
+      }
+    }
+  }
+
+  return regions;
+};
+
+const CROP_REGION_CANDIDATES = buildRegionCandidates();
+
+const cropRegion = (
+  sourceImage: HTMLImageElement,
+  candidate: RegionCandidate
+): { dataUrl: string; score: number } | null => {
+  const sx = Math.max(0, Math.floor(sourceImage.width * candidate.x));
+  const sy = Math.max(0, Math.floor(sourceImage.height * candidate.y));
+  const sw = Math.max(1, Math.floor(sourceImage.width * candidate.width));
+  const sh = Math.max(1, Math.floor(sourceImage.height * candidate.height));
+  if (sw < 120 || sh < 120) {
     return null;
   }
 
@@ -137,12 +157,12 @@ const cropFromTemplate = (
 
   ctx.drawImage(sourceImage, sx, sy, sw, sh, 0, 0, sw, sh);
   const score = computeVisualScore(ctx, sw, sh);
-  if (score < 45) {
+  if (score < 30) {
     return null;
   }
 
   return {
-    dataUrl: canvas.toDataURL('image/jpeg', 0.82),
+    dataUrl: canvas.toDataURL('image/jpeg', 0.83),
     score
   };
 };
@@ -207,8 +227,6 @@ export const extractStyleReferenceAssetsFromPdf = async (
   const assets: StyleReferenceAsset[] = [];
   const seen = new Set<string>();
   const sceneIndexes = selectEvenlySpacedIndexes(pageImages.length, Math.min(18, pageImages.length));
-  const cropIndexes = selectEvenlySpacedIndexes(pageImages.length, Math.min(12, pageImages.length));
-
   for (const pageIndex of sceneIndexes) {
     const dataUrl = pageImages[pageIndex];
     const fingerprint = toFingerprint(dataUrl);
@@ -222,45 +240,44 @@ export const extractStyleReferenceAssetsFromPdf = async (
       ...parsed,
       kind: 'scene',
       source: 'pdf_page',
+      assetRole: 'scene_anchor',
       pageIndex,
-      confidence: 0.55
+      confidence: 0.62,
+      qualityScore: 0.62
     });
   }
 
+  const cropIndexes = selectEvenlySpacedIndexes(pageImages.length, Math.min(20, pageImages.length));
   for (const pageIndex of cropIndexes) {
     if (assets.length >= maxAssets) break;
     const image = await loadImage(pageImages[pageIndex]);
-    const candidates: Array<{ dataUrl: string; score: number; kind: 'character' | 'object' }> = [];
+    const ranked = CROP_REGION_CANDIDATES
+      .map((candidate) => cropRegion(image, candidate))
+      .filter((item): item is { dataUrl: string; score: number } => Boolean(item))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
 
-    for (const template of CROP_TEMPLATES) {
-      const cropped = cropFromTemplate(image, template);
-      if (!cropped) continue;
-      candidates.push({
-        ...cropped,
-        kind: template.kind
+    for (let idx = 0; idx < ranked.length; idx += 1) {
+      if (assets.length >= maxAssets) break;
+      const item = ranked[idx];
+      const fingerprint = toFingerprint(item.dataUrl);
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+
+      const parsed = parseDataUrl(item.dataUrl);
+      if (!parsed.data) continue;
+
+      const kind = idx % 2 === 0 ? 'character' : 'object';
+      assets.push({
+        ...parsed,
+        kind,
+        source: 'crop',
+        assetRole: kind === 'character' ? 'character_form' : 'object_anchor',
+        pageIndex,
+        confidence: Math.max(0.35, Math.min(0.9, item.score / 120)),
+        qualityScore: Math.max(0.35, Math.min(0.9, item.score / 120))
       });
     }
-
-    candidates
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4)
-      .forEach((candidate) => {
-        if (assets.length >= maxAssets) return;
-        const fingerprint = toFingerprint(candidate.dataUrl);
-        if (seen.has(fingerprint)) return;
-        seen.add(fingerprint);
-
-        const parsed = parseDataUrl(candidate.dataUrl);
-        if (!parsed.data) return;
-
-        assets.push({
-          ...parsed,
-          kind: candidate.kind,
-          source: 'crop',
-          pageIndex,
-          confidence: Math.max(0.25, Math.min(0.95, candidate.score / 220))
-        });
-      });
   }
 
   return assets.slice(0, maxAssets);

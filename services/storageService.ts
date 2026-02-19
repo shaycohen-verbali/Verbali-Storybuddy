@@ -1,7 +1,7 @@
 import { Publisher, StoryAssets, StoryManifest, StoredStory } from '../types';
 
 const DB_NAME = 'StoryBuddyDB';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const LEGACY_STORE = 'stories';
 const MANIFEST_STORE = 'story_manifests';
 const ASSETS_STORE = 'story_assets';
@@ -14,6 +14,11 @@ const createDefaultStoryFacts = (source: string) => ({
   characterCatalog: [],
   characterImageMap: [],
   objectImageMap: [],
+  sceneCatalog: [],
+  sceneImageMap: [],
+  characterEvidenceMap: [],
+  objectEvidenceMap: [],
+  scenes: [],
   places: [],
   objects: [],
   events: [],
@@ -114,6 +119,32 @@ const openDB = (): Promise<IDBDatabase> => {
               publisherId: null
             });
           }
+          cursor.continue();
+        };
+      }
+
+      if (oldVersion >= 3 && oldVersion < 4) {
+        assetsStore.openCursor().onsuccess = (cursorEvent) => {
+          const cursor = (cursorEvent.target as IDBRequest<IDBCursorWithValue | null>).result;
+          if (!cursor) {
+            return;
+          }
+
+          const value = cursor.value as StoryAssets;
+          const storyBrief = value?.storyBrief || value?.metadata?.storyBrief || value?.metadata?.summary || '';
+          const nextFacts = {
+            ...createDefaultStoryFacts(storyBrief),
+            ...(value?.metadata?.storyFacts || {})
+          };
+
+          cursor.update({
+            ...value,
+            metadata: {
+              ...(value?.metadata || { summary: storyBrief, characters: [], objects: [] }),
+              storyFacts: nextFacts
+            },
+            styleReferences: value?.styleReferences || []
+          });
           cursor.continue();
         };
       }

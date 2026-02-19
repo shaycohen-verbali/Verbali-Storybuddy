@@ -109,7 +109,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
           stylePrimer: activeAssets.stylePrimer.slice(0, 14),
-          styleReferences: (activeAssets.styleReferences || []).slice(0, 14),
+          styleReferences: (activeAssets.styleReferences || []).slice(0, 120),
           history: compactHistoryForBackend(stateRef.current.conversationHistory)
         });
 

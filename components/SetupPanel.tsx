@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles, FolderOpen } from 'lucide-react';
 import { FileData, Publisher, SetupStoryResponse, StoryPack, StyleReferenceAsset } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
@@ -65,8 +65,12 @@ const toStyleReferenceAsset = (
   source: item.source || fallback.source || 'upload',
   characterName: item.characterName || fallback.characterName,
   objectName: item.objectName || fallback.objectName,
+  sceneId: item.sceneId || fallback.sceneId,
+  assetRole: item.assetRole || fallback.assetRole,
   pageIndex: item.pageIndex ?? fallback.pageIndex,
   confidence: item.confidence ?? fallback.confidence ?? 0.5,
+  qualityScore: item.qualityScore ?? fallback.qualityScore,
+  embeddingHash: item.embeddingHash || fallback.embeddingHash,
   detectedCharacters: item.detectedCharacters || fallback.detectedCharacters || [],
   detectedObjects: item.detectedObjects || fallback.detectedObjects || []
 });
@@ -211,6 +215,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [preparedPack, setPreparedPack] = useState<StoryPack | null>(null);
   const [isReadOnlyView, setIsReadOnlyView] = useState(false);
   const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null);
+  const [warningsAcknowledged, setWarningsAcknowledged] = useState(false);
 
   const isExistingStory = Boolean(initialView?.storyId);
   const canEdit = !isReadOnlyView;
@@ -223,6 +228,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       setPreparedPack(null);
       setIsReadOnlyView(false);
       setSelectedPublisherId(null);
+      setWarningsAcknowledged(false);
       setErrorMsg(null);
       setIsProcessing(false);
       return;
@@ -236,6 +242,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setPreparedPack(initialView.storyPack || null);
     setIsReadOnlyView(Boolean(initialView.readOnly));
     setSelectedPublisherId(initialView.publisherId || null);
+    setWarningsAcknowledged(false);
     setErrorMsg(null);
     setIsProcessing(false);
   }, [initialView]);
@@ -267,6 +274,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         ...setupResponse.storyPack,
         coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
       }));
+      setWarningsAcknowledged(false);
 
       if (setupResponse.storyPack.styleReferences?.length) {
         setStyleReferences(setupResponse.storyPack.styleReferences);
@@ -430,6 +438,11 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
+      if (hasMappingWarnings && !warningsAcknowledged) {
+        setErrorMsg('Please review and acknowledge mapping warnings before saving.');
+        return;
+      }
+
       const preparedRefs = preparedPack.styleReferences?.length
         ? preparedPack.styleReferences
         : preparedPack.stylePrimer.map((item) =>
@@ -477,11 +490,67 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
   const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
+  const objectCatalog = preparedPack?.storyFacts?.objects || [];
+  const sceneCatalog = preparedPack?.storyFacts?.sceneCatalog || [];
   const preparedStyleRefs = preparedPack?.styleReferences?.length
     ? preparedPack.styleReferences
     : (preparedPack?.stylePrimer || []).map((item) =>
         toStyleReferenceAsset(item, { kind: 'scene', source: 'generated' })
       );
+  const mappingWarnings = useMemo(() => {
+    if (!preparedPack) {
+      return {
+        unmappedCharacters: [] as string[],
+        unmappedObjects: [] as string[],
+        unmappedScenes: [] as string[],
+        lowConfidenceRefs: [] as Array<{ index: number; ref: StyleReferenceAsset }>
+      };
+    }
+
+    const facts = preparedPack.storyFacts;
+    const characterMap = new Map(
+      (facts.characterImageMap || []).map((entry) => [entry.characterName.toLowerCase(), entry.styleRefIndexes])
+    );
+    const objectMap = new Map(
+      (facts.objectImageMap || []).map((entry) => [entry.objectName.toLowerCase(), entry.styleRefIndexes])
+    );
+    const sceneMap = new Map(
+      (facts.sceneImageMap || []).map((entry) => [entry.sceneId.toLowerCase(), entry.styleRefIndexes])
+    );
+
+    const unmappedCharacters = (facts.characterCatalog || [])
+      .map((entry) => entry.name)
+      .filter((name) => (characterMap.get(name.toLowerCase()) || []).length === 0);
+    const unmappedObjects = (facts.objects || [])
+      .filter((name) => (objectMap.get(name.toLowerCase()) || []).length === 0);
+    const unmappedScenes = (facts.sceneCatalog || [])
+      .filter((scene) => (sceneMap.get(scene.id.toLowerCase()) || []).length === 0)
+      .map((scene) => scene.title);
+    const lowConfidenceRefs = preparedStyleRefs
+      .map((ref, index) => ({ index, ref }))
+      .filter(({ ref }) => {
+        const confidence = ref.qualityScore ?? ref.confidence ?? 0;
+        return confidence > 0 && confidence < 0.7;
+      })
+      .slice(0, 8);
+
+    return {
+      unmappedCharacters,
+      unmappedObjects,
+      unmappedScenes,
+      lowConfidenceRefs
+    };
+  }, [preparedPack, preparedStyleRefs]);
+  const hasMappingWarnings =
+    mappingWarnings.unmappedCharacters.length > 0 ||
+    mappingWarnings.unmappedObjects.length > 0 ||
+    mappingWarnings.unmappedScenes.length > 0 ||
+    mappingWarnings.lowConfidenceRefs.length > 0;
+
+  useEffect(() => {
+    setWarningsAcknowledged(false);
+  }, [hasMappingWarnings, preparedPack?.summary, preparedStyleRefs.length]);
+
   const setupPreviewRefs = buildBalancedSetupPayload(styleReferences);
   const styleCounts = getStyleRefCounts(setupPreviewRefs);
   const selectedPublisher = publishers.find((publisher) => publisher.id === selectedPublisherId) || null;
@@ -725,6 +794,177 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                           <p className="text-sm text-gray-500 mt-1">No characters mapped yet.</p>
                         )}
                       </div>
+
+                      <div>
+                        <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Object Mapping</label>
+                        {objectCatalog.length > 0 ? (
+                          <div className="mt-2 space-y-2">
+                            {objectCatalog.map((objectName) => {
+                              const mapEntry = (preparedPack?.storyFacts?.objectImageMap || []).find(
+                                (entry) => entry.objectName.toLowerCase() === objectName.toLowerCase()
+                              );
+                              const mappedIndexes = mapEntry?.styleRefIndexes || [];
+                              const mappedRefs = mappedIndexes
+                                .map((index) => preparedStyleRefs[index] || null)
+                                .filter((entry): entry is StyleReferenceAsset => Boolean(entry));
+
+                              return (
+                                <div key={objectName} className="rounded-lg border border-gray-100 p-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="px-3 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-bold">
+                                      {objectName}
+                                    </span>
+                                    <span className="text-[11px] text-gray-500 font-semibold">
+                                      {mappedIndexes.length} mapped refs
+                                    </span>
+                                  </div>
+                                  {mappedRefs.length > 0 && (
+                                    <div className="mt-2 flex gap-2">
+                                      {mappedRefs.slice(0, 3).map((ref, index) => (
+                                        <img
+                                          key={`${objectName}-ref-${index}`}
+                                          src={`data:${ref.mimeType};base64,${ref.data}`}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                        />
+                                      ))}
+                                    </div>
+                                  )}
+                                  {mappedRefs.length === 0 && (
+                                    <p className="mt-2 text-[11px] text-amber-600 font-semibold">
+                                      No object screenshot mapped
+                                    </p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 mt-1">No objects mapped yet.</p>
+                        )}
+                      </div>
+
+                      <div>
+                        <label className="text-xs font-bold text-gray-400 uppercase tracking-wider">Scene Mapping</label>
+                        {sceneCatalog.length > 0 ? (
+                          <div className="mt-2 space-y-2">
+                            {sceneCatalog.map((scene) => {
+                              const mapEntry = (preparedPack?.storyFacts?.sceneImageMap || []).find(
+                                (entry) => entry.sceneId.toLowerCase() === scene.id.toLowerCase()
+                              );
+                              const mappedIndexes = mapEntry?.styleRefIndexes || [];
+                              const mappedRefs = mappedIndexes
+                                .map((index) => preparedStyleRefs[index] || null)
+                                .filter((entry): entry is StyleReferenceAsset => Boolean(entry));
+
+                              return (
+                                <div key={scene.id} className="rounded-lg border border-gray-100 p-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="px-3 py-1 rounded-full bg-sky-50 text-sky-700 text-xs font-bold">
+                                      {scene.title}
+                                    </span>
+                                    <span className="text-[11px] text-gray-500 font-semibold">
+                                      {mappedIndexes.length} mapped refs
+                                    </span>
+                                  </div>
+                                  {mappedRefs.length > 0 && (
+                                    <div className="mt-2 flex gap-2">
+                                      {mappedRefs.slice(0, 3).map((ref, index) => (
+                                        <img
+                                          key={`${scene.id}-ref-${index}`}
+                                          src={`data:${ref.mimeType};base64,${ref.data}`}
+                                          className="w-10 h-10 rounded-md object-cover border border-gray-200"
+                                        />
+                                      ))}
+                                    </div>
+                                  )}
+                                  {mappedRefs.length === 0 && (
+                                    <p className="mt-2 text-[11px] text-amber-600 font-semibold">
+                                      No scene screenshot mapped
+                                    </p>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 mt-1">No scenes mapped yet.</p>
+                        )}
+                      </div>
+
+                      {hasMappingWarnings && (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+                          <div className="flex items-center gap-2 text-amber-900">
+                            <AlertCircle className="w-4 h-4" />
+                            <p className="text-sm font-bold">Review Warnings</p>
+                          </div>
+
+                          {mappingWarnings.unmappedCharacters.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Unmapped Characters</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.unmappedCharacters.map((name) => (
+                                  <span key={name} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.unmappedObjects.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Unmapped Objects</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.unmappedObjects.map((name) => (
+                                  <span key={name} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.unmappedScenes.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Unmapped Scenes</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.unmappedScenes.map((name) => (
+                                  <span key={name} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.lowConfidenceRefs.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Low-Confidence References</p>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {mappingWarnings.lowConfidenceRefs.map(({ index, ref }) => (
+                                  <div key={`warning-ref-${index}`} className="relative w-12 h-12 rounded-md overflow-hidden border border-amber-200 bg-white">
+                                    <img src={`data:${ref.mimeType};base64,${ref.data}`} className="w-full h-full object-cover" />
+                                    <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[9px] text-center">
+                                      {Math.round((ref.qualityScore ?? ref.confidence ?? 0) * 100)}%
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {canEdit && (
+                            <label className="flex items-center gap-2 text-xs text-amber-900 font-semibold">
+                              <input
+                                type="checkbox"
+                                checked={warningsAcknowledged}
+                                onChange={(event) => setWarningsAcknowledged(event.target.checked)}
+                              />
+                              I reviewed these warnings and want to save anyway.
+                            </label>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </section>
@@ -789,7 +1029,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                 <div className="mt-auto pt-6 border-t border-gray-100">
                   <button
                     onClick={handleFinish}
-                    disabled={isProcessing || (!isReadOnlyView && !preparedPack)}
+                    disabled={isProcessing || (!isReadOnlyView && !preparedPack) || (!isReadOnlyView && hasMappingWarnings && !warningsAcknowledged)}
                     className="w-full py-4 bg-kid-blue text-white font-bold rounded-xl shadow-lg hover:bg-blue-600 transition flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <BookOpen className="w-5 h-5" />

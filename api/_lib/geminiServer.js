@@ -20,10 +20,18 @@ const USE_REPLICATE_IMAGE_MODEL = Boolean(process.env.REPLICATE_API_TOKEN);
 const IMAGE_MODEL = USE_REPLICATE_IMAGE_MODEL ? REPLICATE_IMAGE_MODEL : GOOGLE_IMAGE_MODEL;
 const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
+const STYLE_REF_INDEX_LIMIT = 240;
+const STYLE_REF_POOL_LIMIT = 120;
 const STYLE_REF_SCENE_QUOTA = 6;
 const STYLE_REF_CHARACTER_QUOTA = 4;
 const STYLE_REF_OBJECT_QUOTA = 4;
 const MAX_CHARACTER_REFS_PER_CHARACTER = 3;
+const MAX_OBJECT_REFS_PER_OBJECT = 4;
+const MAX_SCENE_REFS_PER_SCENE = 4;
+const MIN_DETECTION_CONFIDENCE = 0.6;
+const LOW_CONFIDENCE_WARNING_THRESHOLD = 0.7;
+const MAX_SCENE_ALIASES = 5;
+const MAX_SCENE_FACTS = 16;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -248,6 +256,17 @@ const titleCaseFirst = (text) => {
 };
 
 const normalizePhrase = (value) => String(value || '').trim().replace(/\s+/g, ' ');
+const toSceneId = (value, fallback = 'scene') => {
+  const slug = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return slug || fallback;
+};
+
 const truncate = (value, maxChars) => {
   const normalized = normalizePhrase(value);
   if (normalized.length <= maxChars) {
@@ -403,6 +422,146 @@ const normalizeObjectImageMap = (imageMap, objects, maxRefCount) => {
   }));
 };
 
+const normalizeEvidenceList = (evidence, limit = 8) => {
+  const output = [];
+  const seen = new Set();
+
+  for (const item of Array.isArray(evidence) ? evidence : []) {
+    const pageIndex = Number(item?.pageIndex);
+    const snippet = normalizePhrase(item?.snippet || '');
+    const confidence = normalizeConfidence(item?.confidence, 0.6);
+    if (!Number.isInteger(pageIndex) || pageIndex < 0) continue;
+
+    const key = `${pageIndex}:${snippet.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    output.push({
+      pageIndex,
+      snippet: snippet || undefined,
+      confidence
+    });
+    if (output.length >= limit) break;
+  }
+
+  return output;
+};
+
+const normalizeSceneCatalog = (sceneCatalog, storyFacts) => {
+  const merged = new Map();
+  const fallbackScenes = normalizeFactList(
+    [...(storyFacts?.scenes || []), ...(storyFacts?.places || [])],
+    MAX_SCENE_FACTS
+  );
+
+  for (const scene of Array.isArray(sceneCatalog) ? sceneCatalog : []) {
+    const title = normalizePhrase(scene?.title || scene?.name || scene);
+    if (!title) continue;
+    const id = toSceneId(scene?.id || title, `scene-${merged.size + 1}`);
+    const aliases = normalizeFactList(scene?.aliases, MAX_SCENE_ALIASES);
+    const describedEvidence = normalizeEvidenceList(scene?.describedEvidence || scene?.described_evidence, 8);
+    const illustratedEvidence = normalizeEvidenceList(scene?.illustratedEvidence || scene?.illustrated_evidence, 8);
+
+    const existing = merged.get(id);
+    merged.set(id, {
+      id,
+      title,
+      aliases: [...new Set([...(existing?.aliases || []), ...aliases])].slice(0, MAX_SCENE_ALIASES),
+      describedEvidence: [...(existing?.describedEvidence || []), ...describedEvidence].slice(0, 8),
+      illustratedEvidence: [...(existing?.illustratedEvidence || []), ...illustratedEvidence].slice(0, 8)
+    });
+  }
+
+  for (const place of fallbackScenes) {
+    const id = toSceneId(place, `scene-${merged.size + 1}`);
+    if (merged.has(id)) continue;
+    merged.set(id, {
+      id,
+      title: place,
+      aliases: [],
+      describedEvidence: [],
+      illustratedEvidence: []
+    });
+  }
+
+  return Array.from(merged.values()).slice(0, MAX_SCENE_FACTS);
+};
+
+const normalizeSceneImageMap = (sceneImageMap, sceneCatalog, maxRefCount) => {
+  const allowed = new Map(
+    (Array.isArray(sceneCatalog) ? sceneCatalog : [])
+      .map((scene) => [String(scene?.id || '').toLowerCase(), String(scene?.id || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const normalized = new Map();
+
+  for (const item of Array.isArray(sceneImageMap) ? sceneImageMap : []) {
+    const key = String(item?.sceneId || item?.scene_id || '').trim().toLowerCase();
+    const canonicalSceneId = allowed.get(key);
+    if (!canonicalSceneId) continue;
+
+    const sourceIndexes = Array.isArray(item?.styleRefIndexes)
+      ? item.styleRefIndexes
+      : Array.isArray(item?.style_ref_indexes)
+        ? item.style_ref_indexes
+        : [];
+
+    const validIndexes = sourceIndexes
+      .map((index) => Number(index))
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < maxRefCount);
+
+    if (validIndexes.length === 0) continue;
+
+    const existing = normalized.get(canonicalSceneId) || [];
+    const mergedIndexes = [...new Set([...existing, ...validIndexes])].slice(0, MAX_SCENE_REFS_PER_SCENE);
+    normalized.set(canonicalSceneId, {
+      sceneId: canonicalSceneId,
+      styleRefIndexes: mergedIndexes,
+      confidence: normalizeConfidence(item?.confidence, 0.65)
+    });
+  }
+
+  return Array.from(normalized.values());
+};
+
+const normalizeCharacterEvidenceMap = (input, characterCatalog) => {
+  const allowed = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [String(entry?.name || '').toLowerCase(), String(entry?.name || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const output = [];
+  for (const item of Array.isArray(input) ? input : []) {
+    const key = String(item?.characterName || item?.character_name || '').toLowerCase().trim();
+    const characterName = allowed.get(key);
+    if (!characterName) continue;
+    output.push({
+      characterName,
+      evidence: normalizeEvidenceList(item?.evidence || [], 10)
+    });
+  }
+  return output;
+};
+
+const normalizeObjectEvidenceMap = (input, objects) => {
+  const allowed = new Map(
+    normalizeFactList(objects, 40)
+      .map((name) => [name.toLowerCase(), name])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const output = [];
+  for (const item of Array.isArray(input) ? input : []) {
+    const key = String(item?.objectName || item?.object_name || '').toLowerCase().trim();
+    const objectName = allowed.get(key);
+    if (!objectName) continue;
+    output.push({
+      objectName,
+      evidence: normalizeEvidenceList(item?.evidence || [], 10)
+    });
+  }
+  return output;
+};
+
 const normalizeStyleReferenceKind = (value, fallback = 'scene') => {
   const kind = String(value || '').toLowerCase();
   if (kind === 'character') return 'character';
@@ -417,6 +576,14 @@ const normalizeStyleReferenceSource = (value, fallback = 'upload') => {
   if (source === 'upload') return 'upload';
   if (source === 'crop') return 'crop';
   if (source === 'generated') return 'generated';
+  return fallback;
+};
+
+const normalizeStyleAssetRole = (value, fallback = 'scene_anchor') => {
+  const role = String(value || '').toLowerCase();
+  if (role === 'scene_anchor') return 'scene_anchor';
+  if (role === 'character_form') return 'character_form';
+  if (role === 'object_anchor') return 'object_anchor';
   return fallback;
 };
 
@@ -457,8 +624,12 @@ const normalizeStyleReferenceAssets = (styleRefs, fallbackSource = 'upload', ded
       source: normalizeStyleReferenceSource(ref.source, fallbackSource),
       characterName: normalizePhrase(ref.characterName || ''),
       objectName: normalizePhrase(ref.objectName || ''),
+      sceneId: ref.sceneId ? toSceneId(ref.sceneId) : '',
+      assetRole: normalizeStyleAssetRole(ref.assetRole, 'scene_anchor'),
       pageIndex: Number.isInteger(ref.pageIndex) ? Number(ref.pageIndex) : undefined,
       confidence: normalizeConfidence(ref.confidence, 0.5),
+      qualityScore: normalizeConfidence(ref.qualityScore, 0.5),
+      embeddingHash: normalizePhrase(ref.embeddingHash || ''),
       detectedCharacters: Array.isArray(ref.detectedCharacters)
         ? ref.detectedCharacters
             .map((entry) => ({
@@ -503,6 +674,34 @@ const normalizeToAllowedName = (value, allowedMap) => {
   return allowedMap.get(normalized) || '';
 };
 
+const inferSceneIdFromEvidence = (sceneCatalog, pageIndex) => {
+  if (!Number.isInteger(pageIndex)) return '';
+
+  let bestScene = null;
+  let bestScore = 0;
+
+  for (const scene of Array.isArray(sceneCatalog) ? sceneCatalog : []) {
+    const evidence = [
+      ...(Array.isArray(scene?.illustratedEvidence) ? scene.illustratedEvidence : []),
+      ...(Array.isArray(scene?.describedEvidence) ? scene.describedEvidence : [])
+    ];
+    for (const item of evidence) {
+      if (!Number.isInteger(item?.pageIndex) || item.pageIndex !== pageIndex) continue;
+      const confidence = normalizeConfidence(item?.confidence, 0.55);
+      if (!bestScene || confidence > bestScore) {
+        bestScene = scene;
+        bestScore = confidence;
+      }
+    }
+  }
+
+  if (bestScene?.id) {
+    return bestScene.id;
+  }
+
+  return '';
+};
+
 const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
   const references = normalizeStyleReferenceAssets(styleRefs).slice(0, STYLE_REF_MAX_TOTAL);
   if (references.length === 0) {
@@ -511,6 +710,7 @@ const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
 
   const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
   const allowedObjects = (storyFacts?.objects || []).slice(0, 20);
+  const allowedScenes = (storyFacts?.sceneCatalog || []).map((entry) => ({ id: entry.id, title: entry.title }));
 
   const parts = [
     {
@@ -518,18 +718,22 @@ const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
         'Classify each style reference image.',
         `Character names allowed: ${allowedCharacters.join(', ') || 'none'}.`,
         `Object names allowed: ${allowedObjects.join(', ') || 'none'}.`,
+        `Scene IDs allowed: ${allowedScenes.map((scene) => `${scene.id}:${scene.title}`).join(', ') || 'none'}.`,
         `You will receive ${references.length} images in order.`,
         'Return strict JSON with classifications array.',
         'Each item must contain:',
         '- image_index (number)',
         '- kind (scene | character | object)',
+        '- scene_id (optional, must be one of allowed scene IDs if provided)',
+        '- asset_role (scene_anchor | character_form | object_anchor)',
         '- confidence (0..1)',
-        '- characters (array of exact allowed names)',
-        '- objects (array of exact allowed object names)',
+        '- characters (array of {name, confidence, box?})',
+        '- objects (array of {name, confidence, box?})',
         'Rules:',
         '- If image is a character crop, use kind=character.',
         '- If image highlights a key object, use kind=object.',
-        '- Use kind=scene for page-wide or environmental references.'
+        '- Use kind=scene for page-wide or environmental references.',
+        '- box must be normalized 0..1 coordinates and only for visible entities.'
       ].join('\n')
     }
   ];
@@ -557,11 +761,51 @@ const classifyStyleReferences = async (ai, styleRefs, storyFacts) => {
                   properties: {
                     image_index: { type: Type.NUMBER },
                     kind: { type: Type.STRING },
+                    scene_id: { type: Type.STRING },
+                    asset_role: { type: Type.STRING },
                     confidence: { type: Type.NUMBER },
-                    characters: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    objects: { type: Type.ARRAY, items: { type: Type.STRING } }
+                    characters: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          name: { type: Type.STRING },
+                          confidence: { type: Type.NUMBER },
+                          box: {
+                            type: Type.OBJECT,
+                            properties: {
+                              x: { type: Type.NUMBER },
+                              y: { type: Type.NUMBER },
+                              width: { type: Type.NUMBER },
+                              height: { type: Type.NUMBER }
+                            }
+                          }
+                        },
+                        required: ['name', 'confidence']
+                      }
+                    },
+                    objects: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          name: { type: Type.STRING },
+                          confidence: { type: Type.NUMBER },
+                          box: {
+                            type: Type.OBJECT,
+                            properties: {
+                              x: { type: Type.NUMBER },
+                              y: { type: Type.NUMBER },
+                              width: { type: Type.NUMBER },
+                              height: { type: Type.NUMBER }
+                            }
+                          }
+                        },
+                        required: ['name', 'confidence']
+                      }
+                    }
                   },
-                  required: ['image_index', 'kind', 'confidence', 'characters', 'objects']
+                  required: ['image_index', 'kind', 'asset_role', 'confidence', 'characters', 'objects']
                 }
               }
             },
@@ -589,18 +833,60 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
 
   const allowedCharacters = buildAllowedCharacterMap(storyFacts);
   const allowedObjects = buildAllowedObjectMap(storyFacts);
+  const allowedScenes = new Map(
+    (storyFacts?.sceneCatalog || [])
+      .map((scene) => [String(scene?.id || '').toLowerCase(), String(scene?.id || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
 
   return references.map((reference, index) => {
     const classification = classificationMap.get(index);
     const characters = (Array.isArray(classification?.characters) ? classification.characters : [])
-      .map((name) => normalizeToAllowedName(name, allowedCharacters))
+      .map((item) => {
+        const name = normalizeToAllowedName(item?.name, allowedCharacters);
+        if (!name) return null;
+        const box = item?.box
+          ? {
+              x: Math.max(0, Math.min(1, Number(item.box.x) || 0)),
+              y: Math.max(0, Math.min(1, Number(item.box.y) || 0)),
+              width: Math.max(0, Math.min(1, Number(item.box.width) || 0)),
+              height: Math.max(0, Math.min(1, Number(item.box.height) || 0))
+            }
+          : undefined;
+        return {
+          name,
+          confidence: normalizeConfidence(item?.confidence, classification?.confidence || 0.6),
+          box
+        };
+      })
       .filter(Boolean);
     const objects = (Array.isArray(classification?.objects) ? classification.objects : [])
-      .map((name) => normalizeToAllowedName(name, allowedObjects))
+      .map((item) => {
+        const name = normalizeToAllowedName(item?.name, allowedObjects);
+        if (!name) return null;
+        const box = item?.box
+          ? {
+              x: Math.max(0, Math.min(1, Number(item.box.x) || 0)),
+              y: Math.max(0, Math.min(1, Number(item.box.y) || 0)),
+              width: Math.max(0, Math.min(1, Number(item.box.width) || 0)),
+              height: Math.max(0, Math.min(1, Number(item.box.height) || 0))
+            }
+          : undefined;
+        return {
+          name,
+          confidence: normalizeConfidence(item?.confidence, classification?.confidence || 0.6),
+          box
+        };
+      })
       .filter(Boolean);
 
-    const characterName = characters[0] || normalizeToAllowedName(reference.characterName, allowedCharacters);
-    const objectName = objects[0] || normalizeToAllowedName(reference.objectName, allowedObjects);
+    const characterName = characters[0]?.name || normalizeToAllowedName(reference.characterName, allowedCharacters);
+    const objectName = objects[0]?.name || normalizeToAllowedName(reference.objectName, allowedObjects);
+    const sceneIdCandidate = String(classification?.scene_id || reference.sceneId || '').toLowerCase().trim();
+    const sceneId =
+      allowedScenes.get(sceneIdCandidate) ||
+      inferSceneIdFromEvidence(storyFacts?.sceneCatalog || [], reference?.pageIndex) ||
+      '';
 
     let kind = normalizeStyleReferenceKind(classification?.kind, reference.kind || 'scene');
     if (characterName) kind = 'character';
@@ -609,11 +895,25 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
     return {
       ...reference,
       kind,
+      sceneId: sceneId || undefined,
+      assetRole: normalizeStyleAssetRole(
+        classification?.asset_role,
+        kind === 'character' ? 'character_form' : kind === 'object' ? 'object_anchor' : 'scene_anchor'
+      ),
       characterName: characterName || undefined,
       objectName: objectName || undefined,
       confidence: normalizeConfidence(classification?.confidence, reference.confidence ?? 0.5),
-      detectedCharacters: characters.map((name) => ({ name, confidence: normalizeConfidence(classification?.confidence, 0.6) })),
-      detectedObjects: objects.map((name) => ({ name, confidence: normalizeConfidence(classification?.confidence, 0.6) }))
+      qualityScore: normalizeConfidence(classification?.confidence, reference.qualityScore ?? 0.5),
+      detectedCharacters: characters.map((item) => ({
+        name: item.name,
+        confidence: item.confidence,
+        box: item.box
+      })),
+      detectedObjects: objects.map((item) => ({
+        name: item.name,
+        confidence: item.confidence,
+        box: item.box
+      }))
     };
   });
 };
@@ -660,26 +960,77 @@ const buildCanonicalStyleReferencePack = (styleRefs) => {
 const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
   const characterBuckets = new Map();
   const objectBuckets = new Map();
+  const sceneBuckets = new Map();
+  const characterEvidenceBuckets = new Map();
+  const objectEvidenceBuckets = new Map();
   const allowedCharacters = buildAllowedCharacterMap(storyFacts);
   const allowedObjects = buildAllowedObjectMap(storyFacts);
+  const allowedScenes = new Map(
+    (storyFacts?.sceneCatalog || [])
+      .map((scene) => [String(scene?.id || '').toLowerCase(), String(scene?.id || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
 
   (Array.isArray(styleRefs) ? styleRefs : []).forEach((reference, index) => {
-    const characterName = normalizeToAllowedName(reference?.characterName, allowedCharacters);
-    if (characterName) {
-      const list = characterBuckets.get(characterName) || [];
-      if (list.length < MAX_CHARACTER_REFS_PER_CHARACTER) {
+    if ((reference?.confidence || 0) < MIN_DETECTION_CONFIDENCE) {
+      return;
+    }
+
+    const normalizedSceneId = allowedScenes.get(String(reference?.sceneId || '').toLowerCase().trim());
+    if (normalizedSceneId) {
+      const list = sceneBuckets.get(normalizedSceneId) || [];
+      if (list.length < MAX_SCENE_REFS_PER_SCENE) {
         list.push(index);
-        characterBuckets.set(characterName, list);
+        sceneBuckets.set(normalizedSceneId, list);
       }
     }
 
-    const objectName = normalizeToAllowedName(reference?.objectName, allowedObjects);
-    if (objectName) {
+    const detectedCharacterNames = [
+      normalizeToAllowedName(reference?.characterName, allowedCharacters),
+      ...(Array.isArray(reference?.detectedCharacters) ? reference.detectedCharacters : [])
+        .map((entry) => normalizeToAllowedName(entry?.name, allowedCharacters))
+    ].filter(Boolean);
+
+    for (const characterName of [...new Set(detectedCharacterNames)]) {
+      const list = characterBuckets.get(characterName) || [];
+      if (!list.includes(index) && list.length < MAX_CHARACTER_REFS_PER_CHARACTER) {
+        list.push(index);
+        characterBuckets.set(characterName, list);
+      }
+
+      const evidence = characterEvidenceBuckets.get(characterName) || [];
+      if (Number.isInteger(reference?.pageIndex)) {
+        evidence.push({
+          pageIndex: Number(reference.pageIndex),
+          confidence: normalizeConfidence(reference?.confidence, 0.65),
+          snippet: 'illustrated reference'
+        });
+      }
+      characterEvidenceBuckets.set(characterName, evidence);
+    }
+
+    const detectedObjectNames = [
+      normalizeToAllowedName(reference?.objectName, allowedObjects),
+      ...(Array.isArray(reference?.detectedObjects) ? reference.detectedObjects : [])
+        .map((entry) => normalizeToAllowedName(entry?.name, allowedObjects))
+    ].filter(Boolean);
+
+    for (const objectName of [...new Set(detectedObjectNames)]) {
       const list = objectBuckets.get(objectName) || [];
-      if (list.length < 4) {
+      if (!list.includes(index) && list.length < MAX_OBJECT_REFS_PER_OBJECT) {
         list.push(index);
         objectBuckets.set(objectName, list);
       }
+
+      const evidence = objectEvidenceBuckets.get(objectName) || [];
+      if (Number.isInteger(reference?.pageIndex)) {
+        evidence.push({
+          pageIndex: Number(reference.pageIndex),
+          confidence: normalizeConfidence(reference?.confidence, 0.65),
+          snippet: 'illustrated reference'
+        });
+      }
+      objectEvidenceBuckets.set(objectName, evidence);
     }
   });
 
@@ -699,6 +1050,29 @@ const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
       })),
       storyFacts?.objects || [],
       styleRefs.length
+    ),
+    sceneImageMap: normalizeSceneImageMap(
+      Array.from(sceneBuckets.entries()).map(([sceneId, styleRefIndexes]) => ({
+        sceneId,
+        styleRefIndexes,
+        confidence: 0.75
+      })),
+      storyFacts?.sceneCatalog || [],
+      styleRefs.length
+    ),
+    characterEvidenceMap: normalizeCharacterEvidenceMap(
+      Array.from(characterEvidenceBuckets.entries()).map(([characterName, evidence]) => ({
+        characterName,
+        evidence
+      })),
+      storyFacts?.characterCatalog || []
+    ),
+    objectEvidenceMap: normalizeObjectEvidenceMap(
+      Array.from(objectEvidenceBuckets.entries()).map(([objectName, evidence]) => ({
+        objectName,
+        evidence
+      })),
+      storyFacts?.objects || []
     )
   };
 };
@@ -736,6 +1110,10 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     facts?.characterCatalog || facts?.character_catalog,
     facts?.characters
   );
+  const sceneCatalog = normalizeSceneCatalog(
+    facts?.sceneCatalog || facts?.scene_catalog,
+    facts
+  );
 
   const normalized = {
     characters: characterCatalog.map((entry) => entry.name),
@@ -743,13 +1121,28 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     characterImageMap: normalizeCharacterImageMap(
       facts?.characterImageMap || facts?.character_image_map,
       characterCatalog,
-      STYLE_REF_MAX_TOTAL
+      STYLE_REF_INDEX_LIMIT
     ),
     objectImageMap: normalizeObjectImageMap(
       facts?.objectImageMap || facts?.object_image_map,
       facts?.objects,
-      STYLE_REF_MAX_TOTAL
+      STYLE_REF_INDEX_LIMIT
     ),
+    sceneCatalog,
+    sceneImageMap: normalizeSceneImageMap(
+      facts?.sceneImageMap || facts?.scene_image_map,
+      sceneCatalog,
+      STYLE_REF_INDEX_LIMIT
+    ),
+    characterEvidenceMap: normalizeCharacterEvidenceMap(
+      facts?.characterEvidenceMap || facts?.character_evidence_map,
+      characterCatalog
+    ),
+    objectEvidenceMap: normalizeObjectEvidenceMap(
+      facts?.objectEvidenceMap || facts?.object_evidence_map,
+      facts?.objects
+    ),
+    scenes: normalizeFactList(facts?.scenes, 16),
     places: normalizeFactList(facts?.places, 12),
     objects: normalizeFactList(facts?.objects, 12),
     events: normalizeFactList(facts?.events, 14),
@@ -770,6 +1163,10 @@ const normalizeStoryFacts = (facts, storyBrief) => {
       [normalized.setting, ...normalized.places, ...normalized.events].join(' | ')
     );
     normalized.worldTags = derived;
+  }
+
+  if (!Array.isArray(normalized.scenes) || normalized.scenes.length === 0) {
+    normalized.scenes = (normalized.sceneCatalog || []).map((scene) => scene.title).slice(0, 16);
   }
 
   return normalized;
@@ -794,6 +1191,16 @@ const compactFactsForPrompt = (storyFacts) => {
     objectImageMap: (normalized.objectImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
       objectName: entry.objectName,
       styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
+    })),
+    scenes: (normalized.sceneCatalog || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      id: entry.id,
+      title: truncate(entry.title, 44),
+      aliases: entry.aliases.slice(0, 3)
+    })),
+    sceneImageMap: (normalized.sceneImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      sceneId: entry.sceneId,
+      styleRefIndexes: entry.styleRefIndexes.slice(0, 3),
+      confidence: entry.confidence
     })),
     places: normalized.places.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
     objects: normalized.objects.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
@@ -854,6 +1261,7 @@ const getAllFactPhrases = (storyFacts) => [
   ...(storyFacts?.characters || []),
   ...(storyFacts?.places || []),
   ...(storyFacts?.objects || []),
+  ...((storyFacts?.sceneCatalog || []).flatMap((scene) => [scene.title, ...(scene.aliases || [])])),
   ...(storyFacts?.events || []),
   storyFacts?.setting || ''
 ].filter(Boolean);
@@ -1226,17 +1634,26 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
   return RENDER_MODE_STANDALONE;
 };
 
-const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, optionCharacters }) => {
+const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, participants }) => {
   const allowedCharacterEntries = (storyFacts?.characterCatalog || [])
     .map((entry) => ({
       name: normalizePhrase(entry?.name),
       source: normalizeCharacterSource(entry?.source)
     }))
     .filter((entry) => entry.name);
+  const participantCharacterSet = new Set([
+    ...(participants?.characters || []),
+    ...(participants?.inferredCharacters || [])
+  ]);
   const allowedCharacters = allowedCharacterEntries
     .map((entry) => entry.name)
-    .filter(Boolean)
+    .filter((name) => participantCharacterSet.size === 0 || participantCharacterSet.has(name))
     .slice(0, 12);
+  const allowedObjects = [...new Set([...(participants?.objects || []), ...(participants?.inferredObjects || [])])].slice(0, 12);
+  const sceneCatalog = storyFacts?.sceneCatalog || [];
+  const participantScenes = (participants?.scenes || [])
+    .map((id) => sceneCatalog.find((scene) => scene.id === id))
+    .filter(Boolean);
   const primaryCharacter = allowedCharacters[0] || '';
   const normalizedOption = canonicalOption(optionText);
   const optionUsesKnownCharacter = allowedCharacters.some((name) => {
@@ -1265,11 +1682,18 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     'STYLE LAYER:',
     `- Match the attached style references exactly.`,
     `- Art style description: ${artStyle || 'Children\'s book illustration'}.`,
-    optionCharacters?.length
-      ? `- Character visual anchors from references: ${optionCharacters.join(', ')}.`
+    participantCharacterSet.size > 0
+      ? `- Character visual anchors from references: ${[...participantCharacterSet].join(', ')}.`
       : '- Use reference style consistency for all visible characters.',
+    allowedObjects.length > 0
+      ? `- Allowed objects for this card: ${allowedObjects.join(', ')}.`
+      : '- Keep object vocabulary limited to book objects only.',
+    participantScenes.length > 0
+      ? `- Matched scene context IDs: ${participantScenes.map((scene) => `${scene.id} (${scene.title})`).join(', ')}.`
+      : '- Use story setting as scene context if scene is ambiguous.',
     '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
     '- Composition must be easy for a non-verbal child to recognize quickly.',
+    '- Do not invent any character or object outside the provided allowed lists.',
     ...characterRules
   ];
 
@@ -1330,18 +1754,128 @@ const inferOptionObjects = (optionText, storyFacts) => {
   return matches.slice(0, 2);
 };
 
-const pickStyleRefByIndexList = (selectedIndexes, indexList, limit, refs, selectedRefs) => {
-  for (const index of indexList || []) {
-    if (selectedRefs.length >= limit) return;
-    if (!Number.isInteger(index)) continue;
-    if (index < 0 || index >= refs.length) continue;
-    if (selectedIndexes.has(index)) continue;
-    selectedIndexes.add(index);
-    selectedRefs.push(refs[index]);
+const inferSceneIdsFromText = (text, storyFacts) => {
+  const canonicalText = canonicalOption(text);
+  if (!canonicalText) return [];
+
+  const matches = [];
+  for (const scene of storyFacts?.sceneCatalog || []) {
+    const pool = [scene.title, ...(scene.aliases || [])].map((value) => canonicalOption(value));
+    if (pool.some((item) => item && (canonicalText.includes(item) || item.includes(canonicalText)))) {
+      matches.push(scene.id);
+    }
+  }
+
+  if (matches.length > 0) {
+    return [...new Set(matches)];
+  }
+
+  const tags = inferWorldTagsFromText(text);
+  const fallback = [];
+  for (const scene of storyFacts?.sceneCatalog || []) {
+    const sceneText = `${scene.title} ${(scene.aliases || []).join(' ')}`.toLowerCase();
+    if (tags.some((tag) => sceneText.includes(tag))) {
+      fallback.push(scene.id);
+    }
+  }
+
+  return [...new Set(fallback)];
+};
+
+const buildTurnContextParticipants = (text, storyFacts, refsWithMeta, questionParticipants) => {
+  const explicitScenes = inferSceneIdsFromText(text, storyFacts);
+  const scenes = explicitScenes.length > 0
+    ? explicitScenes
+    : Array.isArray(questionParticipants?.scenes) && questionParticipants.scenes.length > 0
+      ? questionParticipants.scenes.slice(0, 3)
+      : (storyFacts?.sceneCatalog || []).slice(0, 1).map((scene) => scene.id);
+
+  const explicitCharacters = inferOptionCharacters(text, storyFacts);
+  const explicitObjects = inferOptionObjects(text, storyFacts);
+
+  const inferredCharacters = [];
+  const inferredObjects = [];
+  for (const ref of refsWithMeta) {
+    if (!scenes.includes(ref.sceneId || '')) continue;
+    if (ref.characterName && !explicitCharacters.includes(ref.characterName) && !inferredCharacters.includes(ref.characterName)) {
+      inferredCharacters.push(ref.characterName);
+    }
+    if (ref.objectName && !explicitObjects.includes(ref.objectName) && !inferredObjects.includes(ref.objectName)) {
+      inferredObjects.push(ref.objectName);
+    }
+  }
+
+  return {
+    scenes,
+    characters: explicitCharacters,
+    objects: explicitObjects,
+    inferredCharacters: inferredCharacters.slice(0, 3),
+    inferredObjects: inferredObjects.slice(0, 3)
+  };
+};
+
+const scoreStyleReference = (reference, participants) => {
+  let score = (reference.confidence || 0.5) * 100 + (reference.qualityScore || reference.confidence || 0.5) * 40;
+
+  if (participants.scenes.includes(reference.sceneId || '')) {
+    score += 48;
+  }
+
+  if (reference.characterName && participants.characters.includes(reference.characterName)) {
+    score += 62;
+  } else if (reference.characterName && participants.inferredCharacters.includes(reference.characterName)) {
+    score += 34;
+  }
+
+  if (reference.objectName && participants.objects.includes(reference.objectName)) {
+    score += 54;
+  } else if (reference.objectName && participants.inferredObjects.includes(reference.objectName)) {
+    score += 28;
+  }
+
+  if (reference.assetRole === 'scene_anchor' && participants.scenes.length > 0) score += 12;
+  if (reference.assetRole === 'character_form' && participants.characters.length > 0) score += 10;
+  if (reference.assetRole === 'object_anchor' && participants.objects.length > 0) score += 8;
+
+  return score;
+};
+
+const pickRankedRefs = ({
+  refsWithMeta,
+  selectedIndexes,
+  selectedRefs,
+  predicate,
+  targetCount,
+  participants,
+  categoryPenaltyTracker
+}) => {
+  const ranked = refsWithMeta
+    .map((reference, index) => ({ reference, index }))
+    .filter((entry) => predicate(entry.reference))
+    .map((entry) => ({
+      ...entry,
+      score: scoreStyleReference(entry.reference, participants)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  for (const item of ranked) {
+    if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
+    if (selectedRefs.length >= targetCount) break;
+    if (selectedIndexes.has(item.index)) continue;
+
+    const dedupeKey = item.reference.characterName || item.reference.objectName || item.reference.sceneId || `${item.index}`;
+    const repeats = categoryPenaltyTracker.get(dedupeKey) || 0;
+    if (repeats >= 2 && item.score < 130) {
+      continue;
+    }
+
+    selectedIndexes.add(item.index);
+    selectedRefs.push(item.reference);
+    categoryPenaltyTracker.set(dedupeKey, repeats + 1);
   }
 };
 
-const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, optionText) => {
+const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, optionText, questionParticipants) => {
   const refsSource = Array.isArray(styleReferences) && styleReferences.length > 0
     ? styleReferences
     : (Array.isArray(stylePrimer) ? stylePrimer.map((item) => ({ ...item, kind: 'scene', source: 'upload' })) : []);
@@ -1349,73 +1883,172 @@ const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, opti
     refsSource,
     'upload',
     false
-  ).slice(0, STYLE_REF_MAX_TOTAL);
+  ).slice(0, STYLE_REF_POOL_LIMIT);
+  const participants = buildTurnContextParticipants(optionText, storyFacts, refsWithMeta, questionParticipants);
   const selectedRefs = [];
   const selectedIndexes = new Set();
+  const categoryPenaltyTracker = new Map();
 
-  const sceneIndexes = refsWithMeta
-    .map((ref, index) => ({ ref, index }))
-    .filter((entry) => entry.ref.kind === 'scene')
-    .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
-    .slice(0, STYLE_REF_SCENE_QUOTA)
-    .map((entry) => entry.index);
-  pickStyleRefByIndexList(selectedIndexes, sceneIndexes, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
+  const dynamicSceneTarget = participants.scenes.length > 0 ? 6 : 4;
+  const dynamicCharacterTarget =
+    participants.characters.length + participants.inferredCharacters.length > 0 ? 6 : 4;
+  const dynamicObjectTarget =
+    participants.objects.length + participants.inferredObjects.length > 0 ? 4 : 2;
 
-  const optionCharacters = inferOptionCharacters(optionText, storyFacts);
-  const optionObjects = inferOptionObjects(optionText, storyFacts);
+  pickRankedRefs({
+    refsWithMeta,
+    selectedIndexes,
+    selectedRefs,
+    predicate: (reference) =>
+      participants.scenes.length === 0
+        ? reference.kind === 'scene'
+        : participants.scenes.includes(reference.sceneId || '') || (reference.kind === 'scene' && !reference.sceneId),
+    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget),
+    participants,
+    categoryPenaltyTracker
+  });
 
-  const charMap = storyFacts?.characterImageMap || [];
-  for (const character of optionCharacters) {
-    const mapping = charMap.find((entry) => String(entry.characterName || '').toLowerCase() === character.toLowerCase());
-    pickStyleRefByIndexList(selectedIndexes, mapping?.styleRefIndexes || [], STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
-    if (selectedRefs.length >= STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA) break;
-  }
+  pickRankedRefs({
+    refsWithMeta,
+    selectedIndexes,
+    selectedRefs,
+    predicate: (reference) =>
+      reference.kind === 'character' ||
+      participants.characters.includes(reference.characterName || '') ||
+      participants.inferredCharacters.includes(reference.characterName || ''),
+    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget),
+    participants,
+    categoryPenaltyTracker
+  });
 
-  if (selectedRefs.length < STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA) {
-    const fallbackCharacterIndexes = refsWithMeta
-      .map((ref, index) => ({ ref, index }))
-      .filter((entry) => entry.ref.kind === 'character')
-      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
-      .map((entry) => entry.index);
-    pickStyleRefByIndexList(
-      selectedIndexes,
-      fallbackCharacterIndexes,
-      STYLE_REF_SCENE_QUOTA + STYLE_REF_CHARACTER_QUOTA,
-      refsWithMeta,
-      selectedRefs
-    );
-  }
+  pickRankedRefs({
+    refsWithMeta,
+    selectedIndexes,
+    selectedRefs,
+    predicate: (reference) =>
+      reference.kind === 'object' ||
+      participants.objects.includes(reference.objectName || '') ||
+      participants.inferredObjects.includes(reference.objectName || ''),
+    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget + dynamicObjectTarget),
+    participants,
+    categoryPenaltyTracker
+  });
 
-  const objectMap = storyFacts?.objectImageMap || [];
-  for (const objectName of optionObjects) {
-    const mapping = objectMap.find((entry) => String(entry.objectName || '').toLowerCase() === objectName.toLowerCase());
-    pickStyleRefByIndexList(selectedIndexes, mapping?.styleRefIndexes || [], STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
-    if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
-  }
-
-  if (selectedRefs.length < STYLE_REF_MAX_TOTAL) {
-    const fallbackObjectIndexes = refsWithMeta
-      .map((ref, index) => ({ ref, index }))
-      .filter((entry) => entry.ref.kind === 'object')
-      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
-      .map((entry) => entry.index);
-    pickStyleRefByIndexList(selectedIndexes, fallbackObjectIndexes, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
-  }
-
-  if (selectedRefs.length < STYLE_REF_MAX_TOTAL) {
-    const remaining = refsWithMeta
-      .map((ref, index) => ({ ref, index }))
-      .filter((entry) => !selectedIndexes.has(entry.index))
-      .sort((a, b) => (b.ref.confidence || 0) - (a.ref.confidence || 0))
-      .map((entry) => entry.index);
-    pickStyleRefByIndexList(selectedIndexes, remaining, STYLE_REF_MAX_TOTAL, refsWithMeta, selectedRefs);
-  }
+  pickRankedRefs({
+    refsWithMeta,
+    selectedIndexes,
+    selectedRefs,
+    predicate: () => true,
+    targetCount: STYLE_REF_MAX_TOTAL,
+    participants,
+    categoryPenaltyTracker
+  });
 
   return {
     refs: selectedRefs.slice(0, STYLE_REF_MAX_TOTAL),
-    optionCharacters,
-    optionObjects
+    participants
   };
+};
+
+const extractSceneCatalogFromStory = async (ai, storyFile, storyBrief, storyFacts) => {
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
+            {
+              text: [
+                'Extract canonical scenes from this children story.',
+                'Return JSON with scenes array only.',
+                'Each scene item must include:',
+                '- id (slug-like stable id)',
+                '- title',
+                '- aliases (up to 5)',
+                '- described_evidence (array of {pageIndex, snippet, confidence})',
+                'Rules:',
+                '- Include only scenes grounded in the book.',
+                '- Keep snippets short.',
+                '- pageIndex is 0-based and may be omitted if unknown.'
+              ].join('\n')
+            }
+          ]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              scenes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    aliases: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    described_evidence: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          pageIndex: { type: Type.NUMBER },
+                          snippet: { type: Type.STRING },
+                          confidence: { type: Type.NUMBER }
+                        },
+                        required: ['snippet', 'confidence']
+                      }
+                    }
+                  },
+                  required: ['id', 'title', 'aliases', 'described_evidence']
+                }
+              }
+            },
+            required: ['scenes']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { scenes: [] });
+    return normalizeSceneCatalog(payload.scenes || [], {
+      ...storyFacts,
+      places: storyFacts?.places || []
+    });
+  } catch (error) {
+    console.warn('[setup] scene catalog extraction failed', error?.message || error);
+    return normalizeSceneCatalog([], storyFacts);
+  }
+};
+
+const enrichSceneEvidenceFromStyleRefs = (sceneCatalog, styleReferences) => {
+  const byScene = new Map(
+    (Array.isArray(sceneCatalog) ? sceneCatalog : []).map((scene) => [scene.id, { ...scene }])
+  );
+
+  for (const ref of Array.isArray(styleReferences) ? styleReferences : []) {
+    const sceneId = normalizePhrase(ref?.sceneId || '');
+    if (!sceneId || !byScene.has(sceneId)) continue;
+    const scene = byScene.get(sceneId);
+    if (!scene) continue;
+    if (!Number.isInteger(ref?.pageIndex)) continue;
+
+    scene.illustratedEvidence = normalizeEvidenceList(
+      [
+        ...(scene.illustratedEvidence || []),
+        {
+          pageIndex: Number(ref.pageIndex),
+          snippet: 'illustrated reference',
+          confidence: normalizeConfidence(ref?.confidence, 0.65)
+        }
+      ],
+      8
+    );
+  }
+
+  return Array.from(byScene.values());
 };
 
 export const setupStoryPack = async (storyFile, styleImages) => {
@@ -1442,6 +2075,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
               '   - character_catalog: list of all characters that are mentioned or illustrated',
               '     each item: {name, source} where source is mentioned, illustrated, or both',
               '   - places: concrete locations mentioned',
+              '   - scenes: major scenes with short titles',
               '   - objects: key objects',
               '   - events: key events in sequence fragments',
               '   - setting: one short sentence for overall world',
@@ -1476,12 +2110,13 @@ export const setupStoryPack = async (storyFile, styleImages) => {
                   }
                 },
                 places: { type: Type.ARRAY, items: { type: Type.STRING } },
+                scenes: { type: Type.ARRAY, items: { type: Type.STRING } },
                 objects: { type: Type.ARRAY, items: { type: Type.STRING } },
                 events: { type: Type.ARRAY, items: { type: Type.STRING } },
                 setting: { type: Type.STRING },
                 world_tags: { type: Type.ARRAY, items: { type: Type.STRING } }
               },
-              required: ['characters', 'character_catalog', 'places', 'objects', 'events', 'setting', 'world_tags']
+              required: ['characters', 'character_catalog', 'places', 'scenes', 'objects', 'events', 'setting', 'world_tags']
             }
           },
           required: ['summary', 'art_style', 'story_brief', 'story_facts']
@@ -1547,13 +2182,21 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     extractedCharacterCatalog = [];
   }
 
-  const storyFacts = normalizeStoryFacts(
+  const initialStoryFacts = normalizeStoryFacts(
     {
       ...(parsed.story_facts || {}),
       character_catalog: [
         ...((parsed.story_facts && parsed.story_facts.character_catalog) || []),
         ...extractedCharacterCatalog
       ]
+    },
+    storyBrief
+  );
+  const sceneCatalog = await extractSceneCatalogFromStory(ai, storyFile, storyBrief, initialStoryFacts);
+  const storyFacts = normalizeStoryFacts(
+    {
+      ...initialStoryFacts,
+      sceneCatalog
     },
     storyBrief
   );
@@ -1612,12 +2255,29 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     mimeType: reference.mimeType,
     data: reference.data
   }));
-  const { characterImageMap, objectImageMap } = buildEntityImageMapsFromStyleRefs(finalStyleReferences, storyFacts);
+  const enrichedSceneCatalog = enrichSceneEvidenceFromStyleRefs(
+    storyFacts.sceneCatalog || [],
+    finalStyleReferences
+  );
+  const {
+    characterImageMap,
+    objectImageMap,
+    sceneImageMap,
+    characterEvidenceMap,
+    objectEvidenceMap
+  } = buildEntityImageMapsFromStyleRefs(finalStyleReferences, {
+    ...storyFacts,
+    sceneCatalog: enrichedSceneCatalog
+  });
   const storyFactsWithImageMap = normalizeStoryFacts(
     {
       ...storyFacts,
+      sceneCatalog: enrichedSceneCatalog,
       characterImageMap,
-      objectImageMap
+      objectImageMap,
+      sceneImageMap,
+      characterEvidenceMap,
+      objectEvidenceMap
     },
     storyBrief
   );
@@ -1661,7 +2321,7 @@ export const runTurnPipeline = async (
           : []),
     'upload',
     false
-  ).slice(0, STYLE_REF_MAX_TOTAL);
+  ).slice(0, STYLE_REF_POOL_LIMIT);
   const effectiveStylePrimer = effectiveStyleReferences.map((ref) => ({
     mimeType: ref.mimeType,
     data: ref.data
@@ -1706,6 +2366,12 @@ export const runTurnPipeline = async (
   }
 
   const optionsStart = performance.now();
+  const questionParticipants = buildTurnContextParticipants(
+    question,
+    normalizedFacts,
+    effectiveStyleReferences,
+    null
+  );
 
   let candidatePayload;
   try {
@@ -1767,11 +2433,12 @@ export const runTurnPipeline = async (
     cards.map(async (card) => {
       const start = performance.now();
       const parts = [];
-      const { refs: refsForOption, optionCharacters } = selectStyleRefsForOption(
+      const { refs: refsForOption, participants } = selectStyleRefsForOption(
         effectiveStylePrimer,
         effectiveStyleReferences,
         normalizedFacts,
-        card.text
+        card.text,
+        questionParticipants
       );
 
       for (const ref of refsForOption) {
@@ -1785,7 +2452,7 @@ export const runTurnPipeline = async (
           storyBrief,
           artStyle,
           storyFacts: normalizedFacts,
-          optionCharacters
+          participants
         })
       });
 

@@ -19,13 +19,25 @@ export interface StyleReferenceDetection {
   box?: StyleReferenceBox;
 }
 
+export interface EntityEvidence {
+  pageIndex: number;
+  snippet?: string;
+  confidence: number; // 0..1
+}
+
+export type StyleAssetRole = 'scene_anchor' | 'character_form' | 'object_anchor';
+
 export interface StyleReferenceAsset extends FileData {
   kind: StyleReferenceKind;
   source: StyleReferenceSource;
   characterName?: string;
   objectName?: string;
+  sceneId?: string;
+  assetRole?: StyleAssetRole;
   pageIndex?: number;
   confidence?: number;
+  qualityScore?: number;
+  embeddingHash?: string;
   detectedCharacters?: StyleReferenceDetection[];
   detectedObjects?: StyleReferenceDetection[];
 }
@@ -97,6 +109,11 @@ export interface StoryFacts {
   characterCatalog: StoryCharacterFact[];
   characterImageMap?: StoryCharacterImageMap[];
   objectImageMap?: StoryObjectImageMap[];
+  sceneCatalog?: SceneFact[];
+  sceneImageMap?: SceneImageMap[];
+  characterEvidenceMap?: StoryCharacterEvidenceMap[];
+  objectEvidenceMap?: StoryObjectEvidenceMap[];
+  scenes?: string[];
   places: string[];
   objects: string[];
   events: string[];
@@ -112,6 +129,38 @@ export interface StoryCharacterImageMap {
 export interface StoryObjectImageMap {
   objectName: string;
   styleRefIndexes: number[];
+}
+
+export interface StoryCharacterEvidenceMap {
+  characterName: string;
+  evidence: EntityEvidence[];
+}
+
+export interface StoryObjectEvidenceMap {
+  objectName: string;
+  evidence: EntityEvidence[];
+}
+
+export interface SceneFact {
+  id: string;
+  title: string;
+  aliases: string[];
+  describedEvidence: EntityEvidence[];
+  illustratedEvidence: EntityEvidence[];
+}
+
+export interface SceneImageMap {
+  sceneId: string;
+  styleRefIndexes: number[];
+  confidence: number;
+}
+
+export interface TurnContextParticipants {
+  scenes: string[];
+  characters: string[];
+  objects: string[];
+  inferredCharacters: string[];
+  inferredObjects: string[];
 }
 
 export interface StoryCharacterFact {
