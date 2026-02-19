@@ -482,6 +482,50 @@ const App: React.FC = () => {
                           scenes: {(debug.selectedParticipants?.scenes || []).join(', ') || 'none'} | chars: {(debug.selectedParticipants?.characters || []).join(', ') || 'none'} | objects: {(debug.selectedParticipants?.objects || []).join(', ') || 'none'}
                         </div>
 
+                        {debug.answerAgentPrompt && (
+                          <details className="mb-2">
+                            <summary className="text-[11px] font-semibold text-gray-700 cursor-pointer select-none">
+                              Answer agent prompt
+                            </summary>
+                            <pre className="mt-1 text-[11px] leading-relaxed bg-white border border-gray-200 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap text-gray-700">
+                              {debug.answerAgentPrompt}
+                            </pre>
+                          </details>
+                        )}
+
+                        {debug.answerAgentRaw && (
+                          <details className="mb-2">
+                            <summary className="text-[11px] font-semibold text-gray-700 cursor-pointer select-none">
+                              Answer agent raw output
+                            </summary>
+                            <pre className="mt-1 text-[11px] leading-relaxed bg-white border border-gray-200 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap text-gray-700">
+                              {debug.answerAgentRaw}
+                            </pre>
+                          </details>
+                        )}
+
+                        {debug.illustrationAgentPrompt && (
+                          <details className="mb-2">
+                            <summary className="text-[11px] font-semibold text-gray-700 cursor-pointer select-none">
+                              Illustration agent prompt
+                            </summary>
+                            <pre className="mt-1 text-[11px] leading-relaxed bg-white border border-gray-200 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap text-gray-700">
+                              {debug.illustrationAgentPrompt}
+                            </pre>
+                          </details>
+                        )}
+
+                        {debug.illustrationPlan && (
+                          <details className="mb-2">
+                            <summary className="text-[11px] font-semibold text-gray-700 cursor-pointer select-none">
+                              Illustration plan
+                            </summary>
+                            <pre className="mt-1 text-[11px] leading-relaxed bg-white border border-gray-200 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap text-gray-700">
+                              {debug.illustrationPlan}
+                            </pre>
+                          </details>
+                        )}
+
                         {selectedRefs.length > 0 && (
                           <div className="flex flex-wrap gap-2 mb-3">
                             {selectedRefs.map(({ idx, ref }) => {

@@ -103,9 +103,18 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       const audioBase64 = await readBlobAsBase64(audioBlob);
 
       if (USE_BACKEND_PIPELINE) {
+        if (!activeAssets.pdfData?.data || !activeAssets.pdfData?.mimeType) {
+          dispatch({
+            type: 'SET_ERROR',
+            error: 'This story is missing original PDF. Open setup and save with original PDF.'
+          });
+          return;
+        }
+
         const turnResponse = await runTurnWithBackend({
           audioBase64,
           mimeType: audioBlob.type,
+          storyPdf: activeAssets.pdfData,
           storyBrief: activeAssets.storyBrief,
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',

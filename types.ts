@@ -181,6 +181,10 @@ export interface TurnCardDebug {
   selectedStyleRefIndexes?: number[];
   selectedStyleRefs?: SelectedStyleRefDebug[];
   selectedParticipants?: TurnContextParticipants;
+  answerAgentPrompt?: string;
+  answerAgentRaw?: string;
+  illustrationAgentPrompt?: string;
+  illustrationPlan?: string;
   imagePrompt?: string;
   imageModel?: string;
   imageGenerationError?: string;
@@ -245,6 +249,7 @@ export interface SetupStoryResponse {
 export interface TurnRequest {
   audioBase64: string;
   mimeType: string;
+  storyPdf: FileData;
   storyBrief: string;
   storyFacts?: StoryFacts;
   artStyle: string;

@@ -11,6 +11,8 @@ const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
+const ANSWER_AGENT_MODEL = 'gemini-3-flash-preview';
+const ILLUSTRATION_AGENT_MODEL = 'gemini-3-flash-preview';
 const REPLICATE_IMAGE_MODEL = (
   process.env.REPLICATE_IMAGE_MODEL ||
   'google/nano-banana-pro:d71e2df08d6ef4c4fb6d3773e9e557de6312e04444940dbb81fd73366ed83941'
@@ -1622,6 +1624,308 @@ const buildFallbackOptions = (question, storyBrief, storyFacts) => {
   ];
 };
 
+const normalizeAnswerAgentOptions = (answers, question, storyBrief, storyFacts) => {
+  const deduped = [];
+  const seen = new Set();
+
+  for (const answer of Array.isArray(answers) ? answers : []) {
+    const text = simplifyOptionText(answer?.text || '', question);
+    const canonical = canonicalOption(text);
+    if (!text || !canonical || seen.has(canonical)) continue;
+    seen.add(canonical);
+
+    const supportLevelRaw = Number(answer?.support_level);
+    const computedSupport = computeSupportLevel(
+      text,
+      normalizePhrase(answer?.evidence || ''),
+      storyFacts,
+      question,
+      storyBrief
+    );
+    const supportLevel = Number.isFinite(supportLevelRaw)
+      ? Math.max(0, Math.min(100, Math.round(supportLevelRaw)))
+      : computedSupport;
+
+    deduped.push({
+      text,
+      isCorrect: Boolean(answer?.is_correct),
+      supportLevel,
+      evidence: normalizePhrase(answer?.evidence || '')
+    });
+  }
+
+  if (deduped.length === 0) {
+    return [];
+  }
+
+  deduped.sort((a, b) => b.supportLevel - a.supportLevel);
+  const flaggedCorrect = deduped.filter((item) => item.isCorrect);
+  const selectedCorrect = flaggedCorrect.length > 0 ? flaggedCorrect[0] : deduped[0];
+
+  const distractors = deduped
+    .filter((item) => item.text !== selectedCorrect.text)
+    .map((item) => ({ ...item, isCorrect: false }));
+
+  return [
+    { ...selectedCorrect, isCorrect: true },
+    ...distractors
+  ];
+};
+
+const enforceThreeAnswerOptions = ({
+  options,
+  question,
+  storyBrief,
+  storyFacts
+}) => {
+  const normalizedOptions = Array.isArray(options) ? options : [];
+  const fallback = buildFallbackOptions(question, storyBrief, storyFacts);
+  const normalizedCorrect = normalizedOptions.find((item) => item.isCorrect);
+  const correct = normalizedCorrect || fallback.find((item) => item.isCorrect);
+
+  if (!correct) {
+    return fallback.slice(0, 3);
+  }
+
+  const distractors = normalizedOptions
+    .filter((item) => !item.isCorrect && canonicalOption(item.text) !== canonicalOption(correct.text))
+    .slice(0, 2);
+
+  if (distractors.length < 2) {
+    const existing = new Set(distractors.map((item) => canonicalOption(item.text)));
+    for (const item of fallback.filter((entry) => !entry.isCorrect)) {
+      const key = canonicalOption(item.text);
+      if (!key || existing.has(key) || key === canonicalOption(correct.text)) continue;
+      distractors.push(item);
+      existing.add(key);
+      if (distractors.length >= 2) break;
+    }
+  }
+
+  return [{ ...correct, isCorrect: true }, ...distractors.slice(0, 2)];
+};
+
+const buildAnswerAgentPrompt = ({ question, compactHistory, compactStoryFacts }) =>
+  [
+    'You are an answer generator for a non-verbal child reading-comprehension activity.',
+    'Use the attached story PDF as the primary source of truth.',
+    'Generate exactly 3 options for the parent question.',
+    'Rules:',
+    '- Exactly 3 options total.',
+    '- Exactly 1 option must be correct.',
+    '- Each option max 10 words, child-friendly wording.',
+    '- Wrong options should be plausible but still incorrect.',
+    '- Keep text concrete and easy to illustrate.',
+    `Story facts helper: ${JSON.stringify(compactStoryFacts)}`,
+    `Conversation:\n${compactHistory || 'None yet.'}`,
+    `Parent question: ${question}`,
+    'Return strict JSON only.',
+    'Schema:',
+    '{ "answers": [ { "text": string, "is_correct": boolean, "evidence": string, "support_level": number } ] }'
+  ].join('\n');
+
+const generateAnswersFromPdf = async (ai, { question, storyPdf, history, storyFacts, storyBrief }) => {
+  const compactHistory = compactHistoryForPrompt(history);
+  const compactStoryFacts = compactFactsForPrompt(storyFacts);
+  const answerAgentPrompt = buildAnswerAgentPrompt({ question, compactHistory, compactStoryFacts });
+
+  const runAgent = async () => {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: ANSWER_AGENT_MODEL,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: storyPdf.mimeType,
+                data: storyPdf.data
+              }
+            },
+            { text: answerAgentPrompt }
+          ]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              answers: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    text: { type: Type.STRING },
+                    is_correct: { type: Type.BOOLEAN },
+                    evidence: { type: Type.STRING },
+                    support_level: { type: Type.NUMBER }
+                  },
+                  required: ['text', 'is_correct', 'evidence', 'support_level']
+                }
+              }
+            },
+            required: ['answers']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { answers: [] });
+    const normalized = normalizeAnswerAgentOptions(payload.answers, question, storyBrief, storyFacts);
+    const finalOptions = enforceThreeAnswerOptions({
+      options: normalized,
+      question,
+      storyBrief,
+      storyFacts
+    });
+    const hasThree = finalOptions.length === 3;
+    const correctCount = finalOptions.filter((item) => item.isCorrect).length;
+
+    return {
+      raw: response.text || '',
+      options: finalOptions,
+      valid: hasThree && correctCount === 1
+    };
+  };
+
+  const first = await runAgent();
+  if (first.valid) {
+    return {
+      options: first.options,
+      answerAgentPrompt,
+      answerAgentRaw: first.raw
+    };
+  }
+
+  const second = await runAgent();
+  if (second.valid) {
+    return {
+      options: second.options,
+      answerAgentPrompt,
+      answerAgentRaw: second.raw
+    };
+  }
+
+  return {
+    options: enforceThreeAnswerOptions({
+      options: [],
+      question,
+      storyBrief,
+      storyFacts
+    }),
+    answerAgentPrompt,
+    answerAgentRaw: second.raw || first.raw || ''
+  };
+};
+
+const toIllustrationPlanText = (plan, answerText) => {
+  const safePlan = plan || {};
+  const mustIncludeScenes = Array.isArray(safePlan?.must_include?.scenes) ? safePlan.must_include.scenes : [];
+  const mustIncludeCharacters = Array.isArray(safePlan?.must_include?.characters) ? safePlan.must_include.characters : [];
+  const mustIncludeObjects = Array.isArray(safePlan?.must_include?.objects) ? safePlan.must_include.objects : [];
+  const mustAvoid = Array.isArray(safePlan?.must_avoid?.entities) ? safePlan.must_avoid.entities : [];
+  const compositionNotes = normalizePhrase(safePlan?.composition_notes || '');
+  const sceneDescription = normalizePhrase(safePlan?.scene_description || answerText || '');
+
+  return [
+    `Scene description: ${sceneDescription}`,
+    mustIncludeScenes.length > 0 ? `Must include scenes: ${mustIncludeScenes.join(', ')}` : 'Must include scenes: none',
+    mustIncludeCharacters.length > 0 ? `Must include characters: ${mustIncludeCharacters.join(', ')}` : 'Must include characters: none',
+    mustIncludeObjects.length > 0 ? `Must include objects: ${mustIncludeObjects.join(', ')}` : 'Must include objects: none',
+    mustAvoid.length > 0 ? `Must avoid entities: ${mustAvoid.join(', ')}` : 'Must avoid entities: none',
+    compositionNotes ? `Composition notes: ${compositionNotes}` : 'Composition notes: Keep a clean single-subject composition.'
+  ].join('\n');
+};
+
+const buildIllustrationAgentPrompt = ({
+  question,
+  answerText,
+  isCorrect,
+  participants,
+  storyFacts,
+  selectedRefs
+}) => {
+  const allowedScenes = (storyFacts?.sceneCatalog || []).map((scene) => `${scene.id}:${scene.title}`);
+  const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name);
+  const allowedObjects = storyFacts?.objects || [];
+  const refsSummary = (Array.isArray(selectedRefs) ? selectedRefs : [])
+    .map((ref, idx) => `${idx + 1}) ${ref.kind}/${ref.source} scene=${ref.sceneId || '-'} char=${ref.characterName || '-'} obj=${ref.objectName || '-'}`)
+    .join('\n');
+
+  return [
+    'You are an illustration-planning agent for children story answer cards.',
+    'Create a concise, visual scene plan for one answer option.',
+    `Parent question: ${question}`,
+    `Answer option: ${answerText}`,
+    `Is this answer correct: ${isCorrect ? 'yes' : 'no'}`,
+    `Detected participants scenes=${(participants?.scenes || []).join(', ') || 'none'} characters=${(participants?.characters || []).join(', ') || 'none'} objects=${(participants?.objects || []).join(', ') || 'none'}`,
+    `Allowed scenes: ${allowedScenes.join(', ') || 'none'}`,
+    `Allowed characters: ${allowedCharacters.join(', ') || 'none'}`,
+    `Allowed objects: ${allowedObjects.join(', ') || 'none'}`,
+    `Selected style refs:\n${refsSummary || 'none'}`,
+    'Rules:',
+    '- Never invent entities outside allowed characters/objects/scenes.',
+    '- If no character refs are selected, prefer scene/object composition with zero extra characters.',
+    '- Keep composition simple for quick recognition by non-verbal children.',
+    '- Keep style-compatible framing hints.',
+    'Return strict JSON only with this schema:',
+    '{ "scene_description": string, "must_include": { "scenes": string[], "characters": string[], "objects": string[] }, "must_avoid": { "entities": string[] }, "composition_notes": string }'
+  ].join('\n');
+};
+
+const generateIllustrationPlanForAnswer = async (ai, payload) => {
+  const illustrationAgentPrompt = buildIllustrationAgentPrompt(payload);
+
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: ILLUSTRATION_AGENT_MODEL,
+      contents: {
+        parts: [{ text: illustrationAgentPrompt }]
+      },
+      config: {
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            scene_description: { type: Type.STRING },
+            must_include: {
+              type: Type.OBJECT,
+              properties: {
+                scenes: { type: Type.ARRAY, items: { type: Type.STRING } },
+                characters: { type: Type.ARRAY, items: { type: Type.STRING } },
+                objects: { type: Type.ARRAY, items: { type: Type.STRING } }
+              },
+              required: ['scenes', 'characters', 'objects']
+            },
+            must_avoid: {
+              type: Type.OBJECT,
+              properties: {
+                entities: { type: Type.ARRAY, items: { type: Type.STRING } }
+              },
+              required: ['entities']
+            },
+            composition_notes: { type: Type.STRING }
+          },
+          required: ['scene_description', 'must_include', 'must_avoid', 'composition_notes']
+        }
+      }
+    })
+  );
+
+  const plan = parseJsonSafe(response.text, {
+    scene_description: payload.answerText || '',
+    must_include: { scenes: [], characters: [], objects: [] },
+    must_avoid: { entities: [] },
+    composition_notes: 'Keep the image simple with one clear focal subject.'
+  });
+
+  return {
+    illustrationAgentPrompt,
+    illustrationPlan: plan
+  };
+};
+
 const generateCandidates = async (ai, question, history, storyBrief, storyFacts) => {
   const compactStoryBrief = compactStoryBriefForPrompt(storyBrief);
   const compactStoryFacts = compactFactsForPrompt(storyFacts);
@@ -1881,7 +2185,7 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
   return RENDER_MODE_STANDALONE;
 };
 
-const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, participants, selectedRefs }) => {
+const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, participants, selectedRefs, illustrationPlan }) => {
   const allowedCharacterEntries = (storyFacts?.characterCatalog || [])
     .map((entry) => ({
       name: normalizePhrase(entry?.name),
@@ -1925,6 +2229,20 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
   const participantScenes = (participants?.scenes || [])
     .map((id) => sceneCatalog.find((scene) => scene.id === id))
     .filter(Boolean);
+  const planSceneDescription = normalizePhrase(illustrationPlan?.scene_description || '');
+  const planMustIncludeScenes = Array.isArray(illustrationPlan?.must_include?.scenes)
+    ? illustrationPlan.must_include.scenes.map((item) => normalizePhrase(item)).filter(Boolean)
+    : [];
+  const planMustIncludeCharacters = Array.isArray(illustrationPlan?.must_include?.characters)
+    ? illustrationPlan.must_include.characters.map((item) => normalizePhrase(item)).filter(Boolean)
+    : [];
+  const planMustIncludeObjects = Array.isArray(illustrationPlan?.must_include?.objects)
+    ? illustrationPlan.must_include.objects.map((item) => normalizePhrase(item)).filter(Boolean)
+    : [];
+  const planMustAvoid = Array.isArray(illustrationPlan?.must_avoid?.entities)
+    ? illustrationPlan.must_avoid.entities.map((item) => normalizePhrase(item)).filter(Boolean)
+    : [];
+  const compositionNotes = normalizePhrase(illustrationPlan?.composition_notes || '');
   const primaryCharacter = allowedCharacters[0] || '';
   const normalizedOption = canonicalOption(optionText);
   const optionUsesKnownCharacter = allowedCharacters.some((name) => {
@@ -1968,6 +2286,21 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     participantScenes.length > 0
       ? `- Matched scene context IDs: ${participantScenes.map((scene) => `${scene.id} (${scene.title})`).join(', ')}.`
       : '- Use story setting as scene context if scene is ambiguous.',
+    planMustIncludeScenes.length > 0
+      ? `- Illustration plan scenes: ${planMustIncludeScenes.join(', ')}.`
+      : '- Illustration plan scenes: none specified.',
+    planMustIncludeCharacters.length > 0
+      ? `- Illustration plan characters: ${planMustIncludeCharacters.join(', ')}.`
+      : '- Illustration plan characters: none specified.',
+    planMustIncludeObjects.length > 0
+      ? `- Illustration plan objects: ${planMustIncludeObjects.join(', ')}.`
+      : '- Illustration plan objects: none specified.',
+    planMustAvoid.length > 0
+      ? `- Must avoid entities: ${planMustAvoid.join(', ')}.`
+      : '- Must avoid entities: none specified.',
+    compositionNotes
+      ? `- Composition guidance: ${compositionNotes}.`
+      : '- Composition guidance: keep one primary subject with minimal clutter.',
     '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
     '- Composition must be easy for a non-verbal child to recognize quickly.',
     '- Do not invent any character or object outside the provided allowed lists.',
@@ -1978,14 +2311,14 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     renderMode === RENDER_MODE_BLEND
       ? [
           'SEMANTIC LAYER:',
-          `- Main subject to depict: "${optionText}".`,
+          `- Main subject to depict: "${planSceneDescription || optionText}".`,
           '- Blend the subject naturally into the story world when plausible.',
           `- Story world context: ${storyFacts?.setting || storyBrief}.`,
           '- Keep the scene simple with minimal clutter.'
         ]
       : [
           'SEMANTIC LAYER:',
-          `- Main subject to depict: "${optionText}".`,
+          `- Main subject to depict: "${planSceneDescription || optionText}".`,
           '- Render this option in its normal real-world context.',
           `- Keep style consistent with the story art, but DO NOT force story-world mashups.`,
           '- Explicitly avoid adding underwater/ocean setting unless the option itself requires it.',
@@ -2268,7 +2601,15 @@ const pickRankedRefs = ({
   }
 };
 
-const selectStyleRefsForOption = async (ai, stylePrimer, styleReferences, storyFacts, optionText, questionParticipants) => {
+const selectStyleRefsForOption = async (
+  ai,
+  stylePrimer,
+  styleReferences,
+  storyFacts,
+  optionText,
+  questionParticipants,
+  participantsOverride = null
+) => {
   const refsSource = Array.isArray(styleReferences) && styleReferences.length > 0
     ? styleReferences
     : (Array.isArray(stylePrimer) ? stylePrimer.map((item) => ({ ...item, kind: 'scene', source: 'upload' })) : []);
@@ -2277,7 +2618,13 @@ const selectStyleRefsForOption = async (ai, stylePrimer, styleReferences, storyF
     'upload',
     false
   ).slice(0, STYLE_REF_POOL_LIMIT);
-  const participants = await resolveTurnContextParticipants(ai, optionText, storyFacts, refsWithMeta, questionParticipants);
+  const participants = participantsOverride || await resolveTurnContextParticipants(
+    ai,
+    optionText,
+    storyFacts,
+    refsWithMeta,
+    questionParticipants
+  );
   const selectedRefs = [];
   const selectedIndexes = new Set();
   const categoryPenaltyTracker = new Map();
@@ -2751,6 +3098,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
 export const runTurnPipeline = async (
   audioBase64,
   mimeType,
+  storyPdf,
   storyBrief,
   storyFacts,
   artStyle,
@@ -2758,6 +3106,10 @@ export const runTurnPipeline = async (
   styleReferences,
   history
 ) => {
+  if (!storyPdf?.data || !storyPdf?.mimeType) {
+    throw new Error('This story is missing original PDF. Open setup and save with original PDF.');
+  }
+
   const ai = getClient();
   const totalStart = performance.now();
   const normalizedFacts = normalizeStoryFacts(storyFacts, storyBrief);
@@ -2821,20 +3173,15 @@ export const runTurnPipeline = async (
     effectiveStyleReferences,
     null
   );
-
-  let candidatePayload;
-  try {
-    candidatePayload = await generateCandidates(ai, question, history, storyBrief, normalizedFacts);
-  } catch {
-    candidatePayload = null;
-  }
-
-  const { options: resolvedOptions, regenerationCount } = buildFinalOptions({
+  const answerAgentResult = await generateAnswersFromPdf(ai, {
     question,
-    storyBrief,
+    storyPdf,
+    history,
     storyFacts: normalizedFacts,
-    candidatePayload
+    storyBrief
   });
+  const resolvedOptions = answerAgentResult.options;
+  const regenerationCount = 0;
 
   const shuffled = shuffle(resolvedOptions);
   const optionsMs = Math.round(performance.now() - optionsStart);
@@ -2882,13 +3229,22 @@ export const runTurnPipeline = async (
     cards.map(async (card) => {
       const start = performance.now();
       const parts = [];
-      const { refs: refsForOption, participants, selectedStyleRefIndexes } = await selectStyleRefsForOption(
+      const combinedContext = `${question}\n${card.text}`;
+      const participants = await resolveTurnContextParticipants(
+        ai,
+        combinedContext,
+        normalizedFacts,
+        effectiveStyleReferences,
+        questionParticipants
+      );
+      const { refs: refsForOption, selectedStyleRefIndexes } = await selectStyleRefsForOption(
         ai,
         effectiveStylePrimer,
         effectiveStyleReferences,
         normalizedFacts,
         card.text,
-        questionParticipants
+        questionParticipants,
+        participants
       );
       const refSummary = refsForOption
         .map((ref, idx) => {
@@ -2923,6 +3279,15 @@ export const runTurnPipeline = async (
         confidence: Number.isFinite(Number(ref.confidence)) ? Number(ref.confidence) : undefined
       }));
 
+      const { illustrationAgentPrompt, illustrationPlan } = await generateIllustrationPlanForAnswer(ai, {
+        question,
+        answerText: card.text,
+        isCorrect: Boolean(card.isCorrect),
+        participants,
+        storyFacts: normalizedFacts,
+        selectedRefs: refsForOption
+      });
+      const illustrationPlanText = toIllustrationPlanText(illustrationPlan, card.text);
       const imagePrompt = buildImagePrompt({
         optionText: card.text,
         renderMode: card.renderMode,
@@ -2930,7 +3295,8 @@ export const runTurnPipeline = async (
         artStyle,
         storyFacts: normalizedFacts,
         participants,
-        selectedRefs: refsForOption
+        selectedRefs: refsForOption,
+        illustrationPlan
       });
 
       parts.push({
@@ -2950,6 +3316,10 @@ export const runTurnPipeline = async (
 
       card.isLoadingImage = false;
       card.debug = {
+        answerAgentPrompt: answerAgentResult.answerAgentPrompt,
+        answerAgentRaw: answerAgentResult.answerAgentRaw,
+        illustrationAgentPrompt,
+        illustrationPlan: illustrationPlanText,
         selectedStyleRefIndexes,
         selectedStyleRefs,
         selectedParticipants: participants,

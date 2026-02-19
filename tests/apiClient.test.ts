@@ -78,6 +78,7 @@ describe('apiClient', () => {
     const response = await runTurnWithBackend({
       audioBase64: 'abc',
       mimeType: 'audio/webm',
+      storyPdf: { data: 'pdf-base64', mimeType: 'application/pdf' },
       storyBrief: 'brief',
       storyFacts: {
         characters: ['Milo'],

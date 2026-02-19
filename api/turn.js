@@ -19,9 +19,14 @@ export default async function handler(req, res) {
       return send(res, 400, { error: 'audioBase64, mimeType, and storyBrief are required' });
     }
 
+    if (!body?.storyPdf?.data || !body?.storyPdf?.mimeType) {
+      return send(res, 400, { error: 'This story is missing original PDF. Open setup and save with original PDF.' });
+    }
+
     const result = await runTurnPipeline(
       body.audioBase64,
       body.mimeType,
+      body.storyPdf,
       body.storyBrief,
       body.storyFacts || null,
       body.artStyle,
