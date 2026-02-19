@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Upload, BookOpen, X, AlertCircle, CheckCircle, ArrowRight, Loader2, Sparkles, FolderOpen } from 'lucide-react';
-import { FileData, Publisher, SetupStoryResponse, StoryPack, StyleReferenceAsset } from '../types';
+import { FileData, Publisher, SetupStoryResponse, StoryFacts, StoryPack, StyleReferenceAsset } from '../types';
 import { USE_BACKEND_PIPELINE } from '../services/apiClient';
 import { extractStyleReferenceAssetsFromPdf } from '../services/pdfService';
 
@@ -50,7 +50,10 @@ const STYLE_REF_CHARACTER_QUOTA = 4;
 const STYLE_REF_OBJECT_QUOTA = 4;
 const STYLE_REF_TOTAL = 14;
 const STYLE_REF_LIBRARY_TOTAL = 120;
-const STYLE_REF_SETUP_UPLOAD_LIMIT = 48;
+const STYLE_REF_SETUP_UPLOAD_LIMIT = 80;
+const MAX_TIGHT_CROP_COVERAGE = 0.6;
+const STYLE_REF_ENTITY_TARGET = 72;
+const STYLE_REF_SCENE_TARGET = 48;
 
 const toFingerprint = (item: FileData): string => {
   const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 32);
@@ -69,6 +72,8 @@ const toStyleReferenceAsset = (
   objectName: item.objectName || fallback.objectName,
   sceneId: item.sceneId || fallback.sceneId,
   assetRole: item.assetRole || fallback.assetRole,
+  box: item.box || fallback.box,
+  cropCoverage: item.cropCoverage ?? fallback.cropCoverage,
   pageIndex: item.pageIndex ?? fallback.pageIndex,
   confidence: item.confidence ?? fallback.confidence ?? 0.5,
   qualityScore: item.qualityScore ?? fallback.qualityScore,
@@ -196,6 +201,209 @@ const mergePrimerSources = (preferred: FileData[], fallback: FileData[]): FileDa
   return merged.slice(0, 120);
 };
 
+const normalizeBox = (box: StyleReferenceAsset['box']): StyleReferenceAsset['box'] => {
+  if (!box) return undefined;
+  const x = Math.max(0, Math.min(1, Number(box.x) || 0));
+  const y = Math.max(0, Math.min(1, Number(box.y) || 0));
+  const width = Math.max(0, Math.min(1, Number(box.width) || 0));
+  const height = Math.max(0, Math.min(1, Number(box.height) || 0));
+  if (width <= 0 || height <= 0) return undefined;
+  return {
+    x,
+    y,
+    width: Math.min(width, 1 - x),
+    height: Math.min(height, 1 - y)
+  };
+};
+
+const getBoxCoverage = (box: StyleReferenceAsset['box']): number | undefined => {
+  const normalized = normalizeBox(box);
+  if (!normalized) return undefined;
+  return Math.max(0, Math.min(1, normalized.width * normalized.height));
+};
+
+const isTightEntityRef = (ref: StyleReferenceAsset | null | undefined): boolean => {
+  if (!ref || (ref.kind !== 'character' && ref.kind !== 'object')) return false;
+  const coverage = ref.cropCoverage ?? getBoxCoverage(ref.box);
+  return typeof coverage === 'number' && coverage > 0 && coverage <= MAX_TIGHT_CROP_COVERAGE;
+};
+
+const rebuildStoryFactImageMaps = (storyFacts: StoryFacts, refs: StyleReferenceAsset[]): StoryFacts => {
+  const nextFacts: StoryFacts = {
+    ...storyFacts,
+    characterImageMap: [],
+    objectImageMap: [],
+    sceneImageMap: []
+  };
+
+  const charBuckets = new Map<string, number[]>();
+  const objBuckets = new Map<string, number[]>();
+  const sceneBuckets = new Map<string, number[]>();
+
+  refs.forEach((ref, index) => {
+    const confidence = ref.confidence ?? 0;
+    if (confidence < 0.45) return;
+
+    if (ref.sceneId) {
+      const list = sceneBuckets.get(ref.sceneId.toLowerCase()) || [];
+      if (!list.includes(index) && list.length < 4 && ref.kind === 'scene') {
+        list.push(index);
+        sceneBuckets.set(ref.sceneId.toLowerCase(), list);
+      }
+    }
+
+    if (isTightEntityRef(ref) && ref.characterName) {
+      const key = ref.characterName.toLowerCase();
+      const list = charBuckets.get(key) || [];
+      if (!list.includes(index) && list.length < 3) {
+        list.push(index);
+        charBuckets.set(key, list);
+      }
+    }
+
+    if (isTightEntityRef(ref) && ref.objectName) {
+      const key = ref.objectName.toLowerCase();
+      const list = objBuckets.get(key) || [];
+      if (!list.includes(index) && list.length < 4) {
+        list.push(index);
+        objBuckets.set(key, list);
+      }
+    }
+  });
+
+  nextFacts.characterImageMap = (storyFacts.characterCatalog || [])
+    .map((entry) => {
+      const refsForEntity = charBuckets.get(entry.name.toLowerCase()) || [];
+      return refsForEntity.length > 0
+        ? {
+            characterName: entry.name,
+            styleRefIndexes: refsForEntity
+          }
+        : null;
+    })
+    .filter((item): item is NonNullable<StoryFacts['characterImageMap']>[number] => Boolean(item));
+
+  nextFacts.objectImageMap = (storyFacts.objects || [])
+    .map((entry) => {
+      const refsForEntity = objBuckets.get(entry.toLowerCase()) || [];
+      return refsForEntity.length > 0
+        ? {
+            objectName: entry,
+            styleRefIndexes: refsForEntity
+          }
+        : null;
+    })
+    .filter((item): item is NonNullable<StoryFacts['objectImageMap']>[number] => Boolean(item));
+
+  nextFacts.sceneImageMap = (storyFacts.sceneCatalog || [])
+    .map((entry) => {
+      const refsForEntity = sceneBuckets.get(entry.id.toLowerCase()) || [];
+      return refsForEntity.length > 0
+        ? {
+            sceneId: entry.id,
+            styleRefIndexes: refsForEntity,
+            confidence: 0.75
+          }
+        : null;
+    })
+    .filter((item): item is NonNullable<StoryFacts['sceneImageMap']>[number] => Boolean(item));
+
+  return nextFacts;
+};
+
+const buildTightEntityCrops = async (refs: StyleReferenceAsset[]): Promise<StyleReferenceAsset[]> => {
+  const sceneRefs: StyleReferenceAsset[] = [];
+  const entityCrops: StyleReferenceAsset[] = [];
+
+  for (const ref of refs) {
+    sceneRefs.push(ref);
+    const sourceUrl = toStyleDataUrl(ref);
+    const detections = [
+      ...(ref.detectedCharacters || []).map((det) => ({ ...det, kind: 'character' as const })),
+      ...(ref.detectedObjects || []).map((det) => ({ ...det, kind: 'object' as const }))
+    ].filter((det) => det.confidence >= 0.55 && det.box);
+
+    if (detections.length === 0) continue;
+
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = reject;
+      image.src = sourceUrl;
+    }).catch(() => undefined);
+
+    if (!image.width || !image.height) continue;
+
+    for (const detection of detections) {
+      const normalized = normalizeBox(detection.box);
+      if (!normalized) continue;
+
+      const padX = normalized.width * 0.08;
+      const padY = normalized.height * 0.08;
+      const padded = normalizeBox({
+        x: normalized.x - padX,
+        y: normalized.y - padY,
+        width: normalized.width + 2 * padX,
+        height: normalized.height + 2 * padY
+      });
+      const coverage = getBoxCoverage(padded);
+      if (!padded || !coverage || coverage > MAX_TIGHT_CROP_COVERAGE) continue;
+
+      const sx = Math.max(0, Math.floor(image.width * padded.x));
+      const sy = Math.max(0, Math.floor(image.height * padded.y));
+      const sw = Math.max(1, Math.floor(image.width * padded.width));
+      const sh = Math.max(1, Math.floor(image.height * padded.height));
+      if (sw < 96 || sh < 96) continue;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) continue;
+      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+      const cropData = parseDataUrl(canvas.toDataURL('image/jpeg', 0.86));
+      if (!cropData.data) continue;
+
+      entityCrops.push({
+        ...cropData,
+        kind: detection.kind,
+        source: 'crop',
+        sceneId: ref.sceneId,
+        assetRole: detection.kind === 'character' ? 'character_form' : 'object_anchor',
+        characterName: detection.kind === 'character' ? detection.name : undefined,
+        objectName: detection.kind === 'object' ? detection.name : undefined,
+        pageIndex: ref.pageIndex,
+        box: padded,
+        cropCoverage: coverage,
+        confidence: Math.max(ref.confidence || 0.5, detection.confidence),
+        qualityScore: Math.max(ref.qualityScore || 0.5, detection.confidence)
+      });
+    }
+  }
+
+  const sortByConfidence = (items: StyleReferenceAsset[]) =>
+    [...items].sort(
+      (a, b) =>
+        (b.qualityScore ?? b.confidence ?? 0) - (a.qualityScore ?? a.confidence ?? 0)
+    );
+
+  const sortedEntityCrops = sortByConfidence(entityCrops);
+  const sortedSceneRefs = sortByConfidence(sceneRefs);
+  const selected: StyleReferenceAsset[] = [];
+
+  selected.push(...sortedEntityCrops.slice(0, STYLE_REF_ENTITY_TARGET));
+  selected.push(...sortedSceneRefs.slice(0, STYLE_REF_SCENE_TARGET));
+
+  if (selected.length < STYLE_REF_LIBRARY_TOTAL) {
+    selected.push(...sortedEntityCrops.slice(STYLE_REF_ENTITY_TARGET));
+  }
+  if (selected.length < STYLE_REF_LIBRARY_TOTAL) {
+    selected.push(...sortedSceneRefs.slice(STYLE_REF_SCENE_TARGET));
+  }
+
+  return mergeStyleReferenceAssets(selected, []).slice(0, STYLE_REF_LIBRARY_TOTAL);
+};
+
 const SetupPanel: React.FC<SetupPanelProps> = ({
   publishers,
   onPrepareStory,
@@ -267,7 +475,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     try {
       let effectiveStyles = sourceStyles ?? styleReferences;
       if (effectiveStyles.length === 0) {
-        const extracted = await extractStyleReferenceAssetsFromPdf(storySource.data, 80);
+        const extracted = await extractStyleReferenceAssetsFromPdf(storySource.data, STYLE_REF_SETUP_UPLOAD_LIMIT);
         effectiveStyles = extracted.filter((item) => item.data.length > 0);
       }
 
@@ -279,14 +487,22 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         .slice(0, STYLE_REF_SETUP_UPLOAD_LIMIT)
         .map(stripStyleReferenceAsset);
       const setupResponse = await onPrepareStory(storySource, setupPayload);
+      const setupRefs = setupResponse.storyPack.styleReferences?.length
+        ? setupResponse.storyPack.styleReferences
+        : setupPayload.map((item) => toStyleReferenceAsset(item, { kind: 'scene', source: 'upload' }));
+      const enrichedRefs = await buildTightEntityCrops(setupRefs);
+      const remappedFacts = rebuildStoryFactImageMaps(setupResponse.storyPack.storyFacts, enrichedRefs);
+
       setPreparedPack((prev) => ({
         ...setupResponse.storyPack,
+        storyFacts: remappedFacts,
+        styleReferences: enrichedRefs,
         coverImage: prev?.coverImage || setupResponse.storyPack.coverImage
       }));
       setWarningsAcknowledged(false);
 
-      if (setupResponse.storyPack.styleReferences?.length) {
-        setStyleReferences(setupResponse.storyPack.styleReferences);
+      if (enrichedRefs.length > 0) {
+        setStyleReferences(enrichedRefs);
       } else if (effectiveStyles.length === 0 && setupResponse.storyPack.stylePrimer.length > 0) {
         setStyleReferences(
           setupResponse.storyPack.stylePrimer.map((item) =>
@@ -325,7 +541,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       const dataUrl = await fileToDataUrl(file);
       const storyFile: FileData = { data: dataUrl.split(',')[1] || '', mimeType: file.type };
       setCurrentStory(storyFile);
-      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(storyFile.data, 80);
+      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(storyFile.data, STYLE_REF_SETUP_UPLOAD_LIMIT);
       if (screenshotReferences.length > 0) {
         setStyleReferences(screenshotReferences);
       }
@@ -425,7 +641,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         return;
       }
 
-      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(currentStory.data, 80);
+      const screenshotReferences = await extractStyleReferenceAssetsFromPdf(currentStory.data, STYLE_REF_SETUP_UPLOAD_LIMIT);
       if (screenshotReferences.length > 0) {
         setStyleReferences(screenshotReferences);
       }
@@ -464,8 +680,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         runtimePrimerRefs.map(stripStyleReferenceAsset),
         preparedPack.stylePrimer
       ).slice(0, STYLE_REF_TOTAL);
+      const remappedFacts = rebuildStoryFactImageMaps(preparedPack.storyFacts, finalStyleRefs);
       const finalPack: StoryPack = {
         ...preparedPack,
+        storyFacts: remappedFacts,
         stylePrimer: finalPrimer,
         styleReferences: finalStyleRefs
       };
@@ -512,6 +730,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
         unmappedCharacters: [] as string[],
         unmappedObjects: [] as string[],
         unmappedScenes: [] as string[],
+        characterWideOnly: [] as string[],
+        objectWideOnly: [] as string[],
+        characterNoTightCrop: [] as string[],
+        objectNoTightCrop: [] as string[],
         lowConfidenceRefs: [] as Array<{ index: number; ref: StyleReferenceAsset }>
       };
     }
@@ -543,10 +765,56 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       })
       .slice(0, 8);
 
+    const refsByCharacter = new Map<string, StyleReferenceAsset[]>();
+    for (const ref of preparedStyleRefs) {
+      if (!ref.characterName) continue;
+      const key = ref.characterName.toLowerCase();
+      const list = refsByCharacter.get(key) || [];
+      list.push(ref);
+      refsByCharacter.set(key, list);
+    }
+
+    const refsByObject = new Map<string, StyleReferenceAsset[]>();
+    for (const ref of preparedStyleRefs) {
+      if (!ref.objectName) continue;
+      const key = ref.objectName.toLowerCase();
+      const list = refsByObject.get(key) || [];
+      list.push(ref);
+      refsByObject.set(key, list);
+    }
+
+    const characterWideOnly = (facts.characterCatalog || [])
+      .map((entry) => entry.name)
+      .filter((name) => {
+        const refs = refsByCharacter.get(name.toLowerCase()) || [];
+        return refs.length > 0 && refs.every((ref) => !isTightEntityRef(ref));
+      });
+    const objectWideOnly = (facts.objects || [])
+      .filter((name) => {
+        const refs = refsByObject.get(name.toLowerCase()) || [];
+        return refs.length > 0 && refs.every((ref) => !isTightEntityRef(ref));
+      });
+
+    const characterNoTightCrop = (facts.characterCatalog || [])
+      .map((entry) => entry.name)
+      .filter((name) => {
+        const refs = refsByCharacter.get(name.toLowerCase()) || [];
+        return !refs.some((ref) => isTightEntityRef(ref));
+      });
+    const objectNoTightCrop = (facts.objects || [])
+      .filter((name) => {
+        const refs = refsByObject.get(name.toLowerCase()) || [];
+        return !refs.some((ref) => isTightEntityRef(ref));
+      });
+
     return {
       unmappedCharacters,
       unmappedObjects,
       unmappedScenes,
+      characterWideOnly,
+      objectWideOnly,
+      characterNoTightCrop,
+      objectNoTightCrop,
       lowConfidenceRefs
     };
   }, [preparedPack, preparedStyleRefs]);
@@ -554,6 +822,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     mappingWarnings.unmappedCharacters.length > 0 ||
     mappingWarnings.unmappedObjects.length > 0 ||
     mappingWarnings.unmappedScenes.length > 0 ||
+    mappingWarnings.characterWideOnly.length > 0 ||
+    mappingWarnings.objectWideOnly.length > 0 ||
+    mappingWarnings.characterNoTightCrop.length > 0 ||
+    mappingWarnings.objectNoTightCrop.length > 0 ||
     mappingWarnings.lowConfidenceRefs.length > 0;
 
   useEffect(() => {
@@ -803,19 +1075,28 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                   </div>
                                   {mappedRefs.length > 0 && (
                                     <div className="mt-2 flex gap-2">
-                                      {mappedRefs.slice(0, 3).map((ref, index) => (
-                                        <img
-                                          key={`${character.name}-ref-${index}`}
-                                          src={toStyleDataUrl(ref)}
-                                          className="w-10 h-10 rounded-md object-cover border border-gray-200 cursor-zoom-in"
-                                          onClick={() =>
-                                            setExpandedImage({
-                                              src: toStyleDataUrl(ref),
-                                              label: `${character.name} mapped reference`
-                                            })
-                                          }
-                                        />
-                                      ))}
+                                      {mappedRefs.slice(0, 3).map((ref, index) => {
+                                        const cropCoverage = ref.cropCoverage ?? getBoxCoverage(ref.box);
+                                        return (
+                                          <div key={`${character.name}-ref-${index}`} className="relative w-10 h-10 rounded-md overflow-hidden border border-gray-200 bg-white">
+                                            <img
+                                              src={toStyleDataUrl(ref)}
+                                              className="w-full h-full object-cover cursor-zoom-in"
+                                              onClick={() =>
+                                                setExpandedImage({
+                                                  src: toStyleDataUrl(ref),
+                                                  label: `${character.name} mapped reference`
+                                                })
+                                              }
+                                            />
+                                            {typeof cropCoverage === 'number' && cropCoverage > 0 && (
+                                              <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[9px] text-center">
+                                                {Math.round(cropCoverage * 100)}%
+                                              </span>
+                                            )}
+                                          </div>
+                                        );
+                                      })}
                                     </div>
                                   )}
                                   {mappedRefs.length === 0 && (
@@ -857,19 +1138,28 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                   </div>
                                   {mappedRefs.length > 0 && (
                                     <div className="mt-2 flex gap-2">
-                                      {mappedRefs.slice(0, 3).map((ref, index) => (
-                                        <img
-                                          key={`${objectName}-ref-${index}`}
-                                          src={toStyleDataUrl(ref)}
-                                          className="w-10 h-10 rounded-md object-cover border border-gray-200 cursor-zoom-in"
-                                          onClick={() =>
-                                            setExpandedImage({
-                                              src: toStyleDataUrl(ref),
-                                              label: `${objectName} mapped reference`
-                                            })
-                                          }
-                                        />
-                                      ))}
+                                      {mappedRefs.slice(0, 3).map((ref, index) => {
+                                        const cropCoverage = ref.cropCoverage ?? getBoxCoverage(ref.box);
+                                        return (
+                                          <div key={`${objectName}-ref-${index}`} className="relative w-10 h-10 rounded-md overflow-hidden border border-gray-200 bg-white">
+                                            <img
+                                              src={toStyleDataUrl(ref)}
+                                              className="w-full h-full object-cover cursor-zoom-in"
+                                              onClick={() =>
+                                                setExpandedImage({
+                                                  src: toStyleDataUrl(ref),
+                                                  label: `${objectName} mapped reference`
+                                                })
+                                              }
+                                            />
+                                            {typeof cropCoverage === 'number' && cropCoverage > 0 && (
+                                              <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[9px] text-center">
+                                                {Math.round(cropCoverage * 100)}%
+                                              </span>
+                                            )}
+                                          </div>
+                                        );
+                                      })}
                                     </div>
                                   )}
                                   {mappedRefs.length === 0 && (
@@ -986,6 +1276,58 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                             </div>
                           )}
 
+                          {mappingWarnings.characterWideOnly.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Character Mapped Only By Wide Images</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.characterWideOnly.map((name) => (
+                                  <span key={`wide-char-${name}`} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.objectWideOnly.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">Object Mapped Only By Wide Images</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.objectWideOnly.map((name) => (
+                                  <span key={`wide-object-${name}`} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.characterNoTightCrop.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">No Tight Character Crop</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.characterNoTightCrop.map((name) => (
+                                  <span key={`no-tight-char-${name}`} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {mappingWarnings.objectNoTightCrop.length > 0 && (
+                            <div>
+                              <p className="text-xs font-bold uppercase text-amber-700">No Tight Object Crop</p>
+                              <div className="mt-1 flex flex-wrap gap-2">
+                                {mappingWarnings.objectNoTightCrop.map((name) => (
+                                  <span key={`no-tight-object-${name}`} className="px-2 py-1 rounded-full bg-white text-amber-700 text-xs font-semibold border border-amber-200">
+                                    {name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
                           {mappingWarnings.lowConfidenceRefs.length > 0 && (
                             <div>
                               <p className="text-xs font-bold uppercase text-amber-700">Low-Confidence References</p>
@@ -1060,31 +1402,45 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                 </div>
 
                 <div className="grid grid-cols-3 gap-4 mb-4">
-                  {styleReferences.map((style, idx) => (
-                    <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
-                      <img
-                        src={toStyleDataUrl(style)}
-                        className="w-full h-full object-cover cursor-zoom-in"
-                        onClick={() =>
-                          setExpandedImage({
-                            src: toStyleDataUrl(style),
-                            label: `${style.kind} reference`
-                          })
-                        }
-                      />
-                      <span className="absolute left-1 top-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-semibold uppercase">
-                        {style.kind}
-                      </span>
-                      {canEdit && (
-                        <button
-                          onClick={() => removeStyleImage(idx)}
-                          className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
-                      )}
-                    </div>
-                  ))}
+                  {styleReferences.map((style, idx) => {
+                    const confidencePct = Math.round((style.qualityScore ?? style.confidence ?? 0) * 100);
+                    const cropCoverage = style.cropCoverage ?? getBoxCoverage(style.box);
+
+                    return (
+                      <div key={idx} className="relative aspect-square rounded-xl overflow-hidden border border-gray-200 group">
+                        <img
+                          src={toStyleDataUrl(style)}
+                          className="w-full h-full object-cover cursor-zoom-in"
+                          onClick={() =>
+                            setExpandedImage({
+                              src: toStyleDataUrl(style),
+                              label: `${style.kind} reference`
+                            })
+                          }
+                        />
+                        <span className="absolute left-1 top-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-semibold uppercase">
+                          {style.kind}
+                        </span>
+                        <span className="absolute right-1 top-1 px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px] font-semibold uppercase">
+                          {style.source}
+                        </span>
+                        <div className="absolute inset-x-0 bottom-0 bg-black/55 text-white px-1.5 py-1 flex items-center justify-between text-[10px] font-semibold">
+                          <span>{confidencePct}%</span>
+                          {typeof cropCoverage === 'number' && cropCoverage > 0 && (
+                            <span>crop {Math.round(cropCoverage * 100)}%</span>
+                          )}
+                        </div>
+                        {canEdit && (
+                          <button
+                            onClick={() => removeStyleImage(idx)}
+                            className="absolute top-7 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
 
                   {canEdit && (
                     <button

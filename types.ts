@@ -34,6 +34,8 @@ export interface StyleReferenceAsset extends FileData {
   objectName?: string;
   sceneId?: string;
   assetRole?: StyleAssetRole;
+  box?: StyleReferenceBox;
+  cropCoverage?: number; // normalized area 0..1
   pageIndex?: number;
   confidence?: number;
   qualityScore?: number;
@@ -87,6 +89,7 @@ export interface Option {
   isCorrect?: boolean;
   renderMode?: RenderMode;
   supportLevel?: number;
+  debug?: TurnCardDebug;
 }
 
 export interface ChatTurn {
@@ -161,6 +164,11 @@ export interface TurnContextParticipants {
   objects: string[];
   inferredCharacters: string[];
   inferredObjects: string[];
+}
+
+export interface TurnCardDebug {
+  selectedStyleRefIndexes?: number[];
+  selectedParticipants?: TurnContextParticipants;
 }
 
 export interface StoryCharacterFact {

@@ -31,6 +31,7 @@ const MAX_OBJECT_REFS_PER_OBJECT = 4;
 const MAX_SCENE_REFS_PER_SCENE = 4;
 const MIN_DETECTION_CONFIDENCE = 0.45;
 const LOW_CONFIDENCE_WARNING_THRESHOLD = 0.7;
+const MAX_ENTITY_CROP_COVERAGE = 0.6;
 const MAX_SCENE_ALIASES = 5;
 const MAX_SCENE_FACTS = 16;
 
@@ -594,6 +595,31 @@ const normalizeConfidence = (value, fallback = 0.5) => {
   return Math.max(0, Math.min(1, n));
 };
 
+const normalizeStyleBox = (box) => {
+  if (!box || typeof box !== 'object') return undefined;
+
+  const x = Math.max(0, Math.min(1, Number(box.x) || 0));
+  const y = Math.max(0, Math.min(1, Number(box.y) || 0));
+  const width = Math.max(0, Math.min(1, Number(box.width) || 0));
+  const height = Math.max(0, Math.min(1, Number(box.height) || 0));
+  if (width <= 0 || height <= 0) {
+    return undefined;
+  }
+
+  return {
+    x,
+    y,
+    width: Math.min(width, 1 - x),
+    height: Math.min(height, 1 - y)
+  };
+};
+
+const computeCropCoverage = (box, fallback = undefined) => {
+  const normalized = normalizeStyleBox(box);
+  if (!normalized) return fallback;
+  return Math.max(0, Math.min(1, normalized.width * normalized.height));
+};
+
 const styleRefFingerprint = (item) => {
   if (!item?.data || !item?.mimeType) return '';
   const middleStart = Math.max(0, Math.floor(item.data.length / 2) - 24);
@@ -627,6 +653,8 @@ const normalizeStyleReferenceAssets = (styleRefs, fallbackSource = 'upload', ded
       objectName: normalizePhrase(ref.objectName || ''),
       sceneId: ref.sceneId ? toSceneId(ref.sceneId) : '',
       assetRole: normalizeStyleAssetRole(ref.assetRole, 'scene_anchor'),
+      box: normalizeStyleBox(ref.box),
+      cropCoverage: computeCropCoverage(ref.box, normalizeConfidence(ref.cropCoverage, undefined)),
       pageIndex: Number.isInteger(ref.pageIndex) ? Number(ref.pageIndex) : undefined,
       confidence: normalizeConfidence(ref.confidence, 0.5),
       qualityScore: normalizeConfidence(ref.qualityScore, 0.5),
@@ -635,7 +663,8 @@ const normalizeStyleReferenceAssets = (styleRefs, fallbackSource = 'upload', ded
         ? ref.detectedCharacters
             .map((entry) => ({
               name: normalizePhrase(entry?.name || ''),
-              confidence: normalizeConfidence(entry?.confidence, 0.5)
+              confidence: normalizeConfidence(entry?.confidence, 0.5),
+              box: normalizeStyleBox(entry?.box)
             }))
             .filter((entry) => entry.name)
             .slice(0, 4)
@@ -644,7 +673,8 @@ const normalizeStyleReferenceAssets = (styleRefs, fallbackSource = 'upload', ded
         ? ref.detectedObjects
             .map((entry) => ({
               name: normalizePhrase(entry?.name || ''),
-              confidence: normalizeConfidence(entry?.confidence, 0.5)
+              confidence: normalizeConfidence(entry?.confidence, 0.5),
+              box: normalizeStyleBox(entry?.box)
             }))
             .filter((entry) => entry.name)
             .slice(0, 4)
@@ -927,14 +957,7 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
       .map((item) => {
         const name = normalizeToAllowedName(item?.name, allowedCharacters);
         if (!name) return null;
-        const box = item?.box
-          ? {
-              x: Math.max(0, Math.min(1, Number(item.box.x) || 0)),
-              y: Math.max(0, Math.min(1, Number(item.box.y) || 0)),
-              width: Math.max(0, Math.min(1, Number(item.box.width) || 0)),
-              height: Math.max(0, Math.min(1, Number(item.box.height) || 0))
-            }
-          : undefined;
+        const box = normalizeStyleBox(item?.box);
         return {
           name,
           confidence: normalizeConfidence(item?.confidence, classification?.confidence || 0.6),
@@ -946,14 +969,7 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
       .map((item) => {
         const name = normalizeToAllowedName(item?.name, allowedObjects);
         if (!name) return null;
-        const box = item?.box
-          ? {
-              x: Math.max(0, Math.min(1, Number(item.box.x) || 0)),
-              y: Math.max(0, Math.min(1, Number(item.box.y) || 0)),
-              width: Math.max(0, Math.min(1, Number(item.box.width) || 0)),
-              height: Math.max(0, Math.min(1, Number(item.box.height) || 0))
-            }
-          : undefined;
+        const box = normalizeStyleBox(item?.box);
         return {
           name,
           confidence: normalizeConfidence(item?.confidence, classification?.confidence || 0.6),
@@ -974,6 +990,22 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
     if (characterName) kind = 'character';
     else if (objectName && kind !== 'character') kind = 'object';
 
+    const primaryCharacter = characters
+      .filter((item) => item.name === characterName)
+      .sort((a, b) => b.confidence - a.confidence)[0];
+    const primaryObject = objects
+      .filter((item) => item.name === objectName)
+      .sort((a, b) => b.confidence - a.confidence)[0];
+    const primaryBox = kind === 'character'
+      ? primaryCharacter?.box
+      : kind === 'object'
+        ? primaryObject?.box
+        : undefined;
+    const cropCoverage = computeCropCoverage(
+      primaryBox,
+      computeCropCoverage(reference.box, reference.cropCoverage)
+    );
+
     return {
       ...reference,
       kind,
@@ -984,6 +1016,8 @@ const mergeStyleReferenceClassification = (styleRefs, classifications, storyFact
       ),
       characterName: characterName || undefined,
       objectName: objectName || undefined,
+      box: primaryBox || normalizeStyleBox(reference.box),
+      cropCoverage,
       confidence: normalizeConfidence(classification?.confidence, reference.confidence ?? 0.5),
       qualityScore: normalizeConfidence(classification?.confidence, reference.qualityScore ?? 0.5),
       detectedCharacters: characters.map((item) => ({
@@ -1058,6 +1092,23 @@ const mergeStyleReferencePools = (...groups) => {
   return merged;
 };
 
+const isTightMappedRef = (reference, kind) => {
+  if (!reference || reference.kind !== kind) {
+    return false;
+  }
+
+  if (reference.source === 'pdf_page' && kind !== 'scene') {
+    return false;
+  }
+
+  const coverage = Number(reference.cropCoverage);
+  if (!Number.isFinite(coverage) || coverage <= 0) {
+    return false;
+  }
+
+  return coverage <= MAX_ENTITY_CROP_COVERAGE;
+};
+
 const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
   const characterBuckets = new Map();
   const objectBuckets = new Map();
@@ -1092,9 +1143,10 @@ const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
         .map((entry) => normalizeToAllowedName(entry?.name, allowedCharacters))
     ].filter(Boolean);
 
+    const canUseCharacterRef = isTightMappedRef(reference, 'character');
     for (const characterName of [...new Set(detectedCharacterNames)]) {
       const list = characterBuckets.get(characterName) || [];
-      if (!list.includes(index) && list.length < MAX_CHARACTER_REFS_PER_CHARACTER) {
+      if (canUseCharacterRef && !list.includes(index) && list.length < MAX_CHARACTER_REFS_PER_CHARACTER) {
         list.push(index);
         characterBuckets.set(characterName, list);
       }
@@ -1116,9 +1168,10 @@ const buildEntityImageMapsFromStyleRefs = (styleRefs, storyFacts) => {
         .map((entry) => normalizeToAllowedName(entry?.name, allowedObjects))
     ].filter(Boolean);
 
+    const canUseObjectRef = isTightMappedRef(reference, 'object');
     for (const objectName of [...new Set(detectedObjectNames)]) {
       const list = objectBuckets.get(objectName) || [];
-      if (!list.includes(index) && list.length < MAX_OBJECT_REFS_PER_OBJECT) {
+      if (canUseObjectRef && !list.includes(index) && list.length < MAX_OBJECT_REFS_PER_OBJECT) {
         list.push(index);
         objectBuckets.set(objectName, list);
       }
@@ -1883,7 +1936,7 @@ const inferSceneIdsFromText = (text, storyFacts) => {
   return [...new Set(fallback)];
 };
 
-const buildTurnContextParticipants = (text, storyFacts, refsWithMeta, questionParticipants) => {
+const buildTurnContextParticipantsHeuristic = (text, storyFacts, refsWithMeta, questionParticipants) => {
   const explicitScenes = inferSceneIdsFromText(text, storyFacts);
   const scenes = explicitScenes.length > 0
     ? explicitScenes
@@ -1910,6 +1963,122 @@ const buildTurnContextParticipants = (text, storyFacts, refsWithMeta, questionPa
     scenes,
     characters: explicitCharacters,
     objects: explicitObjects,
+    inferredCharacters: inferredCharacters.slice(0, 3),
+    inferredObjects: inferredObjects.slice(0, 3)
+  };
+};
+
+const extractParticipantsWithModel = async (ai, text, storyFacts) => {
+  const allowedScenes = (storyFacts?.sceneCatalog || []).map((scene) => ({
+    id: scene.id,
+    title: scene.title,
+    aliases: scene.aliases || []
+  }));
+  const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
+  const allowedObjects = (storyFacts?.objects || []).filter(Boolean);
+
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: {
+        parts: [
+          {
+            text: [
+              'Extract participating entities from the text.',
+              `Text: ${text}`,
+              `Allowed scene IDs: ${allowedScenes.map((scene) => scene.id).join(', ') || 'none'}`,
+              `Allowed scene aliases: ${allowedScenes.map((scene) => `${scene.id}:${scene.title} ${(scene.aliases || []).join('|')}`).join('; ') || 'none'}`,
+              `Allowed characters: ${allowedCharacters.join(', ') || 'none'}`,
+              `Allowed objects: ${allowedObjects.join(', ') || 'none'}`,
+              'Return strict JSON only.',
+              'JSON schema:',
+              '{ "scene_ids": string[], "character_names": string[], "object_names": string[] }',
+              'Rules:',
+              '- Use only values from allowed lists.',
+              '- If no match, return empty arrays.'
+            ].join('\n')
+          }
+        ]
+      },
+      config: {
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            scene_ids: { type: Type.ARRAY, items: { type: Type.STRING } },
+            character_names: { type: Type.ARRAY, items: { type: Type.STRING } },
+            object_names: { type: Type.ARRAY, items: { type: Type.STRING } }
+          },
+          required: ['scene_ids', 'character_names', 'object_names']
+        }
+      }
+    })
+  );
+
+  const payload = parseJsonSafe(response.text, {
+    scene_ids: [],
+    character_names: [],
+    object_names: []
+  });
+
+  const sceneIdSet = new Set(allowedScenes.map((scene) => String(scene.id || '').toLowerCase()));
+  const characterNameSet = new Set(allowedCharacters.map((name) => name.toLowerCase()));
+  const objectNameSet = new Set(allowedObjects.map((name) => name.toLowerCase()));
+
+  const scenes = (Array.isArray(payload.scene_ids) ? payload.scene_ids : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => sceneIdSet.has(item.toLowerCase()));
+  const characters = (Array.isArray(payload.character_names) ? payload.character_names : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => characterNameSet.has(item.toLowerCase()));
+  const objects = (Array.isArray(payload.object_names) ? payload.object_names : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => objectNameSet.has(item.toLowerCase()));
+
+  return {
+    scenes: [...new Set(scenes)].slice(0, 4),
+    characters: [...new Set(characters)].slice(0, 4),
+    objects: [...new Set(objects)].slice(0, 4)
+  };
+};
+
+const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta, questionParticipants) => {
+  const heuristic = buildTurnContextParticipantsHeuristic(text, storyFacts, refsWithMeta, questionParticipants);
+
+  let structured = null;
+  try {
+    structured = await extractParticipantsWithModel(ai, text, storyFacts);
+  } catch (error) {
+    console.warn('[turn] participant extraction fallback to heuristic', error?.message || error);
+  }
+
+  const scenes = structured?.scenes?.length
+    ? structured.scenes
+    : heuristic.scenes;
+  const characters = structured?.characters?.length
+    ? structured.characters
+    : heuristic.characters;
+  const objects = structured?.objects?.length
+    ? structured.objects
+    : heuristic.objects;
+
+  const inferredCharacters = [];
+  const inferredObjects = [];
+  for (const ref of refsWithMeta) {
+    if (!scenes.includes(ref.sceneId || '')) continue;
+    if (ref.characterName && !characters.includes(ref.characterName) && !inferredCharacters.includes(ref.characterName)) {
+      inferredCharacters.push(ref.characterName);
+    }
+    if (ref.objectName && !objects.includes(ref.objectName) && !inferredObjects.includes(ref.objectName)) {
+      inferredObjects.push(ref.objectName);
+    }
+  }
+
+  return {
+    scenes: [...new Set(scenes)].slice(0, 4),
+    characters: [...new Set(characters)].slice(0, 4),
+    objects: [...new Set(objects)].slice(0, 4),
     inferredCharacters: inferredCharacters.slice(0, 3),
     inferredObjects: inferredObjects.slice(0, 3)
   };
@@ -1976,7 +2145,7 @@ const pickRankedRefs = ({
   }
 };
 
-const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, optionText, questionParticipants) => {
+const selectStyleRefsForOption = async (ai, stylePrimer, styleReferences, storyFacts, optionText, questionParticipants) => {
   const refsSource = Array.isArray(styleReferences) && styleReferences.length > 0
     ? styleReferences
     : (Array.isArray(stylePrimer) ? stylePrimer.map((item) => ({ ...item, kind: 'scene', source: 'upload' })) : []);
@@ -1985,25 +2154,24 @@ const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, opti
     'upload',
     false
   ).slice(0, STYLE_REF_POOL_LIMIT);
-  const participants = buildTurnContextParticipants(optionText, storyFacts, refsWithMeta, questionParticipants);
+  const participants = await resolveTurnContextParticipants(ai, optionText, storyFacts, refsWithMeta, questionParticipants);
   const selectedRefs = [];
   const selectedIndexes = new Set();
   const categoryPenaltyTracker = new Map();
 
-  const dynamicSceneTarget = participants.scenes.length > 0 ? 6 : 4;
+  const dynamicSceneTarget = participants.scenes.length > 0 ? 6 : 0;
   const dynamicCharacterTarget =
-    participants.characters.length + participants.inferredCharacters.length > 0 ? 6 : 4;
+    participants.characters.length + participants.inferredCharacters.length > 0 ? 6 : 0;
   const dynamicObjectTarget =
-    participants.objects.length + participants.inferredObjects.length > 0 ? 4 : 2;
+    participants.objects.length + participants.inferredObjects.length > 0 ? 4 : 0;
 
   pickRankedRefs({
     refsWithMeta,
     selectedIndexes,
     selectedRefs,
     predicate: (reference) =>
-      participants.scenes.length === 0
-        ? reference.kind === 'scene'
-        : participants.scenes.includes(reference.sceneId || '') || (reference.kind === 'scene' && !reference.sceneId),
+      reference.kind === 'scene' &&
+      participants.scenes.includes(reference.sceneId || ''),
     targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget),
     participants,
     categoryPenaltyTracker
@@ -2014,9 +2182,9 @@ const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, opti
     selectedIndexes,
     selectedRefs,
     predicate: (reference) =>
-      reference.kind === 'character' ||
-      participants.characters.includes(reference.characterName || '') ||
-      participants.inferredCharacters.includes(reference.characterName || ''),
+      isTightMappedRef(reference, 'character') &&
+      (participants.characters.includes(reference.characterName || '') ||
+        participants.inferredCharacters.includes(reference.characterName || '')),
     targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget),
     participants,
     categoryPenaltyTracker
@@ -2027,27 +2195,34 @@ const selectStyleRefsForOption = (stylePrimer, styleReferences, storyFacts, opti
     selectedIndexes,
     selectedRefs,
     predicate: (reference) =>
-      reference.kind === 'object' ||
-      participants.objects.includes(reference.objectName || '') ||
-      participants.inferredObjects.includes(reference.objectName || ''),
+      isTightMappedRef(reference, 'object') &&
+      (participants.objects.includes(reference.objectName || '') ||
+        participants.inferredObjects.includes(reference.objectName || '')),
     targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget + dynamicObjectTarget),
     participants,
     categoryPenaltyTracker
   });
 
-  pickRankedRefs({
-    refsWithMeta,
-    selectedIndexes,
-    selectedRefs,
-    predicate: () => true,
-    targetCount: STYLE_REF_MAX_TOTAL,
-    participants,
-    categoryPenaltyTracker
-  });
+  if (selectedRefs.length === 0 && Array.isArray(questionParticipants?.scenes) && questionParticipants.scenes.length > 0) {
+    pickRankedRefs({
+      refsWithMeta,
+      selectedIndexes,
+      selectedRefs,
+      predicate: (reference) =>
+        reference.kind === 'scene' && questionParticipants.scenes.includes(reference.sceneId || ''),
+      targetCount: 1,
+      participants: {
+        ...participants,
+        scenes: questionParticipants.scenes
+      },
+      categoryPenaltyTracker
+    });
+  }
 
   return {
     refs: selectedRefs.slice(0, STYLE_REF_MAX_TOTAL),
-    participants
+    participants,
+    selectedStyleRefIndexes: [...selectedIndexes].slice(0, STYLE_REF_MAX_TOTAL)
   };
 };
 
@@ -2477,7 +2652,8 @@ export const runTurnPipeline = async (
   }
 
   const optionsStart = performance.now();
-  const questionParticipants = buildTurnContextParticipants(
+  const questionParticipants = await resolveTurnContextParticipants(
+    ai,
     question,
     normalizedFacts,
     effectiveStyleReferences,
@@ -2544,12 +2720,19 @@ export const runTurnPipeline = async (
     cards.map(async (card) => {
       const start = performance.now();
       const parts = [];
-      const { refs: refsForOption, participants } = selectStyleRefsForOption(
+      const { refs: refsForOption, participants, selectedStyleRefIndexes } = await selectStyleRefsForOption(
+        ai,
         effectiveStylePrimer,
         effectiveStyleReferences,
         normalizedFacts,
         card.text,
         questionParticipants
+      );
+      console.info(
+        `[turn] ${card.id} selected_refs=${selectedStyleRefIndexes.join(',') || 'none'} ` +
+          `participants scenes=${participants.scenes.join('|') || 'none'} ` +
+          `chars=${participants.characters.join('|') || 'none'} ` +
+          `objects=${participants.objects.join('|') || 'none'}`
       );
 
       for (const ref of refsForOption) {
@@ -2577,6 +2760,10 @@ export const runTurnPipeline = async (
       }
 
       card.isLoadingImage = false;
+      card.debug = {
+        selectedStyleRefIndexes,
+        selectedParticipants: participants
+      };
       imageMsById[card.id] = Math.round(performance.now() - start);
     })
   );

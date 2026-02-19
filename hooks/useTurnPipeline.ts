@@ -7,7 +7,7 @@ import * as GeminiService from '../services/geminiService';
 
 const MAX_HISTORY_TURNS_FOR_BACKEND = 6;
 const MAX_HISTORY_TEXT_CHARS = 120;
-const MAX_TURN_STYLE_REFS = 48;
+const MAX_TURN_STYLE_REFS = 120;
 
 type TtsResponse = { audioBase64: string; mimeType: string; audioBuffer?: AudioBuffer } | null;
 
