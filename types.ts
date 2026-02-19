@@ -169,6 +169,9 @@ export interface TurnContextParticipants {
 export interface TurnCardDebug {
   selectedStyleRefIndexes?: number[];
   selectedParticipants?: TurnContextParticipants;
+  imagePrompt?: string;
+  imageModel?: string;
+  imageGenerationError?: string;
 }
 
 export interface StoryCharacterFact {

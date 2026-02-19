@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { BookOpen, Key, ArrowRight, RotateCcw, RefreshCw, AlertCircle, Library as LibraryIcon } from 'lucide-react';
-import { AppMode, FileData, Publisher, StoryAssets, StoryManifest, StoryMetadata, StoryPack } from './types';
+import { BookOpen, Key, ArrowRight, RotateCcw, RefreshCw, AlertCircle, Library as LibraryIcon, Bug, X } from 'lucide-react';
+import { AppMode, FileData, Option, Publisher, StoryAssets, StoryManifest, StoryMetadata, StoryPack, StyleReferenceAsset } from './types';
 import { USE_BACKEND_PIPELINE } from './services/apiClient';
 import RecordButton from './components/RecordButton';
 import OptionCard from './components/OptionCard';
@@ -27,6 +27,8 @@ const App: React.FC = () => {
   const [hasApiKey, setHasApiKey] = useState(USE_BACKEND_PIPELINE);
   const [currentMode, setCurrentMode] = useState<AppMode>(AppMode.LIBRARY);
   const [setupView, setSetupView] = useState<SetupViewState | null>(null);
+  const [showAiDebug, setShowAiDebug] = useState(false);
+  const [expandedDebugImage, setExpandedDebugImage] = useState<{ src: string; label?: string } | null>(null);
   const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
   const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
@@ -203,6 +205,33 @@ const App: React.FC = () => {
     await selectOption(option);
   }, [selectOption]);
 
+  const getStyleRefByIndex = useCallback((index: number): StyleReferenceAsset | FileData | null => {
+    if (!Number.isInteger(index) || index < 0) {
+      return null;
+    }
+
+    const refs = activeAssets?.styleReferences || [];
+    if (index < refs.length) {
+      return refs[index];
+    }
+
+    const primer = activeAssets?.stylePrimer || [];
+    if (index < primer.length) {
+      return primer[index];
+    }
+
+    return null;
+  }, [activeAssets]);
+
+  const toDataUrl = useCallback((file: StyleReferenceAsset | FileData | null | undefined): string => {
+    if (!file?.data || !file?.mimeType) {
+      return '';
+    }
+    return `data:${file.mimeType};base64,${file.data}`;
+  }, []);
+
+  const hasTurnDebug = options.some((opt) => Boolean(opt.debug));
+
   const handleSaveExistingSetup = useCallback(async (payload: ExistingSetupUpdatePayload) => {
     const existingManifest = stories.find((story) => story.id === payload.storyId);
     const existingAssetsPdf = setupView?.storyId === payload.storyId
@@ -313,6 +342,16 @@ const App: React.FC = () => {
           )}
           {currentMode === AppMode.STORY && (
             <>
+              {hasTurnDebug && (
+                <button
+                  onClick={() => setShowAiDebug((prev) => !prev)}
+                  className={`px-4 py-2 rounded-full shadow-md transition font-bold flex items-center gap-2 ${
+                    showAiDebug ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-white text-gray-500'
+                  }`}
+                >
+                  <Bug className="w-5 h-5" /> {showAiDebug ? 'Hide AI Debug' : 'AI Debug'}
+                </button>
+              )}
               {conversationHistory.length > 0 && (
                 <button onClick={resetConversation} className="p-3 bg-white rounded-full shadow-md hover:shadow-lg transition text-gray-500 hover:text-red-500">
                   <RotateCcw className="w-6 h-6" />
@@ -394,6 +433,81 @@ const App: React.FC = () => {
               )}
             </div>
 
+            {showAiDebug && hasTurnDebug && (
+              <div className="w-full mb-6 rounded-2xl border border-red-200 bg-white/95 p-4 shadow-sm">
+                <div className="flex items-center gap-2 mb-3 text-red-700">
+                  <Bug className="w-4 h-4" />
+                  <h3 className="text-sm font-bold uppercase tracking-wider">AI Request Debug</h3>
+                </div>
+                <div className="space-y-4">
+                  {options.map((option: Option) => {
+                    const debug = option.debug;
+                    if (!debug) return null;
+
+                    const selectedRefs = (debug.selectedStyleRefIndexes || [])
+                      .map((idx) => {
+                        const ref = getStyleRefByIndex(idx);
+                        return ref ? { idx, ref } : null;
+                      })
+                      .filter((entry): entry is { idx: number; ref: StyleReferenceAsset | FileData } => Boolean(entry));
+
+                    return (
+                      <div key={`debug-${option.id}`} className="rounded-xl border border-gray-200 p-3 bg-gray-50/60">
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                          <span className="px-2 py-1 rounded-full bg-white border border-gray-200 text-xs font-semibold">
+                            {option.text}
+                          </span>
+                          {debug.imageModel && (
+                            <span className="px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 text-xs font-semibold">
+                              model: {debug.imageModel}
+                            </span>
+                          )}
+                          <span className="px-2 py-1 rounded-full bg-slate-100 text-slate-700 text-xs font-semibold">
+                            refs: {(debug.selectedStyleRefIndexes || []).length}
+                          </span>
+                          {debug.imageGenerationError && (
+                            <span className="px-2 py-1 rounded-full bg-red-50 text-red-600 text-xs font-semibold">
+                              error: {debug.imageGenerationError}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="text-[11px] text-gray-600 font-mono mb-2 break-words">
+                          scenes: {(debug.selectedParticipants?.scenes || []).join(', ') || 'none'} | chars: {(debug.selectedParticipants?.characters || []).join(', ') || 'none'} | objects: {(debug.selectedParticipants?.objects || []).join(', ') || 'none'}
+                        </div>
+
+                        {selectedRefs.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {selectedRefs.map(({ idx, ref }) => {
+                              const src = toDataUrl(ref);
+                              return (
+                                <button
+                                  key={`${option.id}-ref-${idx}`}
+                                  onClick={() => setExpandedDebugImage({ src, label: `Ref #${idx} for "${option.text}"` })}
+                                  className="relative w-14 h-14 rounded-md overflow-hidden border border-gray-200 bg-white"
+                                >
+                                  <img src={src} className="w-full h-full object-cover" />
+                                  <span className="absolute bottom-0 left-0 right-0 bg-black/55 text-white text-[10px] text-center">
+                                    #{idx}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {debug.imagePrompt && (
+                          <pre className="text-[11px] leading-relaxed bg-white border border-gray-200 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap text-gray-700">
+                            {debug.imagePrompt}
+                          </pre>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <div className="sticky bottom-8 z-20">
               <RecordButton onRecordingComplete={processRecording} isProcessing={isBusy} />
             </div>
@@ -419,6 +533,35 @@ const App: React.FC = () => {
             setCurrentMode(AppMode.LIBRARY);
           }}
         />
+      )}
+
+      {expandedDebugImage && (
+        <div
+          className="fixed inset-0 z-[80] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6"
+          onClick={() => setExpandedDebugImage(null)}
+        >
+          <div
+            className="relative bg-white rounded-2xl p-3 max-w-4xl w-full max-h-[88vh] shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              onClick={() => setExpandedDebugImage(null)}
+              className="absolute top-3 right-3 z-10 p-2 rounded-full bg-black/70 text-white hover:bg-black"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <img
+              src={expandedDebugImage.src}
+              alt={expandedDebugImage.label || 'Reference preview'}
+              className="w-full max-h-[78vh] object-contain rounded-lg bg-gray-50"
+            />
+            {expandedDebugImage.label && (
+              <p className="mt-2 text-xs font-semibold text-gray-600 text-center">
+                {expandedDebugImage.label}
+              </p>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

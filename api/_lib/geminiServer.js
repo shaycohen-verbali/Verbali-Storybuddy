@@ -1788,22 +1788,46 @@ const determineRenderMode = (optionText, isCorrect, supportLevel, storyFacts, st
   return RENDER_MODE_STANDALONE;
 };
 
-const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, participants }) => {
+const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyFacts, participants, selectedRefs }) => {
   const allowedCharacterEntries = (storyFacts?.characterCatalog || [])
     .map((entry) => ({
       name: normalizePhrase(entry?.name),
       source: normalizeCharacterSource(entry?.source)
     }))
     .filter((entry) => entry.name);
+  const characterSourceMap = new Map(
+    allowedCharacterEntries.map((entry) => [entry.name.toLowerCase(), entry.source])
+  );
+  const selectedCharacterNames = [...new Set(
+    (Array.isArray(selectedRefs) ? selectedRefs : [])
+      .map((ref) => normalizePhrase(ref?.characterName || ''))
+      .filter(Boolean)
+  )];
+  const selectedObjectNames = [...new Set(
+    (Array.isArray(selectedRefs) ? selectedRefs : [])
+      .map((ref) => normalizePhrase(ref?.objectName || ''))
+      .filter(Boolean)
+  )];
   const participantCharacterSet = new Set([
     ...(participants?.characters || []),
     ...(participants?.inferredCharacters || [])
   ]);
-  const allowedCharacters = allowedCharacterEntries
-    .map((entry) => entry.name)
-    .filter((name) => participantCharacterSet.size === 0 || participantCharacterSet.has(name))
-    .slice(0, 12);
-  const allowedObjects = [...new Set([...(participants?.objects || []), ...(participants?.inferredObjects || [])])].slice(0, 12);
+  const participantObjectSet = new Set([
+    ...(participants?.objects || []),
+    ...(participants?.inferredObjects || [])
+  ]);
+  const allowedCharacters = (
+    selectedCharacterNames.length > 0
+      ? selectedCharacterNames
+      : allowedCharacterEntries
+          .map((entry) => entry.name)
+          .filter((name) => participantCharacterSet.size === 0 || participantCharacterSet.has(name))
+  ).slice(0, 12);
+  const allowedObjects = (
+    selectedObjectNames.length > 0
+      ? selectedObjectNames
+      : [...participantObjectSet]
+  ).slice(0, 12);
   const sceneCatalog = storyFacts?.sceneCatalog || [];
   const participantScenes = (participants?.scenes || [])
     .map((id) => sceneCatalog.find((scene) => scene.id === id))
@@ -1817,7 +1841,7 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
 
   const characterRules = allowedCharacters.length > 0
     ? [
-        `- Allowed characters from this book only: ${allowedCharacterEntries.map((entry) => `${entry.name} (${entry.source})`).join(', ')}.`,
+        `- Allowed characters from this book only: ${allowedCharacters.map((name) => `${name} (${characterSourceMap.get(name.toLowerCase()) || 'book'})`).join(', ')}.`,
         '- Never invent new people, animals, fish, or creatures not in the allowed list.',
         '- If a character is needed, use only one of the allowed characters.',
         optionUsesKnownCharacter
@@ -1839,6 +1863,12 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     participantCharacterSet.size > 0
       ? `- Character visual anchors from references: ${[...participantCharacterSet].join(', ')}.`
       : '- Use reference style consistency for all visible characters.',
+    selectedCharacterNames.length > 0
+      ? `- Characters visible in selected references: ${selectedCharacterNames.join(', ')}.`
+      : '- If characters appear, match selected references exactly.',
+    selectedObjectNames.length > 0
+      ? `- Objects visible in selected references: ${selectedObjectNames.join(', ')}.`
+      : '- If objects appear, match selected references exactly.',
     allowedObjects.length > 0
       ? `- Allowed objects for this card: ${allowedObjects.join(', ')}.`
       : '- Keep object vocabulary limited to book objects only.',
@@ -2728,41 +2758,60 @@ export const runTurnPipeline = async (
         card.text,
         questionParticipants
       );
+      const refSummary = refsForOption
+        .map((ref, idx) => {
+          const linkedIndex = selectedStyleRefIndexes[idx];
+          const entity = ref.characterName || ref.objectName || ref.sceneId || 'none';
+          const coverage = Number.isFinite(Number(ref.cropCoverage))
+            ? `${Math.round(Number(ref.cropCoverage) * 100)}%`
+            : '-';
+          return `${Number.isInteger(linkedIndex) ? linkedIndex : '?'}:${ref.kind}:${entity}:${coverage}`;
+        })
+        .join(';');
       console.info(
         `[turn] ${card.id} selected_refs=${selectedStyleRefIndexes.join(',') || 'none'} ` +
           `participants scenes=${participants.scenes.join('|') || 'none'} ` +
           `chars=${participants.characters.join('|') || 'none'} ` +
-          `objects=${participants.objects.join('|') || 'none'}`
+          `objects=${participants.objects.join('|') || 'none'} ` +
+          `refs_meta=${refSummary || 'none'}`
       );
 
       for (const ref of refsForOption) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
       }
 
-      parts.push({
-        text: buildImagePrompt({
-          optionText: card.text,
-          renderMode: card.renderMode,
-          storyBrief,
-          artStyle,
-          storyFacts: normalizedFacts,
-          participants
-        })
+      const imagePrompt = buildImagePrompt({
+        optionText: card.text,
+        renderMode: card.renderMode,
+        storyBrief,
+        artStyle,
+        storyFacts: normalizedFacts,
+        participants,
+        selectedRefs: refsForOption
       });
 
+      parts.push({
+        text: imagePrompt
+      });
+
+      let imageGenerationError = '';
       try {
         card.imageUrl = (
           await retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1'), 1, 350)
         ) || undefined;
       } catch (error) {
         console.warn('[image] generation failed', card.id, error?.message || error);
+        imageGenerationError = String(error?.message || error || 'image generation failed');
         card.imageUrl = undefined;
       }
 
       card.isLoadingImage = false;
       card.debug = {
         selectedStyleRefIndexes,
-        selectedParticipants: participants
+        selectedParticipants: participants,
+        imagePrompt,
+        imageModel: IMAGE_MODEL,
+        imageGenerationError: imageGenerationError || undefined
       };
       imageMsById[card.id] = Math.round(performance.now() - start);
     })
