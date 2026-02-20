@@ -23,6 +23,10 @@ const IMAGE_MODEL = REPLICATE_IMAGE_MODEL;
 const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
 const MIN_STYLE_REF_GROUNDING = 4;
+const REQUIRED_CHARACTER_REF_QUOTA = 2;
+const STYLE_REF_STYLE_ANCHOR_MIN = 2;
+const STYLE_REF_STYLE_ANCHOR_MAX = 3;
+const STYLE_REF_OBJECT_OPTIONAL_QUOTA = 1;
 const STYLE_REF_INDEX_LIMIT = 240;
 const STYLE_REF_POOL_LIMIT = 120;
 const STYLE_REF_CLASSIFY_BATCH_SIZE = 12;
@@ -40,6 +44,19 @@ const MAX_SCENE_FACTS = 16;
 const QA_PACKAGE_VERSION = '1.0.0';
 const MIN_STYLE_BIBLE_REFS = 5;
 const MAX_STYLE_BIBLE_REFS = 20;
+const INTERACTION_KEYWORDS = [
+  'between',
+  'with',
+  'fight',
+  'argue',
+  'conflict',
+  'mad at',
+  'upset with',
+  'problem with',
+  'disagree',
+  'hit',
+  'push'
+];
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -640,6 +657,102 @@ const normalizeObjectEvidenceMap = (input, objects) => {
     });
   }
   return output;
+};
+
+const normalizeTriggerTerms = (terms, limit = 8) =>
+  normalizeFactList(terms, limit).map((term) => canonicalOption(term)).filter(Boolean);
+
+const normalizeInteractionPairs = (pairs, characterCatalog) => {
+  const allowedCharacters = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [canonicalOption(entry?.name || ''), normalizePhrase(entry?.name || '')])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const normalized = [];
+  const seen = new Set();
+
+  for (const pair of Array.isArray(pairs) ? pairs : []) {
+    const primary = allowedCharacters.get(canonicalOption(pair?.primary || ''));
+    const counterpart = allowedCharacters.get(canonicalOption(pair?.counterpart || ''));
+    if (!primary || !counterpart || primary === counterpart) {
+      continue;
+    }
+
+    const triggerTerms = normalizeTriggerTerms(pair?.triggerTerms || pair?.trigger_terms || []);
+    const key = `${primary.toLowerCase()}::${counterpart.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    normalized.push({
+      triggerTerms: triggerTerms.length > 0 ? triggerTerms : ['between', 'other fish', 'fight', 'with'],
+      primary,
+      counterpart
+    });
+    if (normalized.length >= 16) break;
+  }
+
+  return normalized;
+};
+
+const buildInteractionPairsFromStoryFacts = (storyFacts, characterCatalog) => {
+  const allowedCharacters = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [canonicalOption(entry?.name || ''), normalizePhrase(entry?.name || '')])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const pairs = [];
+  const seen = new Set();
+  const registerPair = (primary, counterpart, triggerTerms = []) => {
+    const canonicalPrimary = allowedCharacters.get(canonicalOption(primary || ''));
+    const canonicalCounterpart = allowedCharacters.get(canonicalOption(counterpart || ''));
+    if (!canonicalPrimary || !canonicalCounterpart || canonicalPrimary === canonicalCounterpart) return;
+
+    const key = `${canonicalPrimary.toLowerCase()}::${canonicalCounterpart.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push({
+      triggerTerms: normalizeTriggerTerms(triggerTerms.length > 0 ? triggerTerms : ['between', 'other fish', 'with', 'fight']),
+      primary: canonicalPrimary,
+      counterpart: canonicalCounterpart
+    });
+  };
+
+  for (const event of Array.isArray(storyFacts?.events) ? storyFacts.events : []) {
+    const eventText = canonicalOption(event);
+    if (!eventText) continue;
+
+    const charactersInEvent = [];
+    for (const characterName of allowedCharacters.values()) {
+      const canonicalCharacter = canonicalOption(characterName);
+      if (canonicalCharacter && eventText.includes(canonicalCharacter)) {
+        charactersInEvent.push(characterName);
+      }
+    }
+    if (charactersInEvent.length < 2) continue;
+
+    for (let i = 0; i < charactersInEvent.length; i += 1) {
+      for (let j = i + 1; j < charactersInEvent.length; j += 1) {
+        registerPair(charactersInEvent[i], charactersInEvent[j], [
+          'between',
+          'other fish',
+          'someone',
+          'fight',
+          'argue',
+          ...tokenize(event).slice(0, 6)
+        ]);
+        registerPair(charactersInEvent[j], charactersInEvent[i], [
+          'between',
+          'other fish',
+          'someone',
+          'fight',
+          'argue',
+          ...tokenize(event).slice(0, 6)
+        ]);
+      }
+    }
+  }
+
+  return pairs.slice(0, 16);
 };
 
 const normalizeStyleReferenceKind = (value, fallback = 'scene') => {
@@ -1453,6 +1566,11 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     facts?.characterCatalog || facts?.character_catalog,
     facts?.characters
   );
+  const explicitInteractionPairs = normalizeInteractionPairs(
+    facts?.interactionPairs || facts?.interaction_pairs,
+    characterCatalog
+  );
+  const inferredInteractionPairs = buildInteractionPairsFromStoryFacts(facts, characterCatalog);
   const sceneCatalog = normalizeSceneCatalog(
     facts?.sceneCatalog || facts?.scene_catalog,
     facts
@@ -1484,6 +1602,10 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     objectEvidenceMap: normalizeObjectEvidenceMap(
       facts?.objectEvidenceMap || facts?.object_evidence_map,
       facts?.objects
+    ),
+    interactionPairs: normalizeInteractionPairs(
+      [...explicitInteractionPairs, ...inferredInteractionPairs],
+      characterCatalog
     ),
     scenes: normalizeFactList(facts?.scenes, 16),
     places: normalizeFactList(facts?.places, 12),
@@ -1547,6 +1669,11 @@ const compactFactsForPrompt = (storyFacts) => {
       sceneId: entry.sceneId,
       styleRefIndexes: entry.styleRefIndexes.slice(0, 3),
       confidence: entry.confidence
+    })),
+    interactionPairs: (normalized.interactionPairs || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      triggerTerms: entry.triggerTerms.slice(0, 4),
+      primary: entry.primary,
+      counterpart: entry.counterpart
     })),
     places: normalized.places.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
     objects: normalized.objects.slice(0, MAX_FACT_PROMPT_ITEMS).map((value) => truncate(value, 44)),
@@ -1966,6 +2093,7 @@ const buildIllustrationAgentPrompt = ({
     `Answer option: ${answerText}`,
     `Is this answer correct: ${isCorrect ? 'yes' : 'no'}`,
     `Detected participants scenes=${(participants?.scenes || []).join(', ') || 'none'} characters=${(participants?.characters || []).join(', ') || 'none'} objects=${(participants?.objects || []).join(', ') || 'none'}`,
+    `Required characters: ${(participants?.requiredCharacters || []).join(', ') || 'none'}`,
     `Allowed scenes: ${allowedScenes.join(', ') || 'none'}`,
     `Allowed characters: ${allowedCharacters.join(', ') || 'none'}`,
     `Allowed objects: ${allowedObjects.join(', ') || 'none'}`,
@@ -2312,7 +2440,9 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
       .map((ref) => normalizePhrase(ref?.objectName || ''))
       .filter(Boolean)
   )];
+  const requiredCharacterNames = dedupeOrderedList(participants?.requiredCharacters || [], 6);
   const participantCharacterSet = new Set([
+    ...requiredCharacterNames,
     ...(participants?.characters || []),
     ...(participants?.inferredCharacters || [])
   ]);
@@ -2321,8 +2451,8 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     ...(participants?.inferredObjects || [])
   ]);
   const allowedCharacters = (
-    selectedCharacterNames.length > 0
-      ? selectedCharacterNames
+    requiredCharacterNames.length > 0
+      ? requiredCharacterNames
       : allowedCharacterEntries
           .map((entry) => entry.name)
           .filter((name) => participantCharacterSet.size === 0 || participantCharacterSet.has(name))
@@ -2352,22 +2482,31 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
   const compositionNotes = normalizePhrase(illustrationPlan?.composition_notes || '');
   const primaryCharacter = allowedCharacters[0] || '';
   const normalizedOption = canonicalOption(optionText);
+  const interactionIntent = Boolean(participants?.interactionIntent || requiredCharacterNames.length >= 2);
   const optionUsesKnownCharacter = allowedCharacters.some((name) => {
     const normalizedName = canonicalOption(name);
     return normalizedName && normalizedOption.includes(normalizedName);
   });
+  const enforceSingleCharacter = !interactionIntent && requiredCharacterNames.length <= 1;
 
   const characterRules = allowedCharacters.length > 0
     ? [
         `- Allowed characters from this book only: ${allowedCharacters.map((name) => `${name} (${characterSourceMap.get(name.toLowerCase()) || 'book'})`).join(', ')}.`,
         '- Never invent new people, animals, fish, or creatures not in the allowed list.',
-        '- If a character is needed, use only one of the allowed characters.',
+        requiredCharacterNames.length >= 2
+          ? `- Required characters for this card: ${requiredCharacterNames.join(', ')}.`
+          : '- If a character is needed, use one allowed character.',
+        requiredCharacterNames.length >= 2
+          ? '- Show all required characters together in the same scene.'
+          : '- Keep character count minimal.',
         optionUsesKnownCharacter
           ? '- The matching allowed character must be visually recognizable.'
           : '- For place/object options, draw zero characters unless absolutely required.',
-        !optionUsesKnownCharacter && primaryCharacter
+        enforceSingleCharacter && !optionUsesKnownCharacter && primaryCharacter
           ? `- If the scene needs a character, use "${primaryCharacter}" only.`
-          : '- If the scene needs a character, use only one allowed character.'
+          : requiredCharacterNames.length >= 2
+            ? '- Do not collapse this scene into a single-character image.'
+            : '- If the scene needs a character, use only one allowed character.'
       ]
     : [
         '- Do not invent any characters.',
@@ -2471,6 +2610,175 @@ const inferOptionObjects = (optionText, storyFacts) => {
   return matches.slice(0, 2);
 };
 
+const dedupeOrderedList = (values, limit = 12) => {
+  const output = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const cleaned = normalizePhrase(value);
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(cleaned);
+    if (output.length >= limit) break;
+  }
+  return output;
+};
+
+const unionOrdered = (...lists) => dedupeOrderedList(lists.flat(), 32);
+
+const textImpliesInteraction = (text) => {
+  const normalized = canonicalOption(text);
+  if (!normalized) return false;
+  return INTERACTION_KEYWORDS.some((keyword) => normalized.includes(keyword));
+};
+
+const hasOtherCharacterPlaceholder = (text) =>
+  /\b(other fish|other character|someone|another fish|the other|other one)\b/i.test(String(text || ''));
+
+const findCharactersMentionedInOrder = (text, storyFacts) => {
+  const haystack = String(text || '').toLowerCase();
+  if (!haystack.trim()) return [];
+
+  const matches = [];
+  for (const entry of storyFacts?.characterCatalog || []) {
+    const name = normalizePhrase(entry?.name || '');
+    if (!name) continue;
+    const idx = haystack.indexOf(name.toLowerCase());
+    if (idx >= 0) {
+      matches.push({ name, idx });
+    }
+  }
+
+  return matches
+    .sort((a, b) => a.idx - b.idx)
+    .map((item) => item.name)
+    .slice(0, 6);
+};
+
+const extractBetweenSides = (text, storyFacts) => {
+  const raw = String(text || '');
+  const match = raw.match(/\bbetween\s+(.+?)\s+and\s+(.+?)(?:[?.!,]|$)/i);
+  if (!match) {
+    return { leftCharacter: '', rightCharacter: '', rightRaw: '' };
+  }
+
+  const allowedCharacters = buildAllowedCharacterMap(storyFacts);
+  const leftRaw = normalizePhrase(match[1] || '');
+  const rightRaw = normalizePhrase(match[2] || '');
+  return {
+    leftCharacter: normalizeToAllowedName(leftRaw, allowedCharacters),
+    rightCharacter: normalizeToAllowedName(rightRaw, allowedCharacters),
+    rightRaw
+  };
+};
+
+const inferCounterpartsFromEvents = (primaryCharacter, storyFacts) => {
+  const primary = canonicalOption(primaryCharacter);
+  if (!primary) return [];
+
+  const scoreByCharacter = new Map();
+  const candidates = (storyFacts?.characterCatalog || []).map((entry) => normalizePhrase(entry?.name || '')).filter(Boolean);
+  const events = Array.isArray(storyFacts?.events) ? storyFacts.events : [];
+  for (const event of events) {
+    const eventText = canonicalOption(event);
+    if (!eventText || !eventText.includes(primary)) continue;
+    for (const characterName of candidates) {
+      const canonicalName = canonicalOption(characterName);
+      if (!canonicalName || canonicalName === primary) continue;
+      if (!eventText.includes(canonicalName)) continue;
+      scoreByCharacter.set(characterName, (scoreByCharacter.get(characterName) || 0) + 1);
+    }
+  }
+
+  return Array.from(scoreByCharacter.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map((entry) => entry[0]);
+};
+
+const inferCounterpartsFromInteractionPairs = (text, primaryCharacter, storyFacts) => {
+  const normalizedText = canonicalOption(text);
+  const normalizedPrimary = canonicalOption(primaryCharacter);
+  if (!normalizedText || !normalizedPrimary) return [];
+
+  const pairs = Array.isArray(storyFacts?.interactionPairs) ? storyFacts.interactionPairs : [];
+  const matches = [];
+  for (const pair of pairs) {
+    const primary = normalizePhrase(pair?.primary || '');
+    const counterpart = normalizePhrase(pair?.counterpart || '');
+    if (!primary || !counterpart) continue;
+    if (canonicalOption(primary) !== normalizedPrimary) continue;
+
+    const triggerTerms = normalizeTriggerTerms(pair?.triggerTerms || []);
+    const triggerMatch =
+      triggerTerms.length === 0 || triggerTerms.some((term) => term && normalizedText.includes(term));
+    if (!triggerMatch) continue;
+    matches.push(counterpart);
+  }
+
+  return dedupeOrderedList(matches, 6);
+};
+
+const resolveRequiredCharactersForTurn = (text, storyFacts, questionParticipants) => {
+  const interactionIntent = textImpliesInteraction(text);
+  const explicitCharacters = findCharactersMentionedInOrder(text, storyFacts);
+  const requiredCharacters = [];
+
+  for (const name of explicitCharacters) {
+    if (!requiredCharacters.includes(name)) requiredCharacters.push(name);
+  }
+
+  const betweenSides = extractBetweenSides(text, storyFacts);
+  if (betweenSides.leftCharacter && !requiredCharacters.includes(betweenSides.leftCharacter)) {
+    requiredCharacters.push(betweenSides.leftCharacter);
+  }
+  if (betweenSides.rightCharacter && !requiredCharacters.includes(betweenSides.rightCharacter)) {
+    requiredCharacters.push(betweenSides.rightCharacter);
+  }
+
+  if (interactionIntent || hasOtherCharacterPlaceholder(text)) {
+    const seedPrimary =
+      betweenSides.leftCharacter ||
+      explicitCharacters[0] ||
+      normalizePhrase(questionParticipants?.requiredCharacters?.[0] || questionParticipants?.characters?.[0] || '');
+
+    const pairCounterparts = inferCounterpartsFromInteractionPairs(text, seedPrimary, storyFacts);
+    for (const name of pairCounterparts) {
+      if (!requiredCharacters.includes(name)) requiredCharacters.push(name);
+    }
+
+    const eventCounterparts = inferCounterpartsFromEvents(seedPrimary, storyFacts);
+    for (const name of eventCounterparts) {
+      if (!requiredCharacters.includes(name)) requiredCharacters.push(name);
+    }
+
+    if (requiredCharacters.length < 2) {
+      for (const pair of Array.isArray(storyFacts?.interactionPairs) ? storyFacts.interactionPairs : []) {
+        for (const name of [normalizePhrase(pair?.primary || ''), normalizePhrase(pair?.counterpart || '')]) {
+          if (!name || requiredCharacters.includes(name)) continue;
+          requiredCharacters.push(name);
+          if (requiredCharacters.length >= 2) break;
+        }
+        if (requiredCharacters.length >= 2) break;
+      }
+    }
+
+    if (requiredCharacters.length < 2 && Array.isArray(storyFacts?.characterCatalog)) {
+      for (const entry of storyFacts.characterCatalog) {
+        const name = normalizePhrase(entry?.name || '');
+        if (!name || requiredCharacters.includes(name)) continue;
+        requiredCharacters.push(name);
+        if (requiredCharacters.length >= 2) break;
+      }
+    }
+  }
+
+  return {
+    interactionIntent,
+    requiredCharacters: dedupeOrderedList(requiredCharacters, 4)
+  };
+};
+
 const inferSceneIdsFromText = (text, storyFacts) => {
   const canonicalText = canonicalOption(text);
   if (!canonicalText) return [];
@@ -2499,7 +2807,7 @@ const inferSceneIdsFromText = (text, storyFacts) => {
   return [...new Set(fallback)];
 };
 
-const buildTurnContextParticipantsHeuristic = (text, storyFacts, refsWithMeta, questionParticipants) => {
+const buildTurnContextParticipantsHeuristic = (text, storyFacts, refsWithMeta, questionParticipants, requiredContext = null) => {
   const explicitScenes = inferSceneIdsFromText(text, storyFacts);
   const scenes = explicitScenes.length > 0
     ? explicitScenes
@@ -2508,6 +2816,7 @@ const buildTurnContextParticipantsHeuristic = (text, storyFacts, refsWithMeta, q
       : (storyFacts?.sceneCatalog || []).slice(0, 1).map((scene) => scene.id);
 
   const explicitCharacters = inferOptionCharacters(text, storyFacts);
+  const requiredCharacters = dedupeOrderedList(requiredContext?.requiredCharacters || [], 4);
   const explicitObjects = inferOptionObjects(text, storyFacts);
 
   const inferredCharacters = [];
@@ -2524,10 +2833,12 @@ const buildTurnContextParticipantsHeuristic = (text, storyFacts, refsWithMeta, q
 
   return {
     scenes,
-    characters: explicitCharacters,
+    characters: unionOrdered(requiredCharacters, explicitCharacters).slice(0, 4),
     objects: explicitObjects,
     inferredCharacters: inferredCharacters.slice(0, 3),
-    inferredObjects: inferredObjects.slice(0, 3)
+    inferredObjects: inferredObjects.slice(0, 3),
+    requiredCharacters,
+    interactionIntent: Boolean(requiredContext?.interactionIntent)
   };
 };
 
@@ -2606,8 +2917,9 @@ const extractParticipantsWithModel = async (ai, text, storyFacts) => {
   };
 };
 
-const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta, questionParticipants) => {
-  const heuristic = buildTurnContextParticipantsHeuristic(text, storyFacts, refsWithMeta, questionParticipants);
+const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta, questionParticipants, requiredContext = null) => {
+  const required = requiredContext || resolveRequiredCharactersForTurn(text, storyFacts, questionParticipants);
+  const heuristic = buildTurnContextParticipantsHeuristic(text, storyFacts, refsWithMeta, questionParticipants, required);
 
   let structured = null;
   try {
@@ -2616,15 +2928,13 @@ const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta
     console.warn('[turn] participant extraction fallback to heuristic', error?.message || error);
   }
 
-  const scenes = structured?.scenes?.length
-    ? structured.scenes
-    : heuristic.scenes;
-  const characters = structured?.characters?.length
-    ? structured.characters
-    : heuristic.characters;
-  const objects = structured?.objects?.length
-    ? structured.objects
-    : heuristic.objects;
+  const scenes = unionOrdered(heuristic.scenes, structured?.scenes || []).slice(0, 4);
+  const characters = unionOrdered(
+    required.requiredCharacters || [],
+    heuristic.characters,
+    structured?.characters || []
+  ).slice(0, 6);
+  const objects = unionOrdered(heuristic.objects, structured?.objects || []).slice(0, 4);
 
   const inferredCharacters = [];
   const inferredObjects = [];
@@ -2638,12 +2948,24 @@ const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta
     }
   }
 
+  const minimumCharacters = required.interactionIntent ? 2 : 1;
+  const candidateFallback = unionOrdered(
+    required.requiredCharacters || [],
+    questionParticipants?.requiredCharacters || [],
+    questionParticipants?.characters || [],
+    (storyFacts?.interactionPairs || []).flatMap((pair) => [pair.primary, pair.counterpart])
+  );
+  const finalCharacters = unionOrdered(characters, candidateFallback).slice(0, Math.max(6, minimumCharacters));
+  const finalRequired = unionOrdered(required.requiredCharacters || [], finalCharacters).slice(0, 4);
+
   return {
-    scenes: [...new Set(scenes)].slice(0, 4),
-    characters: [...new Set(characters)].slice(0, 4),
+    scenes: dedupeOrderedList(scenes, 4),
+    characters: dedupeOrderedList(finalCharacters, 6),
     objects: [...new Set(objects)].slice(0, 4),
     inferredCharacters: inferredCharacters.slice(0, 3),
-    inferredObjects: inferredObjects.slice(0, 3)
+    inferredObjects: inferredObjects.slice(0, 3),
+    requiredCharacters: finalRequired,
+    interactionIntent: Boolean(required.interactionIntent)
   };
 };
 
@@ -2673,41 +2995,6 @@ const scoreStyleReference = (reference, participants) => {
   return score;
 };
 
-const pickRankedRefs = ({
-  refsWithMeta,
-  selectedIndexes,
-  selectedRefs,
-  predicate,
-  targetCount,
-  participants,
-  categoryPenaltyTracker
-}) => {
-  const ranked = refsWithMeta
-    .map((reference, index) => ({ reference, index }))
-    .filter((entry) => predicate(entry.reference))
-    .map((entry) => ({
-      ...entry,
-      score: scoreStyleReference(entry.reference, participants)
-    }))
-    .sort((a, b) => b.score - a.score);
-
-  for (const item of ranked) {
-    if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
-    if (selectedRefs.length >= targetCount) break;
-    if (selectedIndexes.has(item.index)) continue;
-
-    const dedupeKey = item.reference.characterName || item.reference.objectName || item.reference.sceneId || `${item.index}`;
-    const repeats = categoryPenaltyTracker.get(dedupeKey) || 0;
-    if (repeats >= 2 && item.score < 130) {
-      continue;
-    }
-
-    selectedIndexes.add(item.index);
-    selectedRefs.push(item.reference);
-    categoryPenaltyTracker.set(dedupeKey, repeats + 1);
-  }
-};
-
 const selectStyleRefsForOption = async (
   ai,
   stylePrimer,
@@ -2730,109 +3017,125 @@ const selectStyleRefsForOption = async (
     optionText,
     storyFacts,
     refsWithMeta,
-    questionParticipants
+    questionParticipants,
+    resolveRequiredCharactersForTurn(optionText, storyFacts, questionParticipants)
   );
   const selectedRefs = [];
   const selectedIndexes = new Set();
-  const categoryPenaltyTracker = new Map();
+  const rankedRefs = (predicate, scoringParticipants = participants) =>
+    refsWithMeta
+      .map((reference, index) => ({ reference, index }))
+      .filter((entry) => predicate(entry.reference))
+      .map((entry) => ({
+        ...entry,
+        score: scoreStyleReference(entry.reference, scoringParticipants)
+      }))
+      .sort((a, b) => b.score - a.score || a.index - b.index);
 
-  const dynamicSceneTarget = participants.scenes.length > 0 ? 6 : 0;
-  const dynamicCharacterTarget =
-    participants.characters.length + participants.inferredCharacters.length > 0 ? 6 : 0;
-  const dynamicObjectTarget =
-    participants.objects.length + participants.inferredObjects.length > 0 ? 4 : 0;
+  const pushRanked = (ranked, limit) => {
+    for (const item of ranked) {
+      if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
+      if (limit <= 0) break;
+      if (selectedIndexes.has(item.index)) continue;
+      selectedIndexes.add(item.index);
+      selectedRefs.push(item.reference);
+      limit -= 1;
+    }
+  };
 
-  pickRankedRefs({
-    refsWithMeta,
-    selectedIndexes,
-    selectedRefs,
-    predicate: (reference) =>
-      reference.kind === 'scene' &&
-      participants.scenes.includes(reference.sceneId || ''),
-    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget),
-    participants,
-    categoryPenaltyTracker
-  });
-
-  pickRankedRefs({
-    refsWithMeta,
-    selectedIndexes,
-    selectedRefs,
-    predicate: (reference) =>
-      isTightMappedRef(reference, 'character') &&
-      (participants.characters.includes(reference.characterName || '') ||
-        participants.inferredCharacters.includes(reference.characterName || '')),
-    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget),
-    participants,
-    categoryPenaltyTracker
-  });
-
-  pickRankedRefs({
-    refsWithMeta,
-    selectedIndexes,
-    selectedRefs,
-    predicate: (reference) =>
-      isTightMappedRef(reference, 'object') &&
-      (participants.objects.includes(reference.objectName || '') ||
-        participants.inferredObjects.includes(reference.objectName || '')),
-    targetCount: Math.min(STYLE_REF_MAX_TOTAL, dynamicSceneTarget + dynamicCharacterTarget + dynamicObjectTarget),
-    participants,
-    categoryPenaltyTracker
-  });
-
-  if (selectedRefs.length === 0 && Array.isArray(questionParticipants?.scenes) && questionParticipants.scenes.length > 0) {
-    pickRankedRefs({
-      refsWithMeta,
-      selectedIndexes,
-      selectedRefs,
-      predicate: (reference) =>
-        reference.kind === 'scene' && questionParticipants.scenes.includes(reference.sceneId || ''),
-      targetCount: 1,
-      participants: {
-        ...participants,
-        scenes: questionParticipants.scenes
-      },
-      categoryPenaltyTracker
-    });
+  const requiredCharacters = dedupeOrderedList(
+    [...(participants.requiredCharacters || []), ...participants.characters],
+    4
+  );
+  for (const characterName of requiredCharacters) {
+    const rankedCharacter = rankedRefs(
+      (reference) =>
+        isTightMappedRef(reference, 'character') &&
+        canonicalOption(reference.characterName || '') === canonicalOption(characterName || '')
+    );
+    pushRanked(rankedCharacter, REQUIRED_CHARACTER_REF_QUOTA);
   }
 
+  const targetScenes = dedupeOrderedList(
+    [
+      ...(participants.scenes || []),
+      ...(questionParticipants?.scenes || [])
+    ],
+    6
+  );
+  const sceneParticipantsForScore = {
+    ...participants,
+    scenes: targetScenes.length > 0 ? targetScenes : participants.scenes
+  };
+  const rankedSceneAnchors = rankedRefs(
+    (reference) =>
+      reference.kind === 'scene' &&
+      (
+        targetScenes.length === 0 ||
+        targetScenes.includes(reference.sceneId || '')
+      ),
+    sceneParticipantsForScore
+  );
+  pushRanked(rankedSceneAnchors, STYLE_REF_STYLE_ANCHOR_MAX);
+  if (selectedRefs.length < requiredCharacters.length + STYLE_REF_STYLE_ANCHOR_MIN) {
+    pushRanked(rankedSceneAnchors, requiredCharacters.length + STYLE_REF_STYLE_ANCHOR_MIN - selectedRefs.length);
+  }
+
+  const rankedObjectAnchors = rankedRefs(
+    (reference) =>
+      isTightMappedRef(reference, 'object') &&
+      (
+        participants.objects.includes(reference.objectName || '') ||
+        participants.inferredObjects.includes(reference.objectName || '')
+      )
+  );
+  pushRanked(rankedObjectAnchors, STYLE_REF_OBJECT_OPTIONAL_QUOTA);
+
+  const relevantCharacterSet = new Set([
+    ...requiredCharacters,
+    ...participants.characters,
+    ...participants.inferredCharacters
+  ]);
+  const relevantObjectSet = new Set([
+    ...participants.objects,
+    ...participants.inferredObjects
+  ]);
+  const relevantSceneSet = new Set(targetScenes);
+
+  const rankedRelevantExtras = rankedRefs((reference) => {
+    if (reference.kind === 'scene') {
+      return relevantSceneSet.size === 0 || relevantSceneSet.has(reference.sceneId || '');
+    }
+    if (reference.kind === 'character') {
+      return isTightMappedRef(reference, 'character') &&
+        relevantCharacterSet.has(reference.characterName || '');
+    }
+    if (reference.kind === 'object') {
+      return isTightMappedRef(reference, 'object') &&
+        relevantObjectSet.has(reference.objectName || '');
+    }
+    return false;
+  });
+  pushRanked(rankedRelevantExtras, STYLE_REF_MAX_TOTAL - selectedRefs.length);
+
   if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
-    const groundingTarget = Math.min(STYLE_REF_MAX_TOTAL, MIN_STYLE_REF_GROUNDING);
-
-    pickRankedRefs({
-      refsWithMeta,
-      selectedIndexes,
-      selectedRefs,
-      predicate: (reference) => reference.kind === 'scene',
-      targetCount: groundingTarget,
-      participants: {
-        ...participants,
-        scenes: participants.scenes.length > 0
-          ? participants.scenes
-          : (Array.isArray(questionParticipants?.scenes) ? questionParticipants.scenes : [])
-      },
-      categoryPenaltyTracker
-    });
-
-    pickRankedRefs({
-      refsWithMeta,
-      selectedIndexes,
-      selectedRefs,
-      predicate: (reference) => isTightMappedRef(reference, 'character'),
-      targetCount: groundingTarget,
-      participants,
-      categoryPenaltyTracker
-    });
-
-    pickRankedRefs({
-      refsWithMeta,
-      selectedIndexes,
-      selectedRefs,
-      predicate: (reference) => isTightMappedRef(reference, 'object'),
-      targetCount: groundingTarget,
-      participants,
-      categoryPenaltyTracker
-    });
+    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
+    const rankedGlobalScenes = rankedRefs((reference) => reference.kind === 'scene');
+    pushRanked(rankedGlobalScenes, groundingNeed);
+  }
+  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
+    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
+    const rankedGlobalCharacters = rankedRefs(
+      (reference) => isTightMappedRef(reference, 'character')
+    );
+    pushRanked(rankedGlobalCharacters, groundingNeed);
+  }
+  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
+    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
+    const rankedGlobalObjects = rankedRefs(
+      (reference) => isTightMappedRef(reference, 'object')
+    );
+    pushRanked(rankedGlobalObjects, groundingNeed);
   }
 
   return {
@@ -3343,6 +3646,7 @@ const buildQaReadyBookPackage = async (
     illustrationPages,
     styleBible,
     entityRecords,
+    interactionPairs: normalizeInteractionPairs(storyFacts?.interactionPairs || [], storyFacts?.characterCatalog || []),
     qaReadyManifest
   };
 };
@@ -3731,12 +4035,14 @@ export const runTurnPipeline = async (
 
   const optionsStart = performance.now();
   const resolveQuestionParticipantsStart = performance.now();
+  const questionRequiredContext = resolveRequiredCharactersForTurn(question, normalizedFacts, null);
   const questionParticipants = await resolveTurnContextParticipants(
     ai,
     question,
     normalizedFacts,
     effectiveStyleReferences,
-    null
+    null,
+    questionRequiredContext
   );
   stepMs.resolveQuestionParticipantsMs = Math.round(performance.now() - resolveQuestionParticipantsStart);
 
@@ -3803,13 +4109,15 @@ export const runTurnPipeline = async (
       const cardStart = performance.now();
       const parts = [];
       const combinedContext = `${question}\n${card.text}`;
+      const requiredCardContext = resolveRequiredCharactersForTurn(combinedContext, normalizedFacts, questionParticipants);
       const resolveParticipantsStart = performance.now();
       const participants = await resolveTurnContextParticipants(
         ai,
         combinedContext,
         normalizedFacts,
         effectiveStyleReferences,
-        questionParticipants
+        questionParticipants,
+        requiredCardContext
       );
       const resolveParticipantsMs = Math.round(performance.now() - resolveParticipantsStart);
       const selectRefsStart = performance.now();
@@ -3837,6 +4145,7 @@ export const runTurnPipeline = async (
         `[turn] ${card.id} selected_refs=${selectedStyleRefIndexes.join(',') || 'none'} ` +
           `participants scenes=${participants.scenes.join('|') || 'none'} ` +
           `chars=${participants.characters.join('|') || 'none'} ` +
+          `required=${(participants.requiredCharacters || []).join('|') || 'none'} ` +
           `objects=${participants.objects.join('|') || 'none'} ` +
           `refs_meta=${refSummary || 'none'}`
       );
@@ -4194,6 +4503,7 @@ const normalizeQaReadyPackagePayload = (payload) => {
       illustrationPages: payload?.illustration_pages || [],
       styleBible: payload?.style_bible || {},
       entityRecords: payload?.entity_records || [],
+      interactionPairs: payload?.interaction_pairs || payload?.interactionPairs || [],
       qaReadyManifest: payload?.qa_ready_manifest || {}
     };
   }

@@ -120,6 +120,7 @@ export interface StoryFacts {
   sceneImageMap?: SceneImageMap[];
   characterEvidenceMap?: StoryCharacterEvidenceMap[];
   objectEvidenceMap?: StoryObjectEvidenceMap[];
+  interactionPairs?: StoryInteractionPair[];
   scenes?: string[];
   places: string[];
   objects: string[];
@@ -162,12 +163,20 @@ export interface SceneImageMap {
   confidence: number;
 }
 
+export interface StoryInteractionPair {
+  triggerTerms: string[];
+  primary: string;
+  counterpart: string;
+}
+
 export interface TurnContextParticipants {
   scenes: string[];
   characters: string[];
   objects: string[];
   inferredCharacters: string[];
   inferredObjects: string[];
+  requiredCharacters?: string[];
+  interactionIntent?: boolean;
 }
 
 export interface SelectedStyleRefDebug {
@@ -402,6 +411,7 @@ export interface QaReadyBookPackage {
   illustrationPages: number[];
   styleBible: StyleBibleRecord;
   entityRecords: EntityRecord[];
+  interactionPairs?: StoryInteractionPair[];
   qaReadyManifest: QaReadyManifest;
 }
 
