@@ -47,6 +47,7 @@ const legacyToAssets = (legacy: StoredStory): StoryAssets => ({
     ...legacy.metadata,
     storyBrief: legacy.metadata.storyBrief || legacy.metadata.summary,
     storyText: legacy.metadata.storyText || legacy.metadata.storyBrief || legacy.metadata.summary,
+    qaReadyPackage: legacy.metadata.qaReadyPackage,
     storyFacts: legacy.metadata.storyFacts || createDefaultStoryFacts(legacy.metadata.storyBrief || legacy.metadata.summary)
   },
   styleReferences: []
@@ -143,6 +144,7 @@ const openDB = (): Promise<IDBDatabase> => {
             metadata: {
               ...(value?.metadata || { summary: storyBrief, characters: [], objects: [] }),
               storyText: value?.metadata?.storyText || storyBrief,
+              qaReadyPackage: value?.metadata?.qaReadyPackage,
               storyFacts: nextFacts
             },
             styleReferences: value?.styleReferences || []

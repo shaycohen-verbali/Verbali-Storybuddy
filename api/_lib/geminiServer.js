@@ -9,6 +9,7 @@ const MAX_OPTION_WORDS = 10;
 const MAX_TTS_WORDS = 10;
 const MAX_STORY_BRIEF_PROMPT_CHARS = 700;
 const MAX_STORY_TEXT_PROMPT_CHARS = 32000;
+const MAX_PAGES_TEXT_ITEMS = 160;
 const MAX_HISTORY_TURNS_FOR_PROMPT = 4;
 const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
@@ -36,6 +37,9 @@ const LOW_CONFIDENCE_WARNING_THRESHOLD = 0.7;
 const MAX_ENTITY_CROP_COVERAGE = 0.6;
 const MAX_SCENE_ALIASES = 5;
 const MAX_SCENE_FACTS = 16;
+const QA_PACKAGE_VERSION = '1.0.0';
+const MIN_STYLE_BIBLE_REFS = 5;
+const MAX_STYLE_BIBLE_REFS = 20;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -260,6 +264,95 @@ const truncate = (value, maxChars) => {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+};
+
+const slugify = (value, fallback = 'item') => {
+  const slug = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return slug || fallback;
+};
+
+const makeEntityId = (type, name) => `ent_${slugify(type, 'entity')}_${slugify(name, 'unknown')}`;
+
+const hashStringFast = (value) => {
+  const input = String(value || '');
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash +=
+      (hash << 1) +
+      (hash << 4) +
+      (hash << 7) +
+      (hash << 8) +
+      (hash << 24);
+  }
+  return `h${(hash >>> 0).toString(16).padStart(8, '0')}`;
+};
+
+const estimateBase64Bytes = (base64Data) => {
+  const rawLength = String(base64Data || '').length;
+  if (!rawLength) return 0;
+  const padding = String(base64Data || '').endsWith('==') ? 2 : String(base64Data || '').endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((rawLength * 3) / 4) - padding);
+};
+
+const toImageIdFromStyleRefIndex = (index) => `img_${String(index + 1).padStart(4, '0')}`;
+
+const normalizePagesTextEntries = (pages) => {
+  const normalized = [];
+  const seen = new Set();
+
+  for (const entry of Array.isArray(pages) ? pages : []) {
+    const pageNum = Number(entry?.page_num ?? entry?.pageNum);
+    if (!Number.isInteger(pageNum) || pageNum <= 0) continue;
+    if (seen.has(pageNum)) continue;
+
+    const rawText = String(entry?.raw_text ?? entry?.rawText ?? '').trim();
+    const cleanText = normalizePhrase(entry?.clean_text ?? entry?.cleanText ?? rawText);
+    seen.add(pageNum);
+    normalized.push({
+      pageNum,
+      rawText,
+      cleanText,
+      charCount: cleanText.length
+    });
+  }
+
+  return normalized.sort((a, b) => a.pageNum - b.pageNum).slice(0, MAX_PAGES_TEXT_ITEMS);
+};
+
+const evaluateTextQuality = (pagesText) => {
+  const pages = Array.isArray(pagesText) ? pagesText : [];
+  if (pages.length === 0) {
+    return {
+      textQuality: 'poor',
+      nearEmptyPercent: 1,
+      avgCharsPerPage: 0
+    };
+  }
+
+  const totalChars = pages.reduce((sum, page) => sum + Number(page?.charCount || 0), 0);
+  const nearEmptyPages = pages.filter((page) => Number(page?.charCount || 0) < 24).length;
+  const nearEmptyPercent = nearEmptyPages / Math.max(1, pages.length);
+  const avgCharsPerPage = totalChars / Math.max(1, pages.length);
+
+  let textQuality = 'poor';
+  if (avgCharsPerPage >= 120 && nearEmptyPercent <= 0.25) {
+    textQuality = 'good';
+  } else if (avgCharsPerPage >= 40 && nearEmptyPercent <= 0.65) {
+    textQuality = 'mixed';
+  }
+
+  return {
+    textQuality,
+    nearEmptyPercent,
+    avgCharsPerPage
+  };
 };
 const limitWords = (value, maxWords) => {
   const normalized = normalizePhrase(value);
@@ -2871,6 +2964,389 @@ const extractStoryTextFromPdf = async (ai, storyFile, storyBrief) => {
   return compactStoryTextForPrompt(storyBrief || '');
 };
 
+const extractPagesTextFromPdf = async (ai, storyFile) => {
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: storyFile.mimeType, data: storyFile.data } },
+            {
+              text: [
+                'Extract page-level story text from this children story PDF.',
+                'Return strict JSON with pages only.',
+                'Each page item must include page_num (1-based), raw_text, clean_text.',
+                'Keep raw_text and clean_text concise (max ~500 chars each per page).',
+                'If page has no story text, return empty strings for that page.',
+                `Limit output to at most ${MAX_PAGES_TEXT_ITEMS} pages.`
+              ].join('\n')
+            }
+          ]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              pages: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    page_num: { type: Type.NUMBER },
+                    raw_text: { type: Type.STRING },
+                    clean_text: { type: Type.STRING }
+                  },
+                  required: ['page_num', 'raw_text', 'clean_text']
+                }
+              }
+            },
+            required: ['pages']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { pages: [] });
+    const pagesText = normalizePagesTextEntries(payload.pages || []);
+    const storyText = compactStoryTextForPrompt(
+      pagesText
+        .map((entry) => entry.cleanText)
+        .filter(Boolean)
+        .join('\n\n')
+    );
+
+    return { pagesText, storyText };
+  } catch (error) {
+    console.warn('[setup] page text extraction failed', error?.message || error);
+    return { pagesText: [], storyText: '' };
+  }
+};
+
+const buildStyleBibleFromModel = async (ai, { summary, artStyle, styleReferences, imageIdsByIndex }) => {
+  const sceneRefs = (Array.isArray(styleReferences) ? styleReferences : [])
+    .map((ref, index) => ({ ...ref, index }))
+    .filter((ref) => ref.kind === 'scene')
+    .sort((a, b) => (b.qualityScore || b.confidence || 0) - (a.qualityScore || a.confidence || 0));
+  const picked = sceneRefs.slice(0, MAX_STYLE_BIBLE_REFS);
+  const styleReferenceImageIds = picked.map((ref) => imageIdsByIndex.get(ref.index)).filter(Boolean);
+
+  if (picked.length === 0) {
+    return {
+      id: 'style_bible_main',
+      globalStyleDescription: artStyle || 'Children storybook style',
+      palette: ['soft pastel colors'],
+      lineQuality: 'soft outlines',
+      lighting: 'bright and child-friendly',
+      compositionHabits: ['single focal subject', 'clear simple scenes'],
+      styleReferenceImageIds
+    };
+  }
+
+  try {
+    const parts = picked.map((ref) => ({
+      inlineData: {
+        mimeType: ref.mimeType,
+        data: ref.data
+      }
+    }));
+    parts.push({
+      text: [
+        'Create a concise style bible from these book illustrations.',
+        `Book summary: ${summary}`,
+        `Known art style: ${artStyle}`,
+        'Return strict JSON only with fields:',
+        '- global_style_description',
+        '- palette (array of color words)',
+        '- line_quality',
+        '- lighting',
+        '- composition_habits (array)'
+      ].join('\n')
+    });
+
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: { parts },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              global_style_description: { type: Type.STRING },
+              palette: { type: Type.ARRAY, items: { type: Type.STRING } },
+              line_quality: { type: Type.STRING },
+              lighting: { type: Type.STRING },
+              composition_habits: { type: Type.ARRAY, items: { type: Type.STRING } }
+            },
+            required: [
+              'global_style_description',
+              'palette',
+              'line_quality',
+              'lighting',
+              'composition_habits'
+            ]
+          }
+        }
+      })
+    );
+
+    const parsed = parseJsonSafe(response.text, {});
+    return {
+      id: 'style_bible_main',
+      globalStyleDescription: normalizePhrase(parsed.global_style_description || artStyle || 'Children storybook style'),
+      palette: normalizeFactList(parsed.palette || [], 8),
+      lineQuality: normalizePhrase(parsed.line_quality || 'soft outlines'),
+      lighting: normalizePhrase(parsed.lighting || 'balanced lighting'),
+      compositionHabits: normalizeFactList(parsed.composition_habits || [], 8),
+      styleReferenceImageIds
+    };
+  } catch (error) {
+    console.warn('[setup] style bible extraction failed', error?.message || error);
+    return {
+      id: 'style_bible_main',
+      globalStyleDescription: artStyle || 'Children storybook style',
+      palette: ['soft pastel colors'],
+      lineQuality: 'soft outlines',
+      lighting: 'bright and child-friendly',
+      compositionHabits: ['single focal subject', 'clear simple scenes'],
+      styleReferenceImageIds
+    };
+  }
+};
+
+const buildEntityRecords = (storyFacts, imageIdsByIndex) => {
+  const records = [];
+  const styleTags = normalizeFactList(storyFacts?.worldTags || [], 8);
+
+  for (const character of storyFacts?.characterCatalog || []) {
+    const styleRefIndexes = (storyFacts?.characterImageMap || [])
+      .find((entry) => entry.characterName === character.name)
+      ?.styleRefIndexes || [];
+    const mappedImageIds = styleRefIndexes
+      .map((index) => imageIdsByIndex.get(index))
+      .filter(Boolean);
+    const visualAssets = mappedImageIds.map((imageId, idx) => ({
+      imageId,
+      role: idx === 0 ? 'gold_face' : idx === 1 ? 'gold_body' : 'reference',
+      styleRefIndex: styleRefIndexes[idx]
+    }));
+
+    records.push({
+      entityId: makeEntityId('character', character.name),
+      name: character.name,
+      aliases: [],
+      type: 'character',
+      canonicalDescription: `${character.name} from the story`,
+      mustHaveTraits: [],
+      negativeTraits: [],
+      styleTags,
+      visualAssets,
+      goldRefs: {
+        face: mappedImageIds[0],
+        body: mappedImageIds[1]
+      }
+    });
+  }
+
+  for (const objectName of storyFacts?.objects || []) {
+    const styleRefIndexes = (storyFacts?.objectImageMap || [])
+      .find((entry) => entry.objectName === objectName)
+      ?.styleRefIndexes || [];
+    const visualAssets = styleRefIndexes
+      .map((index) => ({
+        imageId: imageIdsByIndex.get(index),
+        role: 'reference',
+        styleRefIndex: index
+      }))
+      .filter((asset) => Boolean(asset.imageId));
+
+    records.push({
+      entityId: makeEntityId('object', objectName),
+      name: objectName,
+      aliases: [],
+      type: 'object',
+      canonicalDescription: `${objectName} from the story`,
+      mustHaveTraits: [],
+      negativeTraits: [],
+      styleTags,
+      visualAssets
+    });
+  }
+
+  for (const placeName of storyFacts?.places || []) {
+    records.push({
+      entityId: makeEntityId('location', placeName),
+      name: placeName,
+      aliases: [],
+      type: 'location',
+      canonicalDescription: `Location in the story: ${placeName}`,
+      mustHaveTraits: [],
+      negativeTraits: [],
+      styleTags,
+      visualAssets: []
+    });
+  }
+
+  for (const scene of storyFacts?.sceneCatalog || []) {
+    const sceneIndexes = (storyFacts?.sceneImageMap || [])
+      .find((entry) => entry.sceneId === scene.id)
+      ?.styleRefIndexes || [];
+    const visualAssets = sceneIndexes
+      .map((index) => ({
+        imageId: imageIdsByIndex.get(index),
+        role: 'reference',
+        styleRefIndex: index
+      }))
+      .filter((asset) => Boolean(asset.imageId));
+    records.push({
+      entityId: makeEntityId('scene', scene.title || scene.id),
+      name: scene.title || scene.id,
+      aliases: normalizeFactList(scene.aliases || [], 6),
+      type: 'scene',
+      canonicalDescription: `Scene in the story: ${scene.title || scene.id}`,
+      mustHaveTraits: [],
+      negativeTraits: [],
+      styleTags,
+      visualAssets
+    });
+  }
+
+  return records;
+};
+
+const buildQaReadyBookPackage = async (
+  ai,
+  {
+    storyFile,
+    summary,
+    artStyle,
+    storyText,
+    storyFacts,
+    styleReferences,
+    pagesText
+  }
+) => {
+  const normalizedPagesText = normalizePagesTextEntries(pagesText || []);
+  const textStats = evaluateTextQuality(normalizedPagesText);
+  const indexedRefs = (Array.isArray(styleReferences) ? styleReferences : []).map((ref, index) => ({ ref, index }));
+  const imageIdsByIndex = new Map(indexedRefs.map(({ index }) => [index, toImageIdFromStyleRefIndex(index)]));
+
+  const pageRefs = indexedRefs.filter(({ ref }) => ref.source === 'pdf_page' && Number.isInteger(ref.pageIndex));
+  const pagesImages = pageRefs.map(({ ref, index }) => ({
+    pageNum: Number(ref.pageIndex) + 1,
+    imageId: imageIdsByIndex.get(index),
+    path: `page_images/page_${String(Number(ref.pageIndex) + 1).padStart(4, '0')}.png`,
+    styleRefIndex: index
+  }));
+  const illustrationPages = [...new Set(
+    pageRefs
+      .filter(({ ref }) => ref.kind === 'scene')
+      .map(({ ref }) => Number(ref.pageIndex) + 1)
+  )].sort((a, b) => a - b);
+
+  const styleBible = await buildStyleBibleFromModel(ai, {
+    summary,
+    artStyle,
+    styleReferences,
+    imageIdsByIndex
+  });
+  const entityRecords = buildEntityRecords(storyFacts, imageIdsByIndex);
+
+  const characterRecords = entityRecords.filter((record) => record.type === 'character');
+  const mainCharacters = characterRecords
+    .filter((record) =>
+      (storyFacts?.characterCatalog || [])
+        .find((entry) => entry.name === record.name)?.source !== 'mentioned'
+    );
+  const mainCharacterSet = (mainCharacters.length > 0 ? mainCharacters : characterRecords).slice(0, 4);
+  const mainCharactersWithGold = mainCharacterSet.filter((record) => Boolean(record.goldRefs?.face || record.goldRefs?.bootstrap));
+  const allCharactersWithGold = characterRecords.filter((record) => Boolean(record.goldRefs?.face || record.goldRefs?.bootstrap));
+  const hasGoldRefsPercent = mainCharacterSet.length > 0
+    ? Math.round((mainCharactersWithGold.length / mainCharacterSet.length) * 100)
+    : 0;
+
+  const validationWarnings = [];
+  if (!String(storyFile?.mimeType || '').includes('pdf')) {
+    validationWarnings.push('File is not marked as PDF mime type.');
+  }
+  if (String(storyFile?.data || '').includes('L0VuY3J5cHQ')) {
+    validationWarnings.push('PDF appears encrypted; parsing quality may be limited.');
+  }
+  if (textStats.textQuality === 'poor') {
+    validationWarnings.push('Low text quality detected. OCR may be required for strong Q&A accuracy.');
+  }
+  if ((styleBible.styleReferenceImageIds || []).length < MIN_STYLE_BIBLE_REFS) {
+    validationWarnings.push('Style bible has fewer than 5 representative references.');
+  }
+  if (mainCharacterSet.length > 0 && mainCharactersWithGold.length === 0) {
+    validationWarnings.push('Main characters are missing gold refs.');
+  }
+
+  const pageCount = Math.max(
+    normalizedPagesText.length,
+    ...pagesImages.map((entry) => entry.pageNum),
+    0
+  );
+  const fileHash = hashStringFast(`${storyFile?.data?.slice(0, 10000) || ''}:${storyFile?.data?.length || 0}`);
+  const bookId = `book_${fileHash}`;
+  const notes = [
+    'Pass character gold refs to image generation whenever that character appears.',
+    'Use a stable small reference set per render: 2-3 style + 1-2 character refs.',
+    'Avoid random page refs at runtime; prefer pinned style and gold refs.',
+    ...(validationWarnings.length > 0 ? validationWarnings.map((warning) => `Warning: ${warning}`) : [])
+  ];
+
+  const qaReadyManifest = {
+    styleBibleId: styleBible.id,
+    entityRecordsId: 'entity_records_main',
+    pageTextCount: normalizedPagesText.length,
+    pageImageCount: pagesImages.length,
+    illustrationPageCount: illustrationPages.length,
+    textQuality: textStats.textQuality,
+    hasGoldRefsPercent,
+    checklist: {
+      normalizedPdf: true,
+      pageImages: pagesImages.length > 0,
+      styleBible: (styleBible.styleReferenceImageIds || []).length >= MIN_STYLE_BIBLE_REFS,
+      entityCatalog: entityRecords.length > 0,
+      mainCharactersGoldRefs: mainCharacterSet.length === 0 || mainCharactersWithGold.length > 0,
+      cleanTextPerPage: textStats.textQuality !== 'poor',
+      allRecurringCharactersGoldRefs:
+        characterRecords.length > 0 && allCharactersWithGold.length === characterRecords.length,
+      keyObjectsGoldRefs:
+        (storyFacts?.objects || []).length === 0 ||
+        (storyFacts?.objectImageMap || []).some((entry) => (entry.styleRefIndexes || []).length > 0)
+    },
+    notes
+  };
+
+  return {
+    version: QA_PACKAGE_VERSION,
+    createdAt: Date.now(),
+    manifest: {
+      bookId,
+      title: truncate(summary || 'Untitled book', 120),
+      fileHash,
+      pageCount,
+      originalFileSize: estimateBase64Bytes(storyFile?.data || ''),
+      mimeType: storyFile?.mimeType || 'application/pdf',
+      textQuality: textStats.textQuality,
+      validationWarnings,
+      normalizedAt: Date.now()
+    },
+    pagesText: normalizedPagesText,
+    pagesImages,
+    illustrationPages,
+    styleBible,
+    entityRecords,
+    qaReadyManifest
+  };
+};
+
 const enrichSceneEvidenceFromStyleRefs = (sceneCatalog, styleReferences) => {
   const byScene = new Map(
     (Array.isArray(sceneCatalog) ? sceneCatalog : []).map((scene) => [scene.id, { ...scene }])
@@ -2979,6 +3455,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
   const summary = parsed.summary || 'Story analyzed.';
   const artStyle = parsed.art_style || 'Children\'s book illustration';
   const storyBrief = parsed.story_brief || summary;
+  const pagesTextPromise = extractPagesTextFromPdf(ai, storyFile);
   const storyTextPromise = extractStoryTextFromPdf(ai, storyFile, storyBrief);
 
   let extractedCharacterCatalog = [];
@@ -3140,7 +3617,17 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     },
     storyBrief
   );
-  const storyText = await storyTextPromise;
+  const pagesTextPayload = await pagesTextPromise;
+  const storyText = pagesTextPayload.storyText || await storyTextPromise;
+  const qaReadyPackage = await buildQaReadyBookPackage(ai, {
+    storyFile,
+    summary,
+    artStyle,
+    storyText,
+    storyFacts: storyFactsWithImageMap,
+    styleReferences: finalStyleReferences,
+    pagesText: pagesTextPayload.pagesText
+  });
 
   return {
     storyPack: {
@@ -3148,6 +3635,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
       artStyle,
       storyBrief,
       storyText,
+      qaReadyPackage,
       storyFacts: storyFactsWithImageMap,
       coverImage,
       stylePrimer,

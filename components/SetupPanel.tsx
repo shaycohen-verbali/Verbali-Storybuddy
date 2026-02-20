@@ -716,6 +716,7 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
 
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
+  const qaReadyPackage = preparedPack?.qaReadyPackage;
   const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
   const objectCatalog = preparedPack?.storyFacts?.objects || [];
   const sceneCatalog = preparedPack?.storyFacts?.sceneCatalog || [];
@@ -969,6 +970,47 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                             />
                           </div>
                         </div>
+                      )}
+
+                      {qaReadyPackage && (
+                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-4 space-y-2">
+                          <label className="text-xs font-bold text-gray-400 uppercase tracking-wider block">Q&A Ready Package</label>
+                          <div className="text-sm text-gray-700">
+                            <span className="font-semibold">Text Quality:</span> {qaReadyPackage.qaReadyManifest.textQuality}
+                          </div>
+                          <div className="text-sm text-gray-700">
+                            <span className="font-semibold">Main Character Gold Refs:</span> {qaReadyPackage.qaReadyManifest.hasGoldRefsPercent}%
+                          </div>
+                          <div className="text-sm text-gray-700">
+                            <span className="font-semibold">Pages Text:</span> {qaReadyPackage.qaReadyManifest.pageTextCount} | <span className="font-semibold">Page Images:</span> {qaReadyPackage.qaReadyManifest.pageImageCount}
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-xs text-gray-600">
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.normalizedPdf ? '[x]' : '[ ]'} PDF normalized</div>
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.pageImages ? '[x]' : '[ ]'} Page images rendered</div>
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.styleBible ? '[x]' : '[ ]'} Style bible ready</div>
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.entityCatalog ? '[x]' : '[ ]'} Entity catalog ready</div>
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.mainCharactersGoldRefs ? '[x]' : '[ ]'} Main characters have gold refs</div>
+                            <div>{qaReadyPackage.qaReadyManifest.checklist.cleanTextPerPage ? '[x]' : '[ ]'} Clean per-page text</div>
+                          </div>
+                          {qaReadyPackage.qaReadyManifest.notes.length > 0 && (
+                            <div className="text-xs text-gray-500 space-y-1">
+                              {qaReadyPackage.qaReadyManifest.notes.slice(0, 4).map((note, index) => (
+                                <div key={`qa-note-${index}`}>• {note}</div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {preparedPack?.storyText && (
+                        <details className="rounded-xl border border-gray-200 bg-white p-3">
+                          <summary className="text-xs font-bold text-gray-500 uppercase tracking-wider cursor-pointer">
+                            Extracted Story Text
+                          </summary>
+                          <pre className="mt-2 text-xs text-gray-700 whitespace-pre-wrap max-h-48 overflow-auto">
+                            {preparedPack.storyText}
+                          </pre>
+                        </details>
                       )}
 
                       {canEdit && (

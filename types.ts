@@ -76,6 +76,7 @@ export interface StoryMetadata {
   artStyle?: string;
   storyBrief?: string;
   storyText?: string;
+  qaReadyPackage?: QaReadyBookPackage;
   storyFacts?: StoryFacts;
 }
 
@@ -103,6 +104,7 @@ export interface StoryPack {
   artStyle: string;
   storyBrief: string;
   storyText?: string;
+  qaReadyPackage?: QaReadyBookPackage;
   storyFacts: StoryFacts;
   coverImage?: string | null;
   stylePrimer: FileData[];
@@ -283,4 +285,105 @@ export interface StoredStory {
   createdAt: number;
   metadata: StoryMetadata;
   pdfData: FileData;
+}
+
+export type TextQuality = 'good' | 'mixed' | 'poor';
+export type EntityType = 'character' | 'object' | 'location' | 'scene';
+export type VisualAssetRole = 'gold_face' | 'gold_body' | 'gold_bootstrap' | 'reference';
+
+export interface BookPackageManifest {
+  bookId: string;
+  title: string;
+  author?: string;
+  fileHash: string;
+  pageCount: number;
+  originalFileSize: number;
+  mimeType: string;
+  textQuality: TextQuality;
+  validationWarnings: string[];
+  normalizedAt: number;
+}
+
+export interface PageTextRecord {
+  pageNum: number;
+  rawText: string;
+  cleanText: string;
+  charCount: number;
+}
+
+export interface PageImageRecord {
+  pageNum: number;
+  imageId: string;
+  path: string;
+  styleRefIndex: number;
+  width?: number;
+  height?: number;
+}
+
+export interface StyleBibleRecord {
+  id: string;
+  globalStyleDescription: string;
+  palette: string[];
+  lineQuality: string;
+  lighting: string;
+  compositionHabits: string[];
+  styleReferenceImageIds: string[];
+}
+
+export interface EntityVisualAssetRecord {
+  imageId: string;
+  role: VisualAssetRole;
+  styleRefIndex?: number;
+}
+
+export interface EntityRecord {
+  entityId: string;
+  name: string;
+  aliases: string[];
+  type: EntityType;
+  canonicalDescription: string;
+  mustHaveTraits: string[];
+  negativeTraits: string[];
+  styleTags: string[];
+  visualAssets: EntityVisualAssetRecord[];
+  goldRefs?: {
+    face?: string;
+    body?: string;
+    bootstrap?: string;
+  };
+}
+
+export interface QaReadyChecklist {
+  normalizedPdf: boolean;
+  pageImages: boolean;
+  styleBible: boolean;
+  entityCatalog: boolean;
+  mainCharactersGoldRefs: boolean;
+  cleanTextPerPage: boolean;
+  allRecurringCharactersGoldRefs: boolean;
+  keyObjectsGoldRefs: boolean;
+}
+
+export interface QaReadyManifest {
+  styleBibleId: string;
+  entityRecordsId: string;
+  pageTextCount: number;
+  pageImageCount: number;
+  illustrationPageCount: number;
+  textQuality: TextQuality;
+  hasGoldRefsPercent: number;
+  checklist: QaReadyChecklist;
+  notes: string[];
+}
+
+export interface QaReadyBookPackage {
+  version: string;
+  createdAt: number;
+  manifest: BookPackageManifest;
+  pagesText: PageTextRecord[];
+  pagesImages: PageImageRecord[];
+  illustrationPages: number[];
+  styleBible: StyleBibleRecord;
+  entityRecords: EntityRecord[];
+  qaReadyManifest: QaReadyManifest;
 }

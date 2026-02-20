@@ -41,6 +41,7 @@ export const useStorySetup = () => {
           artStyle: analysis.artStyle,
           storyBrief: analysis.summary,
           storyText: analysis.summary,
+          qaReadyPackage: undefined,
           storyFacts: {
             characters: [],
             characterCatalog: [],
