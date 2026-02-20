@@ -429,6 +429,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const [selectedPublisherId, setSelectedPublisherId] = useState<string | null>(null);
   const [warningsAcknowledged, setWarningsAcknowledged] = useState(false);
   const [expandedImage, setExpandedImage] = useState<{ src: string; label?: string } | null>(null);
+  const [showQaPackageJson, setShowQaPackageJson] = useState(false);
+  const [qaPackageCopied, setQaPackageCopied] = useState(false);
 
   const isExistingStory = Boolean(initialView?.storyId);
   const canEdit = !isReadOnlyView;
@@ -443,6 +445,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
       setSelectedPublisherId(null);
       setWarningsAcknowledged(false);
       setExpandedImage(null);
+      setShowQaPackageJson(false);
+      setQaPackageCopied(false);
       setErrorMsg(null);
       setIsProcessing(false);
       return;
@@ -458,6 +462,8 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
     setSelectedPublisherId(initialView.publisherId || null);
     setWarningsAcknowledged(false);
     setExpandedImage(null);
+    setShowQaPackageJson(false);
+    setQaPackageCopied(false);
     setErrorMsg(null);
     setIsProcessing(false);
   }, [initialView]);
@@ -717,6 +723,10 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const summary = preparedPack?.summary || '';
   const generatedCover = preparedPack?.coverImage || null;
   const qaReadyPackage = preparedPack?.qaReadyPackage;
+  const qaReadyPackageJson = useMemo(
+    () => (qaReadyPackage ? JSON.stringify(qaReadyPackage, null, 2) : ''),
+    [qaReadyPackage]
+  );
   const characterCatalog = preparedPack?.storyFacts?.characterCatalog || [];
   const objectCatalog = preparedPack?.storyFacts?.objects || [];
   const sceneCatalog = preparedPack?.storyFacts?.sceneCatalog || [];
@@ -852,6 +862,37 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
   const selectedPublisher = publishers.find((publisher) => publisher.id === selectedPublisherId) || null;
   const hasAnalysis = Boolean(summary || preparedPack) || isReadOnlyView;
 
+  const copyQaPackageToClipboard = async () => {
+    if (!qaReadyPackageJson) {
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Clipboard access is unavailable in this browser.');
+      }
+      await navigator.clipboard.writeText(qaReadyPackageJson);
+      setQaPackageCopied(true);
+      window.setTimeout(() => setQaPackageCopied(false), 1800);
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'Failed to copy Q&A package JSON.');
+    }
+  };
+
+  const downloadQaPackageJson = () => {
+    if (!qaReadyPackageJson || !qaReadyPackage?.manifest?.bookId) {
+      return;
+    }
+
+    const blob = new Blob([qaReadyPackageJson], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${qaReadyPackage.manifest.bookId}_qa_ready_package.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-3xl w-full max-w-5xl h-[90vh] overflow-hidden shadow-2xl flex flex-col">
@@ -976,6 +1017,9 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4 space-y-2">
                           <label className="text-xs font-bold text-gray-400 uppercase tracking-wider block">Q&A Ready Package</label>
                           <div className="text-sm text-gray-700">
+                            <span className="font-semibold">Book ID:</span> {qaReadyPackage.manifest.bookId}
+                          </div>
+                          <div className="text-sm text-gray-700">
                             <span className="font-semibold">Text Quality:</span> {qaReadyPackage.qaReadyManifest.textQuality}
                           </div>
                           <div className="text-sm text-gray-700">
@@ -998,6 +1042,31 @@ const SetupPanel: React.FC<SetupPanelProps> = ({
                                 <div key={`qa-note-${index}`}>• {note}</div>
                               ))}
                             </div>
+                          )}
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            <button
+                              onClick={() => setShowQaPackageJson((prev) => !prev)}
+                              className="px-3 py-2 rounded-lg bg-white border border-gray-200 text-xs font-bold text-gray-700 hover:bg-gray-100 transition"
+                            >
+                              {showQaPackageJson ? 'Hide Full JSON' : 'Open Full JSON'}
+                            </button>
+                            <button
+                              onClick={copyQaPackageToClipboard}
+                              className="px-3 py-2 rounded-lg bg-white border border-gray-200 text-xs font-bold text-gray-700 hover:bg-gray-100 transition"
+                            >
+                              {qaPackageCopied ? 'Copied' : 'Copy JSON'}
+                            </button>
+                            <button
+                              onClick={downloadQaPackageJson}
+                              className="px-3 py-2 rounded-lg bg-kid-teal/10 text-kid-teal text-xs font-bold hover:bg-kid-teal/20 transition"
+                            >
+                              Download JSON
+                            </button>
+                          </div>
+                          {showQaPackageJson && (
+                            <pre className="text-[11px] text-gray-700 bg-white border border-gray-200 rounded-lg p-3 whitespace-pre-wrap max-h-64 overflow-auto">
+                              {qaReadyPackageJson}
+                            </pre>
                           )}
                         </div>
                       )}
