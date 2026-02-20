@@ -3933,3 +3933,910 @@ export const synthesizeSpeech = async (text) => {
     mimeType: inlineData.mimeType || 'audio/L16;rate=24000'
   };
 };
+
+const RUNTIME_CACHE_LIMIT = 64;
+const RUNTIME_EVENT_LOG_LIMIT = 2000;
+const RUNTIME_PLAN_STORE_LIMIT = 1000;
+const RUNTIME_CONTEXT_ENTITY_LIMIT = 36;
+const RUNTIME_IMAGE_CONCURRENCY_LIMIT = 6;
+
+const runtimeBookCache = new Map();
+const runtimePlanStore = new Map();
+const runtimeEventLog = [];
+let runtimeActiveImageJobs = 0;
+const runtimeImageQueue = [];
+
+const toRuntimeId = (prefix) => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+const pushRuntimeEvent = (eventType, payload = {}) => {
+  const event = {
+    eventId: toRuntimeId('evt'),
+    timestamp: Date.now(),
+    eventType,
+    ...payload
+  };
+  runtimeEventLog.push(event);
+  while (runtimeEventLog.length > RUNTIME_EVENT_LOG_LIMIT) {
+    runtimeEventLog.shift();
+  }
+  const bookId = payload.bookId ? ` book=${payload.bookId}` : '';
+  const planId = payload.qaPlanId ? ` plan=${payload.qaPlanId}` : '';
+  console.info(`[runtime] ${eventType}${bookId}${planId}`);
+  return event;
+};
+
+const normalizeForEntityMatch = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const levenshteinDistance = (a, b) => {
+  const left = normalizeForEntityMatch(a);
+  const right = normalizeForEntityMatch(b);
+  if (!left || !right) return 99;
+  if (left === right) return 0;
+  const dp = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+  for (let i = 0; i <= left.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= right.length; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= left.length; i += 1) {
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[left.length][right.length];
+};
+
+const splitMentions = (text) =>
+  normalizeForEntityMatch(text)
+    .split(/\s+/)
+    .filter((token) => token.length >= 3);
+
+const normalizeEntityRecordsForRuntime = (entityRecords) =>
+  (Array.isArray(entityRecords) ? entityRecords : [])
+    .map((record) => {
+      const name = normalizePhrase(record?.name || '');
+      const type = normalizePhrase(record?.type || '');
+      const aliases = normalizeFactList(record?.aliases || [], 16);
+      if (!name || !type) {
+        return null;
+      }
+
+      return {
+        entityId: normalizePhrase(record?.entityId || makeEntityId(type, name)),
+        name,
+        type,
+        aliases,
+        canonicalDescription: normalizePhrase(record?.canonicalDescription || ''),
+        mustHaveTraits: normalizeFactList(record?.mustHaveTraits || [], 12),
+        negativeTraits: normalizeFactList(record?.negativeTraits || [], 12),
+        styleTags: normalizeFactList(record?.styleTags || [], 12),
+        visualAssets: Array.isArray(record?.visualAssets) ? record.visualAssets : [],
+        goldRefs: {
+          face: normalizePhrase(record?.goldRefs?.face || ''),
+          body: normalizePhrase(record?.goldRefs?.body || ''),
+          bootstrap: normalizePhrase(record?.goldRefs?.bootstrap || '')
+        }
+      };
+    })
+    .filter(Boolean);
+
+export const resolveEntitiesForText = (text, entityRecords) => {
+  const normalizedText = normalizeForEntityMatch(text);
+  const tokens = splitMentions(text);
+  const resolved = [];
+  const unmatchedMentions = [];
+  const seen = new Set();
+
+  for (const record of normalizeEntityRecordsForRuntime(entityRecords)) {
+    const candidates = [record.name, ...(record.aliases || [])]
+      .map((value) => normalizeForEntityMatch(value))
+      .filter(Boolean);
+    const directMatch = candidates.find((candidate) => {
+      if (candidate.length < 3) return false;
+      return normalizedText.includes(candidate);
+    });
+
+    if (directMatch) {
+      resolved.push({
+        entityId: record.entityId,
+        confidence: 0.98,
+        matchMethod: 'alias_exact',
+        matchedValue: directMatch
+      });
+      seen.add(record.entityId);
+      continue;
+    }
+
+    let fuzzyMatch = null;
+    for (const token of tokens) {
+      for (const candidate of candidates) {
+        if (Math.abs(candidate.length - token.length) > 2) continue;
+        const distance = levenshteinDistance(token, candidate);
+        if (distance <= 1 || distance / Math.max(candidate.length, 1) <= 0.2) {
+          fuzzyMatch = { token, candidate, distance };
+          break;
+        }
+      }
+      if (fuzzyMatch) break;
+    }
+
+    if (fuzzyMatch) {
+      resolved.push({
+        entityId: record.entityId,
+        confidence: Math.max(0.55, 0.9 - fuzzyMatch.distance * 0.25),
+        matchMethod: 'alias_fuzzy',
+        matchedValue: fuzzyMatch.candidate
+      });
+      seen.add(record.entityId);
+    }
+  }
+
+  for (const mention of tokens) {
+    const matched = resolved.some((item) => normalizeForEntityMatch(item.matchedValue || '') === mention);
+    if (!matched) {
+      unmatchedMentions.push(mention);
+    }
+  }
+
+  return {
+    matchedEntityIds: resolved.map((item) => item.entityId),
+    resolvedEntities: resolved,
+    unmatchedMentions
+  };
+};
+
+const trimRuntimeCache = () => {
+  while (runtimeBookCache.size > RUNTIME_CACHE_LIMIT) {
+    const firstKey = runtimeBookCache.keys().next().value;
+    if (!firstKey) break;
+    runtimeBookCache.delete(firstKey);
+  }
+  while (runtimePlanStore.size > RUNTIME_PLAN_STORE_LIMIT) {
+    const firstKey = runtimePlanStore.keys().next().value;
+    if (!firstKey) break;
+    runtimePlanStore.delete(firstKey);
+  }
+};
+
+const buildImageRefMapForRuntime = (qaReadyPackage, styleReferences) => {
+  const imageRefById = new Map();
+  const pageImages = Array.isArray(qaReadyPackage?.pagesImages) ? qaReadyPackage.pagesImages : [];
+  const styleRefs = normalizeStyleReferenceAssets(styleReferences || [], 'upload', false);
+  for (const pageImage of pageImages) {
+    const index = Number(pageImage?.styleRefIndex);
+    const imageId = normalizePhrase(pageImage?.imageId || '');
+    if (!imageId || !Number.isInteger(index) || index < 0 || index >= styleRefs.length) continue;
+    imageRefById.set(imageId, styleRefs[index]);
+  }
+
+  const entityRecords = normalizeEntityRecordsForRuntime(qaReadyPackage?.entityRecords || []);
+  for (const entity of entityRecords) {
+    for (const asset of entity.visualAssets || []) {
+      const imageId = normalizePhrase(asset?.imageId || '');
+      const index = Number(asset?.styleRefIndex);
+      if (!imageId || !Number.isInteger(index) || index < 0 || index >= styleRefs.length) continue;
+      imageRefById.set(imageId, styleRefs[index]);
+    }
+  }
+
+  return imageRefById;
+};
+
+const normalizeQaReadyPackagePayload = (payload) => {
+  if (payload?.qaReadyPackage) {
+    return payload.qaReadyPackage;
+  }
+
+  if (payload?.manifest && payload?.entityRecords && payload?.styleBible) {
+    return payload;
+  }
+
+  if (payload?.entity_records || payload?.style_bible || payload?.qa_ready_manifest) {
+    return {
+      version: payload?.version || QA_PACKAGE_VERSION,
+      createdAt: payload?.created_at || Date.now(),
+      manifest: payload?.manifest || {
+        bookId: payload?.book_id || '',
+        title: payload?.title || '',
+        fileHash: payload?.book_package_hash || '',
+        pageCount: Array.isArray(payload?.pages_text) ? payload.pages_text.length : 0,
+        originalFileSize: 0,
+        mimeType: 'application/pdf',
+        textQuality: payload?.qa_ready_manifest?.text_quality || 'mixed',
+        validationWarnings: [],
+        normalizedAt: Date.now()
+      },
+      pagesText: payload?.pages_text || [],
+      pagesImages: payload?.pages_images || [],
+      illustrationPages: payload?.illustration_pages || [],
+      styleBible: payload?.style_bible || {},
+      entityRecords: payload?.entity_records || [],
+      qaReadyManifest: payload?.qa_ready_manifest || {}
+    };
+  }
+
+  return null;
+};
+
+const buildSessionContextFromPackage = (bookId, qaReadyPackage, styleReferences = []) => {
+  if (!qaReadyPackage) {
+    throw new Error('qaReadyPackage is required to create runtime session.');
+  }
+
+  const safeBookId = normalizePhrase(bookId || qaReadyPackage?.manifest?.bookId || '');
+  if (!safeBookId) {
+    throw new Error('book_id is required.');
+  }
+
+  const packageHash = normalizePhrase(
+    qaReadyPackage?.manifest?.fileHash ||
+      qaReadyPackage?.manifest?.bookPackageHash ||
+      qaReadyPackage?.qaReadyManifest?.bookPackageHash ||
+      hashStringFast(JSON.stringify(qaReadyPackage).slice(0, 12000))
+  );
+  const entityRecords = normalizeEntityRecordsForRuntime(qaReadyPackage?.entityRecords || []);
+  const styleBible = {
+    id: normalizePhrase(qaReadyPackage?.styleBible?.id || 'style_bible_main'),
+    globalStyleDescription: normalizePhrase(
+      qaReadyPackage?.styleBible?.globalStyleDescription || qaReadyPackage?.styleBible?.global_style_description || ''
+    ),
+    palette: normalizeFactList(
+      qaReadyPackage?.styleBible?.palette || [],
+      10
+    ),
+    lineQuality: normalizePhrase(
+      qaReadyPackage?.styleBible?.lineQuality || qaReadyPackage?.styleBible?.line_quality || 'soft lines'
+    ),
+    lighting: normalizePhrase(
+      qaReadyPackage?.styleBible?.lighting || 'balanced lighting'
+    ),
+    compositionHabits: normalizeFactList(
+      qaReadyPackage?.styleBible?.compositionHabits || qaReadyPackage?.styleBible?.composition_habits || [],
+      10
+    ),
+    styleReferenceImageIds: normalizeFactList(
+      qaReadyPackage?.styleBible?.styleReferenceImageIds || qaReadyPackage?.styleBible?.style_reference_image_ids || [],
+      MAX_STYLE_BIBLE_REFS
+    )
+  };
+  const pagesText = normalizePagesTextEntries(qaReadyPackage?.pagesText || qaReadyPackage?.pages_text || []);
+  const qaReadyManifest = qaReadyPackage?.qaReadyManifest || qaReadyPackage?.qa_ready_manifest || {};
+  const bookContextText = compactStoryTextForPrompt(
+    pagesText.map((item) => item.cleanText).filter(Boolean).join('\n\n')
+  );
+  const styleRefs = normalizeStyleReferenceAssets(styleReferences || [], 'upload', false).slice(0, STYLE_REF_POOL_LIMIT);
+  const imageRefById = buildImageRefMapForRuntime(qaReadyPackage, styleRefs);
+
+  return {
+    bookId: safeBookId,
+    sessionId: toRuntimeId('sess'),
+    bookPackageHash: packageHash,
+    loadedAt: Date.now(),
+    qaReadyPackage,
+    styleBible,
+    entityRecords,
+    pagesText,
+    qaReadyManifest,
+    bookContextText,
+    styleReferences: styleRefs,
+    imageRefById
+  };
+};
+
+export const loadBookPackageRuntime = ({ bookId, qaReadyPackage, styleReferences = [], forceReload = false }) => {
+  const normalizedPackage = normalizeQaReadyPackagePayload(qaReadyPackage) || qaReadyPackage;
+  if (!normalizedPackage) {
+    throw new Error('qaReadyPackage is required.');
+  }
+  const normalizedBookId = normalizePhrase(bookId || normalizedPackage?.manifest?.bookId || '');
+  if (!normalizedBookId) {
+    throw new Error('book_id is required.');
+  }
+
+  const packageHash = normalizePhrase(
+    normalizedPackage?.manifest?.fileHash || hashStringFast(JSON.stringify(normalizedPackage).slice(0, 12000))
+  );
+  const cacheHit = runtimeBookCache.get(normalizedBookId);
+  if (
+    !forceReload &&
+    cacheHit &&
+    normalizePhrase(cacheHit?.bookPackageHash) === packageHash &&
+    Array.isArray(cacheHit?.styleReferences) &&
+    cacheHit.styleReferences.length > 0
+  ) {
+    pushRuntimeEvent('book_cache_hit', {
+      bookId: normalizedBookId,
+      sessionId: cacheHit.sessionId,
+      bookPackageHash: packageHash
+    });
+    return cacheHit;
+  }
+
+  const context = buildSessionContextFromPackage(normalizedBookId, normalizedPackage, styleReferences);
+  runtimeBookCache.set(normalizedBookId, context);
+  trimRuntimeCache();
+  pushRuntimeEvent('book_loaded', {
+    bookId: normalizedBookId,
+    sessionId: context.sessionId,
+    bookPackageHash: context.bookPackageHash
+  });
+  return context;
+};
+
+const getRuntimeContext = ({ bookId, qaReadyPackage, styleReferences = [] }) => {
+  const normalizedBookId = normalizePhrase(bookId || qaReadyPackage?.manifest?.bookId || '');
+  if (!normalizedBookId) {
+    throw new Error('book_id is required.');
+  }
+
+  const cached = runtimeBookCache.get(normalizedBookId);
+  if (cached) {
+    return cached;
+  }
+
+  if (!qaReadyPackage) {
+    throw new Error('Book package is not loaded. Call /api/runtime-load-book first or provide qaReadyPackage.');
+  }
+
+  return loadBookPackageRuntime({ bookId: normalizedBookId, qaReadyPackage, styleReferences });
+};
+
+const normalizeQuestionText = (questionText) =>
+  normalizePhrase(String(questionText || '').replace(/[“”]/g, '"').replace(/[‘’]/g, "'"));
+
+const makeEntityMiniIndex = (entityRecords) =>
+  normalizeEntityRecordsForRuntime(entityRecords)
+    .slice(0, RUNTIME_CONTEXT_ENTITY_LIMIT)
+    .map((entity) => ({
+      entity_id: entity.entityId,
+      name: entity.name,
+      aliases: entity.aliases.slice(0, 8),
+      type: entity.type,
+      must_have_traits: entity.mustHaveTraits.slice(0, 6),
+      negative_traits: entity.negativeTraits.slice(0, 6),
+      gold_ref_image_ids: [entity.goldRefs?.face, entity.goldRefs?.body, entity.goldRefs?.bootstrap].filter(Boolean)
+    }));
+
+const buildOrchestratorPrompt = ({
+  questionText,
+  difficulty,
+  bookContextText,
+  styleBible,
+  styleRefIds,
+  entityMiniIndex,
+  resolvedQuestionEntities
+}) =>
+  [
+    'You are the quiz orchestrator for a non-verbal child reading app.',
+    'Return strict JSON only.',
+    'Task: produce an MCQ plan and image prompt packages.',
+    'Rules:',
+    '- Exactly 3 choices with ids A, B, C.',
+    '- Exactly 1 correct choice.',
+    '- Answer text max 10 words.',
+    '- Use different wrongness types for the two incorrect choices.',
+    '- Keep A/B/C scenes comparable (same framing level, similar complexity).',
+    '- Keep style and characters consistent with the provided book entities and style refs.',
+    '- Do not invent characters/objects outside the provided entity index.',
+    `Difficulty: ${difficulty || 'easy'}`,
+    `Question: ${questionText}`,
+    `Book context:\n${bookContextText || 'No context available.'}`,
+    `Style block: ${JSON.stringify(styleBible)}`,
+    `Style ref image IDs: ${JSON.stringify(styleRefIds)}`,
+    `Resolved entities from question: ${JSON.stringify(resolvedQuestionEntities)}`,
+    `Entity mini index:\n${JSON.stringify(entityMiniIndex)}`,
+    'Return schema:',
+    '{',
+    '  "choices": [',
+    '    { "choice_id": "A|B|C", "answer_text": "...", "is_correct": true|false, "wrongness_type": "..." , "scene_plan": "..." }',
+    '  ],',
+    '  "prompt_packages": [',
+    '    {',
+    '      "choice_id": "A|B|C",',
+    '      "prompt": "...",',
+    '      "negative_constraints": ["..."],',
+    '      "reference_image_ids": ["..."],',
+    '      "style_reference_image_ids": ["..."],',
+    '      "character_reference_image_ids": ["..."],',
+    '      "selected_entity_ids": ["..."]',
+    '    }',
+    '  ]',
+    '}'
+  ].join('\n');
+
+const validateQaPlan = (plan) => {
+  const choices = Array.isArray(plan?.choices) ? plan.choices : [];
+  const promptPackages = Array.isArray(plan?.prompt_packages) ? plan.prompt_packages : [];
+  if (choices.length !== 3) {
+    throw new Error('Invalid orchestrator plan: exactly 3 choices are required.');
+  }
+  const ids = new Set(choices.map((item) => normalizePhrase(item?.choice_id || '').toUpperCase()));
+  if (!(ids.has('A') && ids.has('B') && ids.has('C'))) {
+    throw new Error('Invalid orchestrator plan: choice ids must be A/B/C.');
+  }
+  const correctChoices = choices.filter((item) => Boolean(item?.is_correct));
+  if (correctChoices.length !== 1) {
+    throw new Error('Invalid orchestrator plan: exactly one choice must be correct.');
+  }
+  const wrongnessTypes = choices
+    .filter((item) => !item?.is_correct)
+    .map((item) => normalizePhrase(item?.wrongness_type || ''));
+  if (wrongnessTypes.length >= 2 && wrongnessTypes[0] && wrongnessTypes[1] && wrongnessTypes[0] === wrongnessTypes[1]) {
+    throw new Error('Invalid orchestrator plan: wrong choices must use different wrongness types.');
+  }
+  if (promptPackages.length !== 3) {
+    throw new Error('Invalid orchestrator plan: exactly 3 prompt packages are required.');
+  }
+};
+
+const finalizeQaPlan = (rawPlan, context, questionText, resolvedQuestion) => {
+  validateQaPlan(rawPlan);
+
+  const styleRefIds = context.styleBible.styleReferenceImageIds.slice(0, 3);
+  const entitiesById = new Map(context.entityRecords.map((entry) => [entry.entityId, entry]));
+  const choices = rawPlan.choices
+    .map((choice) => ({
+      choiceId: normalizePhrase(choice.choice_id || '').toUpperCase(),
+      answerText: limitWords(choice.answer_text || '', MAX_OPTION_WORDS),
+      isCorrect: Boolean(choice.is_correct),
+      wrongnessType: normalizePhrase(choice.wrongness_type || ''),
+      scenePlan: normalizePhrase(choice.scene_plan || '')
+    }))
+    .sort((a, b) => a.choiceId.localeCompare(b.choiceId));
+  const correctChoice = choices.find((choice) => choice.isCorrect);
+  if (!correctChoice) {
+    throw new Error('Orchestrator plan missing correct choice.');
+  }
+
+  const promptPackages = rawPlan.prompt_packages
+    .map((pkg) => {
+      const choiceId = normalizePhrase(pkg.choice_id || '').toUpperCase();
+      const selectedEntityIds = normalizeFactList(pkg.selected_entity_ids || [], 16)
+        .filter((entityId) => entitiesById.has(entityId));
+      const characterReferenceImageIds = normalizeFactList(pkg.character_reference_image_ids || [], 8);
+      const derivedGoldRefs = selectedEntityIds.flatMap((entityId) => {
+        const entity = entitiesById.get(entityId);
+        if (!entity || entity.type !== 'character') return [];
+        return [entity.goldRefs?.face, entity.goldRefs?.body, entity.goldRefs?.bootstrap].filter(Boolean);
+      });
+      const styleReferenceImageIds = normalizeFactList(
+        pkg.style_reference_image_ids?.length ? pkg.style_reference_image_ids : styleRefIds,
+        6
+      );
+      const referenceImageIds = normalizeFactList(
+        [
+          ...(pkg.reference_image_ids || []),
+          ...styleReferenceImageIds,
+          ...characterReferenceImageIds,
+          ...derivedGoldRefs
+        ],
+        STYLE_REF_MAX_TOTAL
+      );
+      if (styleReferenceImageIds.length === 0 && styleRefIds.length > 0) {
+        styleReferenceImageIds.push(...styleRefIds.slice(0, 2));
+      }
+
+      return {
+        choiceId,
+        prompt: normalizePhrase(pkg.prompt || ''),
+        negativeConstraints: normalizeFactList(pkg.negative_constraints || [], 10),
+        referenceImageIds,
+        styleReferenceImageIds: styleReferenceImageIds.slice(0, 4),
+        characterReferenceImageIds: normalizeFactList([...characterReferenceImageIds, ...derivedGoldRefs], 6),
+        selectedEntityIds
+      };
+    })
+    .sort((a, b) => a.choiceId.localeCompare(b.choiceId));
+
+  for (const pkg of promptPackages) {
+    if (pkg.styleReferenceImageIds.length === 0) {
+      pkg.styleReferenceImageIds = styleRefIds.slice(0, 2);
+      pkg.referenceImageIds = normalizeFactList(
+        [...pkg.referenceImageIds, ...pkg.styleReferenceImageIds],
+        STYLE_REF_MAX_TOTAL
+      );
+    }
+  }
+
+  return {
+    choices,
+    promptPackages,
+    correctChoiceId: correctChoice.choiceId,
+    resolvedQuestionEntities: resolvedQuestion.resolvedEntities,
+    unmatchedMentions: resolvedQuestion.unmatchedMentions
+  };
+};
+
+const generateQaPlanWithOrchestrator = async ({
+  ai,
+  context,
+  questionText,
+  difficulty
+}) => {
+  const resolvedQuestion = resolveEntitiesForText(questionText, context.entityRecords);
+  const styleRefIds = context.styleBible.styleReferenceImageIds.slice(0, 3);
+  const entityMiniIndex = makeEntityMiniIndex(context.entityRecords);
+  const orchestratorPrompt = buildOrchestratorPrompt({
+    questionText,
+    difficulty,
+    bookContextText: context.bookContextText,
+    styleBible: {
+      global_style_description: context.styleBible.globalStyleDescription,
+      palette: context.styleBible.palette,
+      line_quality: context.styleBible.lineQuality,
+      lighting: context.styleBible.lighting,
+      composition_habits: context.styleBible.compositionHabits
+    },
+    styleRefIds,
+    entityMiniIndex,
+    resolvedQuestionEntities: resolvedQuestion.matchedEntityIds
+  });
+
+  const orchestratorCall = async (promptText) =>
+    retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: { parts: [{ text: promptText }] },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              choices: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    choice_id: { type: Type.STRING },
+                    answer_text: { type: Type.STRING },
+                    is_correct: { type: Type.BOOLEAN },
+                    wrongness_type: { type: Type.STRING },
+                    scene_plan: { type: Type.STRING }
+                  },
+                  required: ['choice_id', 'answer_text', 'is_correct', 'wrongness_type', 'scene_plan']
+                }
+              },
+              prompt_packages: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    choice_id: { type: Type.STRING },
+                    prompt: { type: Type.STRING },
+                    negative_constraints: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    reference_image_ids: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    style_reference_image_ids: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    character_reference_image_ids: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    selected_entity_ids: { type: Type.ARRAY, items: { type: Type.STRING } }
+                  },
+                  required: [
+                    'choice_id',
+                    'prompt',
+                    'negative_constraints',
+                    'reference_image_ids',
+                    'style_reference_image_ids',
+                    'character_reference_image_ids',
+                    'selected_entity_ids'
+                  ]
+                }
+              }
+            },
+            required: ['choices', 'prompt_packages']
+          }
+        }
+      })
+    );
+
+  const firstResponse = await orchestratorCall(orchestratorPrompt);
+  let firstPlan = parseJsonSafe(firstResponse.text, null);
+  try {
+    const finalized = finalizeQaPlan(firstPlan, context, questionText, resolvedQuestion);
+    return {
+      ...finalized,
+      orchestratorPrompt,
+      orchestratorRaw: firstResponse.text || ''
+    };
+  } catch (error) {
+    const repairPrompt = [
+      'Repair this JSON so it strictly matches the required schema.',
+      'Return only valid JSON.',
+      `Original output:\n${firstResponse.text || ''}`
+    ].join('\n');
+    const repairResponse = await orchestratorCall(repairPrompt);
+    firstPlan = parseJsonSafe(repairResponse.text, null);
+    const finalized = finalizeQaPlan(firstPlan, context, questionText, resolvedQuestion);
+    return {
+      ...finalized,
+      orchestratorPrompt,
+      orchestratorRaw: repairResponse.text || firstResponse.text || ''
+    };
+  }
+};
+
+const runWithRuntimeImageSlot = async (fn) => {
+  if (runtimeActiveImageJobs >= RUNTIME_IMAGE_CONCURRENCY_LIMIT) {
+    await new Promise((resolve) => runtimeImageQueue.push(resolve));
+  }
+  runtimeActiveImageJobs += 1;
+  try {
+    return await fn();
+  } finally {
+    runtimeActiveImageJobs = Math.max(0, runtimeActiveImageJobs - 1);
+    const next = runtimeImageQueue.shift();
+    if (next) next();
+  }
+};
+
+const buildImagePromptFromPackage = (promptPackage, choice, context) => {
+  const styleBlock = [
+    'STYLE:',
+    `- ${context.styleBible.globalStyleDescription || 'Children storybook style'}.`,
+    context.styleBible.palette?.length ? `- Palette: ${context.styleBible.palette.join(', ')}.` : null,
+    context.styleBible.lineQuality ? `- Line quality: ${context.styleBible.lineQuality}.` : null,
+    context.styleBible.lighting ? `- Lighting: ${context.styleBible.lighting}.` : null,
+    context.styleBible.compositionHabits?.length
+      ? `- Composition habits: ${context.styleBible.compositionHabits.join(', ')}.`
+      : null
+  ].filter(Boolean);
+  const negativeBlock = promptPackage.negativeConstraints?.length
+    ? ['NEGATIVE CONSTRAINTS:', ...promptPackage.negativeConstraints.map((line) => `- ${line}`)]
+    : [];
+  const entityList = promptPackage.selectedEntityIds?.length
+    ? `Allowed entities: ${promptPackage.selectedEntityIds.join(', ')}.`
+    : 'Allowed entities: none specified.';
+
+  return [
+    `Render choice ${choice.choiceId}.`,
+    `Answer text: "${choice.answerText}"`,
+    `Scene plan: ${choice.scenePlan || 'Keep a clean scene that fits the answer text.'}`,
+    entityList,
+    promptPackage.prompt || 'Create a clear and simple illustration for this answer.',
+    ...styleBlock,
+    ...negativeBlock
+  ].join('\n');
+};
+
+export const createRuntimeQaPlan = async ({
+  bookId,
+  questionText,
+  difficulty = 'easy',
+  qaReadyPackage = null,
+  styleReferences = []
+}) => {
+  const normalizedQuestion = normalizeQuestionText(questionText);
+  if (!normalizedQuestion) {
+    throw new Error('question_text is required.');
+  }
+  if (normalizedQuestion.length > 280) {
+    throw new Error('question_text is too long (max 280 characters).');
+  }
+
+  const context = getRuntimeContext({ bookId, qaReadyPackage, styleReferences });
+  const ai = getClient();
+  const startedAt = Date.now();
+
+  pushRuntimeEvent('question_received', {
+    bookId: context.bookId,
+    sessionId: context.sessionId,
+    questionHash: hashStringFast(normalizedQuestion)
+  });
+
+  const orchestrated = await generateQaPlanWithOrchestrator({
+    ai,
+    context,
+    questionText: normalizedQuestion,
+    difficulty
+  });
+
+  const qaPlanId = toRuntimeId('plan');
+  const questionId = `q_${hashStringFast(normalizedQuestion).slice(1)}`;
+  const requestPayloadHash = hashStringFast(
+    JSON.stringify({
+      bookId: context.bookId,
+      questionText: normalizedQuestion,
+      difficulty,
+      bookPackageHash: context.bookPackageHash
+    })
+  );
+  const planRecord = {
+    qaPlanId,
+    bookId: context.bookId,
+    sessionId: context.sessionId,
+    questionId,
+    questionText: normalizedQuestion,
+    difficulty,
+    requestPayloadHash,
+    correctChoiceId: orchestrated.correctChoiceId,
+    choices: orchestrated.choices,
+    promptPackages: orchestrated.promptPackages,
+    orchestratorPrompt: orchestrated.orchestratorPrompt,
+    orchestratorRaw: orchestrated.orchestratorRaw,
+    resolvedQuestionEntities: orchestrated.resolvedQuestionEntities,
+    unmatchedMentions: orchestrated.unmatchedMentions,
+    createdAt: Date.now(),
+    processingMs: Date.now() - startedAt
+  };
+  runtimePlanStore.set(qaPlanId, planRecord);
+  trimRuntimeCache();
+
+  pushRuntimeEvent('qa_plan_created', {
+    bookId: context.bookId,
+    sessionId: context.sessionId,
+    qaPlanId,
+    questionId,
+    processingMs: planRecord.processingMs
+  });
+
+  return {
+    qaPlanId,
+    sessionId: context.sessionId,
+    bookId: context.bookId,
+    questionText: normalizedQuestion,
+    choices: planRecord.choices.map((choice) => ({
+      choiceId: choice.choiceId,
+      answerText: choice.answerText
+    })),
+    internal: {
+      correctChoiceId: planRecord.correctChoiceId
+    },
+    debug: {
+      resolvedQuestionEntities: planRecord.resolvedQuestionEntities,
+      unmatchedMentions: planRecord.unmatchedMentions
+    }
+  };
+};
+
+export const renderRuntimeQaImages = async ({ qaPlanId }) => {
+  const plan = runtimePlanStore.get(normalizePhrase(qaPlanId));
+  if (!plan) {
+    throw new Error('qa_plan_id not found.');
+  }
+  const context = runtimeBookCache.get(plan.bookId);
+  if (!context) {
+    throw new Error('Runtime context not found for this plan.');
+  }
+  const ai = getClient();
+
+  const generatedImages = await Promise.all(
+    plan.choices.map(async (choice) => {
+      const pkg = plan.promptPackages.find((item) => item.choiceId === choice.choiceId);
+      if (!pkg) {
+        return {
+          choiceId: choice.choiceId,
+          imageId: '',
+          storageUri: '',
+          imageDataUrl: null,
+          error: 'Prompt package missing for choice.'
+        };
+      }
+
+      const prompt = buildImagePromptFromPackage(pkg, choice, context);
+      const parts = [];
+      for (const imageId of (pkg.referenceImageIds || []).slice(0, STYLE_REF_MAX_TOTAL)) {
+        const ref = context.imageRefById.get(imageId);
+        if (!ref?.mimeType || !ref?.data) continue;
+        parts.push({
+          inlineData: {
+            mimeType: ref.mimeType,
+            data: ref.data
+          }
+        });
+      }
+      parts.push({ text: prompt });
+
+      const questionId = plan.questionId || `q_${hashStringFast(plan.questionText || '').slice(1)}`;
+      const storageUri = `generated/${plan.bookId}/${plan.sessionId}/${questionId}/${choice.choiceId}.png`;
+      const imageId = `gen_${hashStringFast(storageUri).slice(1)}`;
+
+      try {
+        const imageDataUrl = await runWithRuntimeImageSlot(
+          () => retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1'), 1, 350)
+        );
+        pushRuntimeEvent('qa_image_generated', {
+          bookId: plan.bookId,
+          sessionId: plan.sessionId,
+          qaPlanId: plan.qaPlanId,
+          choiceId: choice.choiceId,
+          imageId
+        });
+        return {
+          choiceId: choice.choiceId,
+          imageId,
+          storageUri,
+          imageDataUrl: imageDataUrl || null
+        };
+      } catch (error) {
+        const message = String(error?.message || error || 'image generation failed');
+        pushRuntimeEvent('qa_image_failed', {
+          bookId: plan.bookId,
+          sessionId: plan.sessionId,
+          qaPlanId: plan.qaPlanId,
+          choiceId: choice.choiceId,
+          error: message
+        });
+        return {
+          choiceId: choice.choiceId,
+          imageId,
+          storageUri,
+          imageDataUrl: null,
+          error: message
+        };
+      }
+    })
+  );
+
+  pushRuntimeEvent('qa_images_completed', {
+    bookId: plan.bookId,
+    sessionId: plan.sessionId,
+    qaPlanId: plan.qaPlanId
+  });
+
+  return {
+    qaPlanId: plan.qaPlanId,
+    bookId: plan.bookId,
+    sessionId: plan.sessionId,
+    questionText: plan.questionText,
+    images: generatedImages
+  };
+};
+
+export const runRuntimeQuiz = async ({
+  bookId,
+  questionText,
+  difficulty = 'easy',
+  qaReadyPackage = null,
+  styleReferences = []
+}) => {
+  const planResult = await createRuntimeQaPlan({
+    bookId,
+    questionText,
+    difficulty,
+    qaReadyPackage,
+    styleReferences
+  });
+  const imageResult = await renderRuntimeQaImages({ qaPlanId: planResult.qaPlanId });
+  const imageByChoice = new Map((imageResult.images || []).map((item) => [item.choiceId, item]));
+  const choices = planResult.choices.map((choice) => ({
+    ...choice,
+    image: imageByChoice.get(choice.choiceId) || null
+  }));
+
+  pushRuntimeEvent('quiz_completed', {
+    bookId: planResult.bookId,
+    sessionId: planResult.sessionId,
+    qaPlanId: planResult.qaPlanId
+  });
+
+  return {
+    bookId: planResult.bookId,
+    sessionId: planResult.sessionId,
+    qaPlanId: planResult.qaPlanId,
+    questionText: planResult.questionText,
+    choices,
+    internal: {
+      correctChoiceId: planResult.internal.correctChoiceId
+    }
+  };
+};
+
+export const getRuntimeEvents = ({ bookId, qaPlanId, limit = 200 } = {}) => {
+  const normalizedBookId = normalizePhrase(bookId || '');
+  const normalizedQaPlanId = normalizePhrase(qaPlanId || '');
+  const maxItems = Math.max(1, Math.min(1000, Number(limit) || 200));
+  const events = [...runtimeEventLog]
+    .filter((event) => {
+      if (normalizedBookId && normalizePhrase(event.bookId || '') !== normalizedBookId) return false;
+      if (normalizedQaPlanId && normalizePhrase(event.qaPlanId || '') !== normalizedQaPlanId) return false;
+      return true;
+    })
+    .slice(-maxItems);
+  return events;
+};

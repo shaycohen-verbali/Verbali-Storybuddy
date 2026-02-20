@@ -1,4 +1,14 @@
-import { SetupStoryRequest, SetupStoryResponse, TurnRequest, TurnResponse } from '../types';
+import {
+  RuntimeLoadBookRequest,
+  RuntimeLoadBookResponse,
+  RuntimePlanResponse,
+  RuntimeQuizResponse,
+  RuntimeRenderResponse,
+  SetupStoryRequest,
+  SetupStoryResponse,
+  TurnRequest,
+  TurnResponse
+} from '../types';
 import { getPayloadBytes, logPayloadSize, logSetupTimings, logTurnTimings } from './performanceService';
 
 export const USE_BACKEND_PIPELINE = import.meta.env.VITE_USE_BACKEND_PIPELINE !== 'false';
@@ -51,3 +61,32 @@ export const requestTtsFromBackend = async (text: string): Promise<{ audioBase64
   const response = await postJson<{ audio: { audioBase64: string; mimeType: string } | null }>('/api/tts', { text });
   return response.audio;
 };
+
+export const loadRuntimeBook = async (payload: RuntimeLoadBookRequest): Promise<RuntimeLoadBookResponse> =>
+  postJson<RuntimeLoadBookResponse>('/api/runtime-load-book', payload);
+
+export const createRuntimePlan = async (payload: {
+  book_id: string;
+  question_text: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+  qa_ready_package?: unknown;
+  style_references?: unknown[];
+  force_reload?: boolean;
+}): Promise<RuntimePlanResponse> =>
+  postJson<RuntimePlanResponse>('/api/runtime-plan', payload);
+
+export const renderRuntimePlanImages = async (qa_plan_id: string): Promise<RuntimeRenderResponse> =>
+  postJson<RuntimeRenderResponse>('/api/runtime-render', { qa_plan_id });
+
+export const runRuntimeQuiz = async (payload: {
+  book_id: string;
+  question_text: string;
+  difficulty?: 'easy' | 'medium' | 'hard';
+  qa_ready_package?: unknown;
+  style_references?: unknown[];
+  force_reload?: boolean;
+}): Promise<RuntimeQuizResponse> =>
+  postJson<RuntimeQuizResponse>('/api/runtime-quiz', payload);
+
+export const getRuntimeEvents = async (params?: { book_id?: string; qa_plan_id?: string; limit?: number }) =>
+  postJson<{ count: number; events: unknown[] }>('/api/runtime-events', params || {});

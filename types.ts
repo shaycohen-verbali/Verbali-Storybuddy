@@ -387,3 +387,76 @@ export interface QaReadyBookPackage {
   entityRecords: EntityRecord[];
   qaReadyManifest: QaReadyManifest;
 }
+
+export interface RuntimeLoadBookRequest {
+  book_id: string;
+  qa_ready_package: QaReadyBookPackage;
+  style_references?: StyleReferenceAsset[];
+  force_reload?: boolean;
+}
+
+export interface RuntimeLoadBookResponse {
+  book_id: string;
+  session_id: string;
+  book_package_hash: string;
+  text_quality: TextQuality;
+  entity_count: number;
+  style_ref_count: number;
+  style_ref_image_id_count: number;
+}
+
+export interface RuntimePlanChoice {
+  choice_id: 'A' | 'B' | 'C';
+  answer_text: string;
+}
+
+export interface RuntimePlanResponse {
+  qa_plan_id: string;
+  session_id: string;
+  book_id: string;
+  question_text: string;
+  choices: RuntimePlanChoice[];
+  internal: {
+    correct_choice_id: 'A' | 'B' | 'C';
+  };
+  debug?: {
+    resolvedQuestionEntities?: Array<{
+      entityId: string;
+      confidence: number;
+      matchMethod: string;
+      matchedValue: string;
+    }>;
+    unmatchedMentions?: string[];
+  };
+}
+
+export interface RuntimeRenderImage {
+  choice_id: 'A' | 'B' | 'C';
+  image_id: string;
+  storage_uri: string;
+  image_data_url: string | null;
+  error: string | null;
+}
+
+export interface RuntimeRenderResponse {
+  qa_plan_id: string;
+  session_id: string;
+  book_id: string;
+  question_text: string;
+  images: RuntimeRenderImage[];
+}
+
+export interface RuntimeQuizResponse {
+  book_id: string;
+  session_id: string;
+  qa_plan_id: string;
+  question_text: string;
+  choices: Array<
+    RuntimePlanChoice & {
+      image: RuntimeRenderImage | null;
+    }
+  >;
+  internal: {
+    correct_choice_id: 'A' | 'B' | 'C';
+  };
+}
