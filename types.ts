@@ -117,6 +117,9 @@ export interface StoryFacts {
   characters: string[];
   characterCatalog: StoryCharacterFact[];
   characterImageMap?: StoryCharacterImageMap[];
+  characterGoldRefMap?: StoryCharacterGoldRefMap[];
+  characterTraitLocks?: StoryCharacterTraitLock[];
+  goldStyleRefIndex?: number;
   objectImageMap?: StoryObjectImageMap[];
   sceneCatalog?: SceneFact[];
   sceneImageMap?: SceneImageMap[];
@@ -134,6 +137,18 @@ export interface StoryFacts {
 export interface StoryCharacterImageMap {
   characterName: string;
   styleRefIndexes: number[];
+}
+
+export interface StoryCharacterGoldRefMap {
+  characterName: string;
+  faceRefIndex?: number;
+  bodyRefIndex?: number;
+}
+
+export interface StoryCharacterTraitLock {
+  characterName: string;
+  mustHaveTraits: string[];
+  negativeTraits: string[];
 }
 
 export interface StoryObjectImageMap {

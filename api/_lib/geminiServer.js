@@ -29,11 +29,10 @@ const REPLICATE_IMAGE_MODEL_STANDARD = (
 ).trim();
 const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
-const MIN_STYLE_REF_GROUNDING = 4;
-const REQUIRED_CHARACTER_REF_QUOTA = 2;
-const STYLE_REF_STYLE_ANCHOR_MIN = 2;
-const STYLE_REF_STYLE_ANCHOR_MAX = 3;
-const STYLE_REF_OBJECT_OPTIONAL_QUOTA = 1;
+const FAST_PRESET_STYLE_REF_COUNT = 1;
+const FAST_PRESET_CHARACTER_REF_COUNT = 1;
+const FAST_PRESET_INCLUDE_OBJECT_REF = false;
+const FAST_PRESET_INCLUDE_SCENE_REF_WHEN_NO_CHAR = true;
 const STYLE_REF_INDEX_LIMIT = 240;
 const STYLE_REF_POOL_LIMIT = 120;
 const STYLE_REF_CLASSIFY_BATCH_SIZE = 12;
@@ -507,6 +506,66 @@ const normalizeCharacterImageMap = (imageMap, characterCatalog, maxRefCount) => 
     characterName,
     styleRefIndexes
   }));
+};
+
+const normalizeCharacterGoldRefMap = (input, characterCatalog, maxRefCount) => {
+  const allowed = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [String(entry?.name || '').toLowerCase(), String(entry?.name || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const output = [];
+
+  for (const item of Array.isArray(input) ? input : []) {
+    const key = String(item?.characterName || item?.character_name || '').trim().toLowerCase();
+    const characterName = allowed.get(key);
+    if (!characterName) continue;
+
+    const faceRefIndex = Number(item?.faceRefIndex ?? item?.face_ref_index);
+    const bodyRefIndex = Number(item?.bodyRefIndex ?? item?.body_ref_index);
+    const normalizedItem = { characterName };
+
+    if (Number.isInteger(faceRefIndex) && faceRefIndex >= 0 && faceRefIndex < maxRefCount) {
+      normalizedItem.faceRefIndex = faceRefIndex;
+    }
+    if (Number.isInteger(bodyRefIndex) && bodyRefIndex >= 0 && bodyRefIndex < maxRefCount) {
+      normalizedItem.bodyRefIndex = bodyRefIndex;
+    }
+    if (!Number.isInteger(normalizedItem.faceRefIndex) && !Number.isInteger(normalizedItem.bodyRefIndex)) {
+      continue;
+    }
+
+    output.push(normalizedItem);
+  }
+
+  return output.slice(0, 32);
+};
+
+const normalizeCharacterTraitLocks = (input, characterCatalog) => {
+  const allowed = new Map(
+    (Array.isArray(characterCatalog) ? characterCatalog : [])
+      .map((entry) => [String(entry?.name || '').toLowerCase(), String(entry?.name || '').trim()])
+      .filter((entry) => entry[0] && entry[1])
+  );
+  const output = [];
+
+  for (const item of Array.isArray(input) ? input : []) {
+    const key = String(item?.characterName || item?.character_name || '').trim().toLowerCase();
+    const characterName = allowed.get(key);
+    if (!characterName) continue;
+
+    const mustHaveTraits = normalizeFactList(item?.mustHaveTraits || item?.must_have_traits || [], 5);
+    const negativeTraits = normalizeFactList(item?.negativeTraits || item?.negative_traits || [], 4);
+    if (mustHaveTraits.length === 0 && negativeTraits.length === 0) continue;
+
+    output.push({
+      characterName,
+      mustHaveTraits,
+      negativeTraits
+    });
+  }
+
+  return output.slice(0, 32);
 };
 
 const normalizeObjectImageMap = (imageMap, objects, maxRefCount) => {
@@ -1631,6 +1690,20 @@ const normalizeStoryFacts = (facts, storyBrief) => {
       facts?.objectEvidenceMap || facts?.object_evidence_map,
       facts?.objects
     ),
+    characterGoldRefMap: normalizeCharacterGoldRefMap(
+      facts?.characterGoldRefMap || facts?.character_gold_ref_map,
+      characterCatalog,
+      STYLE_REF_INDEX_LIMIT
+    ),
+    characterTraitLocks: normalizeCharacterTraitLocks(
+      facts?.characterTraitLocks || facts?.character_trait_locks,
+      characterCatalog
+    ),
+    goldStyleRefIndex: Number.isInteger(Number(facts?.goldStyleRefIndex))
+      ? Number(facts?.goldStyleRefIndex)
+      : Number.isInteger(Number(facts?.gold_style_ref_index))
+        ? Number(facts?.gold_style_ref_index)
+        : undefined,
     interactionPairs: normalizeInteractionPairs(
       [...explicitInteractionPairs, ...inferredInteractionPairs],
       characterCatalog
@@ -1662,6 +1735,17 @@ const normalizeStoryFacts = (facts, storyBrief) => {
     normalized.scenes = (normalized.sceneCatalog || []).map((scene) => scene.title).slice(0, 16);
   }
 
+  if (!Array.isArray(normalized.characterGoldRefMap) || normalized.characterGoldRefMap.length === 0) {
+    normalized.characterGoldRefMap = (normalized.characterImageMap || [])
+      .map((entry) => ({
+        characterName: entry.characterName,
+        faceRefIndex: Number.isInteger(entry.styleRefIndexes?.[0]) ? entry.styleRefIndexes[0] : undefined,
+        bodyRefIndex: Number.isInteger(entry.styleRefIndexes?.[1]) ? entry.styleRefIndexes[1] : undefined
+      }))
+      .filter((entry) => Number.isInteger(entry.faceRefIndex) || Number.isInteger(entry.bodyRefIndex))
+      .slice(0, 32);
+  }
+
   return normalized;
 };
 
@@ -1684,6 +1768,17 @@ const compactFactsForPrompt = (storyFacts) => {
       characterName: entry.characterName,
       styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
     })),
+    characterGoldRefMap: (normalized.characterGoldRefMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      characterName: entry.characterName,
+      faceRefIndex: entry.faceRefIndex,
+      bodyRefIndex: entry.bodyRefIndex
+    })),
+    characterTraitLocks: (normalized.characterTraitLocks || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
+      characterName: entry.characterName,
+      mustHaveTraits: entry.mustHaveTraits.slice(0, 5),
+      negativeTraits: entry.negativeTraits.slice(0, 4)
+    })),
+    goldStyleRefIndex: Number.isInteger(normalized.goldStyleRefIndex) ? normalized.goldStyleRefIndex : undefined,
     objectImageMap: (normalized.objectImageMap || []).slice(0, MAX_FACT_PROMPT_ITEMS).map((entry) => ({
       objectName: entry.objectName,
       styleRefIndexes: entry.styleRefIndexes.slice(0, 3)
@@ -2110,6 +2205,20 @@ const buildIllustrationAgentPrompt = ({
   const allowedScenes = (storyFacts?.sceneCatalog || []).map((scene) => `${scene.id}:${scene.title}`);
   const allowedCharacters = (storyFacts?.characterCatalog || []).map((entry) => entry.name);
   const allowedObjects = storyFacts?.objects || [];
+  const traitLockMap = new Map(
+    (Array.isArray(storyFacts?.characterTraitLocks) ? storyFacts.characterTraitLocks : [])
+      .map((entry) => [canonicalOption(entry?.characterName || ''), entry])
+      .filter((entry) => entry[0])
+  );
+  const requiredTraitLockSummary = dedupeOrderedList(participants?.requiredCharacters || [], 4)
+    .map((name) => {
+      const lock = traitLockMap.get(canonicalOption(name));
+      if (!lock) return null;
+      const mustHave = normalizeFactList(lock.mustHaveTraits || lock.must_have_traits || [], 5).join('; ');
+      const negative = normalizeFactList(lock.negativeTraits || lock.negative_traits || [], 4).join('; ');
+      return `${name}: must=${mustHave || 'n/a'} | avoid=${negative || 'n/a'}`;
+    })
+    .filter(Boolean);
   const refsSummary = (Array.isArray(selectedRefs) ? selectedRefs : [])
     .map((ref, idx) => `${idx + 1}) ${ref.kind}/${ref.source} scene=${ref.sceneId || '-'} char=${ref.characterName || '-'} obj=${ref.objectName || '-'}`)
     .join('\n');
@@ -2126,6 +2235,7 @@ const buildIllustrationAgentPrompt = ({
     `Allowed characters: ${allowedCharacters.join(', ') || 'none'}`,
     `Allowed objects: ${allowedObjects.join(', ') || 'none'}`,
     `Selected style refs:\n${refsSummary || 'none'}`,
+    `Character trait locks:\n${requiredTraitLockSummary.join('\n') || 'none'}`,
     'Rules:',
     '- Never invent entities outside allowed characters/objects/scenes.',
     '- If no character refs are selected, prefer scene/object composition with zero extra characters.',
@@ -2468,23 +2578,18 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
       .map((ref) => normalizePhrase(ref?.objectName || ''))
       .filter(Boolean)
   )];
-  const requiredCharacterNames = dedupeOrderedList(participants?.requiredCharacters || [], 6);
-  const participantCharacterSet = new Set([
-    ...requiredCharacterNames,
-    ...(participants?.characters || []),
-    ...(participants?.inferredCharacters || [])
-  ]);
+  const fallbackOptionCharacters = inferOptionCharacters(optionText, storyFacts);
+  const requiredCharacterNames = dedupeOrderedList(
+    (participants?.requiredCharacters || []).length > 0
+      ? participants.requiredCharacters
+      : fallbackOptionCharacters,
+    6
+  );
+  const allowedCharacters = requiredCharacterNames.slice(0, 12);
   const participantObjectSet = new Set([
     ...(participants?.objects || []),
     ...(participants?.inferredObjects || [])
   ]);
-  const allowedCharacters = (
-    requiredCharacterNames.length > 0
-      ? requiredCharacterNames
-      : allowedCharacterEntries
-          .map((entry) => entry.name)
-          .filter((name) => participantCharacterSet.size === 0 || participantCharacterSet.has(name))
-  ).slice(0, 12);
   const allowedObjects = (
     selectedObjectNames.length > 0
       ? selectedObjectNames
@@ -2508,14 +2613,30 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     ? illustrationPlan.must_avoid.entities.map((item) => normalizePhrase(item)).filter(Boolean)
     : [];
   const compositionNotes = normalizePhrase(illustrationPlan?.composition_notes || '');
-  const primaryCharacter = allowedCharacters[0] || '';
   const normalizedOption = canonicalOption(optionText);
   const interactionIntent = Boolean(participants?.interactionIntent || requiredCharacterNames.length >= 2);
   const optionUsesKnownCharacter = allowedCharacters.some((name) => {
     const normalizedName = canonicalOption(name);
     return normalizedName && normalizedOption.includes(normalizedName);
   });
-  const enforceSingleCharacter = !interactionIntent && requiredCharacterNames.length <= 1;
+  const traitLockMap = new Map(
+    (Array.isArray(storyFacts?.characterTraitLocks) ? storyFacts.characterTraitLocks : [])
+      .map((entry) => [canonicalOption(entry?.characterName || ''), entry])
+      .filter((entry) => entry[0])
+  );
+  const traitLockRules = [];
+  for (const characterName of allowedCharacters) {
+    const lock = traitLockMap.get(canonicalOption(characterName));
+    if (!lock) continue;
+    const mustHave = normalizeFactList(lock.mustHaveTraits || lock.must_have_traits || [], 5);
+    const negative = normalizeFactList(lock.negativeTraits || lock.negative_traits || [], 4);
+    if (mustHave.length > 0) {
+      traitLockRules.push(`- ${characterName} must-have traits: ${mustHave.join('; ')}.`);
+    }
+    if (negative.length > 0) {
+      traitLockRules.push(`- ${characterName} avoid traits: ${negative.join('; ')}.`);
+    }
+  }
 
   const characterRules = allowedCharacters.length > 0
     ? [
@@ -2530,11 +2651,10 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
         optionUsesKnownCharacter
           ? '- The matching allowed character must be visually recognizable.'
           : '- For place/object options, draw zero characters unless absolutely required.',
-        enforceSingleCharacter && !optionUsesKnownCharacter && primaryCharacter
-          ? `- If the scene needs a character, use "${primaryCharacter}" only.`
-          : requiredCharacterNames.length >= 2
-            ? '- Do not collapse this scene into a single-character image.'
-            : '- If the scene needs a character, use only one allowed character.'
+        requiredCharacterNames.length >= 2
+          ? '- Do not collapse this scene into a single-character image.'
+          : '- Use one character only when the card is single-character.',
+        ...traitLockRules
       ]
     : [
         '- Do not invent any characters.',
@@ -2543,11 +2663,8 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
 
   const styleLayer = [
     'STYLE LAYER:',
-    `- Match the attached style references exactly.`,
+    '- Match the attached style references exactly.',
     `- Art style description: ${artStyle || 'Children\'s book illustration'}.`,
-    participantCharacterSet.size > 0
-      ? `- Character visual anchors from references: ${[...participantCharacterSet].join(', ')}.`
-      : '- Use reference style consistency for all visible characters.',
     selectedCharacterNames.length > 0
       ? `- Characters visible in selected references: ${selectedCharacterNames.join(', ')}.`
       : '- If characters appear, match selected references exactly.',
@@ -2578,6 +2695,9 @@ const buildImagePrompt = ({ optionText, renderMode, storyBrief, artStyle, storyF
     '- Keep clean linework, soft kid-friendly colors, and one clear focal subject.',
     '- Composition must be easy for a non-verbal child to recognize quickly.',
     '- Do not invent any character or object outside the provided allowed lists.',
+    interactionIntent && requiredCharacterNames.length >= 2
+      ? '- This card is an interaction scene. Show all required characters.'
+      : '- Keep scenes as simple as possible for fast recognition.',
     ...characterRules
   ];
 
@@ -2997,30 +3117,95 @@ const resolveTurnContextParticipants = async (ai, text, storyFacts, refsWithMeta
   };
 };
 
-const scoreStyleReference = (reference, participants) => {
-  let score = (reference.confidence || 0.5) * 100 + (reference.qualityScore || reference.confidence || 0.5) * 40;
+const resolveGoldStyleRefIndexForTurn = (storyFacts, refsWithMeta) => {
+  const refs = Array.isArray(refsWithMeta) ? refsWithMeta : [];
+  if (refs.length === 0) return -1;
 
-  if (participants.scenes.includes(reference.sceneId || '')) {
-    score += 48;
+  const goldFromFacts = Number(storyFacts?.goldStyleRefIndex);
+  if (Number.isInteger(goldFromFacts) && goldFromFacts >= 0 && goldFromFacts < refs.length) {
+    return goldFromFacts;
   }
 
-  if (reference.characterName && participants.characters.includes(reference.characterName)) {
-    score += 62;
-  } else if (reference.characterName && participants.inferredCharacters.includes(reference.characterName)) {
-    score += 34;
+  const sceneCandidates = refs
+    .map((ref, index) => ({ ref, index }))
+    .filter((entry) => entry.ref?.kind === 'scene')
+    .sort((a, b) => {
+      const bScore = (b.ref?.qualityScore || b.ref?.confidence || 0.5);
+      const aScore = (a.ref?.qualityScore || a.ref?.confidence || 0.5);
+      if (bScore !== aScore) return bScore - aScore;
+      return a.index - b.index;
+    });
+  if (sceneCandidates.length > 0) {
+    return sceneCandidates[0].index;
   }
 
-  if (reference.objectName && participants.objects.includes(reference.objectName)) {
-    score += 54;
-  } else if (reference.objectName && participants.inferredObjects.includes(reference.objectName)) {
-    score += 28;
+  return 0;
+};
+
+const buildCharacterGoldRefLookup = (storyFacts) => {
+  const byCharacter = new Map();
+
+  for (const entry of Array.isArray(storyFacts?.characterGoldRefMap) ? storyFacts.characterGoldRefMap : []) {
+    const characterName = normalizePhrase(entry?.characterName || '');
+    if (!characterName) continue;
+
+    const indexes = [];
+    const faceRefIndex = Number(entry?.faceRefIndex);
+    const bodyRefIndex = Number(entry?.bodyRefIndex);
+    if (Number.isInteger(faceRefIndex) && faceRefIndex >= 0) {
+      indexes.push(faceRefIndex);
+    }
+    if (Number.isInteger(bodyRefIndex) && bodyRefIndex >= 0 && !indexes.includes(bodyRefIndex)) {
+      indexes.push(bodyRefIndex);
+    }
+    if (indexes.length > 0) {
+      byCharacter.set(canonicalOption(characterName), indexes);
+    }
   }
 
-  if (reference.assetRole === 'scene_anchor' && participants.scenes.length > 0) score += 12;
-  if (reference.assetRole === 'character_form' && participants.characters.length > 0) score += 10;
-  if (reference.assetRole === 'object_anchor' && participants.objects.length > 0) score += 8;
+  for (const entry of Array.isArray(storyFacts?.characterImageMap) ? storyFacts.characterImageMap : []) {
+    const characterName = normalizePhrase(entry?.characterName || '');
+    if (!characterName) continue;
+    const key = canonicalOption(characterName);
+    if (byCharacter.has(key)) continue;
 
-  return score;
+    const indexes = (Array.isArray(entry?.styleRefIndexes) ? entry.styleRefIndexes : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value >= 0);
+    if (indexes.length > 0) {
+      byCharacter.set(key, indexes.slice(0, 2));
+    }
+  }
+
+  return byCharacter;
+};
+
+const buildObjectRefLookup = (storyFacts) => {
+  const byObject = new Map();
+  for (const entry of Array.isArray(storyFacts?.objectImageMap) ? storyFacts.objectImageMap : []) {
+    const objectName = normalizePhrase(entry?.objectName || '');
+    if (!objectName) continue;
+    const indexes = (Array.isArray(entry?.styleRefIndexes) ? entry.styleRefIndexes : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value >= 0);
+    if (indexes.length > 0) {
+      byObject.set(canonicalOption(objectName), indexes);
+    }
+  }
+  return byObject;
+};
+
+const shouldIncludeSceneAnchorRef = (participants, optionText) => {
+  if (!FAST_PRESET_INCLUDE_SCENE_REF_WHEN_NO_CHAR) return false;
+  const requiredCount = (participants?.requiredCharacters || []).length;
+  if (requiredCount > 0) return false;
+
+  const hasScene = Array.isArray(participants?.scenes) && participants.scenes.length > 0;
+  if (!hasScene) return false;
+
+  const normalized = canonicalOption(optionText);
+  if (!normalized) return false;
+  return /\b(where|take place|happen|happened|setting|scene|location)\b/.test(normalized);
 };
 
 const selectStyleRefsForOption = async (
@@ -3049,127 +3234,97 @@ const selectStyleRefsForOption = async (
     resolveRequiredCharactersForTurn(optionText, storyFacts, questionParticipants)
   );
   const selectedRefs = [];
-  const selectedIndexes = new Set();
-  const rankedRefs = (predicate, scoringParticipants = participants) =>
-    refsWithMeta
-      .map((reference, index) => ({ reference, index }))
-      .filter((entry) => predicate(entry.reference))
-      .map((entry) => ({
-        ...entry,
-        score: scoreStyleReference(entry.reference, scoringParticipants)
-      }))
-      .sort((a, b) => b.score - a.score || a.index - b.index);
-
-  const pushRanked = (ranked, limit) => {
-    for (const item of ranked) {
-      if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) break;
-      if (limit <= 0) break;
-      if (selectedIndexes.has(item.index)) continue;
-      selectedIndexes.add(item.index);
-      selectedRefs.push(item.reference);
-      limit -= 1;
-    }
+  const selectedStyleRefIndexes = [];
+  const selectedIndexSet = new Set();
+  const pushRefByIndex = (index) => {
+    if (!Number.isInteger(index) || index < 0 || index >= refsWithMeta.length) return false;
+    if (selectedIndexSet.has(index)) return false;
+    if (selectedRefs.length >= STYLE_REF_MAX_TOTAL) return false;
+    selectedIndexSet.add(index);
+    selectedStyleRefIndexes.push(index);
+    selectedRefs.push(refsWithMeta[index]);
+    return true;
   };
 
   const requiredCharacters = dedupeOrderedList(
-    [...(participants.requiredCharacters || []), ...participants.characters],
+    (participants?.requiredCharacters || []).length > 0
+      ? participants.requiredCharacters
+      : inferOptionCharacters(optionText, storyFacts),
     4
   );
+
+  const goldStyleRefIndex = resolveGoldStyleRefIndexForTurn(storyFacts, refsWithMeta);
+  if (FAST_PRESET_STYLE_REF_COUNT > 0) {
+    pushRefByIndex(goldStyleRefIndex);
+  }
+
+  const characterGoldLookup = buildCharacterGoldRefLookup(storyFacts);
   for (const characterName of requiredCharacters) {
-    const rankedCharacter = rankedRefs(
-      (reference) =>
-        isTightMappedRef(reference, 'character') &&
-        canonicalOption(reference.characterName || '') === canonicalOption(characterName || '')
-    );
-    pushRanked(rankedCharacter, REQUIRED_CHARACTER_REF_QUOTA);
-  }
-
-  const targetScenes = dedupeOrderedList(
-    [
-      ...(participants.scenes || []),
-      ...(questionParticipants?.scenes || [])
-    ],
-    6
-  );
-  const sceneParticipantsForScore = {
-    ...participants,
-    scenes: targetScenes.length > 0 ? targetScenes : participants.scenes
-  };
-  const rankedSceneAnchors = rankedRefs(
-    (reference) =>
-      reference.kind === 'scene' &&
-      (
-        targetScenes.length === 0 ||
-        targetScenes.includes(reference.sceneId || '')
-      ),
-    sceneParticipantsForScore
-  );
-  pushRanked(rankedSceneAnchors, STYLE_REF_STYLE_ANCHOR_MAX);
-  if (selectedRefs.length < requiredCharacters.length + STYLE_REF_STYLE_ANCHOR_MIN) {
-    pushRanked(rankedSceneAnchors, requiredCharacters.length + STYLE_REF_STYLE_ANCHOR_MIN - selectedRefs.length);
-  }
-
-  const rankedObjectAnchors = rankedRefs(
-    (reference) =>
-      isTightMappedRef(reference, 'object') &&
-      (
-        participants.objects.includes(reference.objectName || '') ||
-        participants.inferredObjects.includes(reference.objectName || '')
-      )
-  );
-  pushRanked(rankedObjectAnchors, STYLE_REF_OBJECT_OPTIONAL_QUOTA);
-
-  const relevantCharacterSet = new Set([
-    ...requiredCharacters,
-    ...participants.characters,
-    ...participants.inferredCharacters
-  ]);
-  const relevantObjectSet = new Set([
-    ...participants.objects,
-    ...participants.inferredObjects
-  ]);
-  const relevantSceneSet = new Set(targetScenes);
-
-  const rankedRelevantExtras = rankedRefs((reference) => {
-    if (reference.kind === 'scene') {
-      return relevantSceneSet.size === 0 || relevantSceneSet.has(reference.sceneId || '');
+    const candidateIndexes = characterGoldLookup.get(canonicalOption(characterName)) || [];
+    let addedForCharacter = 0;
+    for (const index of candidateIndexes) {
+      const ref = refsWithMeta[index];
+      if (!ref || !isTightMappedRef(ref, 'character')) continue;
+      if (!pushRefByIndex(index)) continue;
+      addedForCharacter += 1;
+      if (addedForCharacter >= FAST_PRESET_CHARACTER_REF_COUNT) break;
     }
-    if (reference.kind === 'character') {
-      return isTightMappedRef(reference, 'character') &&
-        relevantCharacterSet.has(reference.characterName || '');
-    }
-    if (reference.kind === 'object') {
-      return isTightMappedRef(reference, 'object') &&
-        relevantObjectSet.has(reference.objectName || '');
-    }
-    return false;
-  });
-  pushRanked(rankedRelevantExtras, STYLE_REF_MAX_TOTAL - selectedRefs.length);
+    if (addedForCharacter >= FAST_PRESET_CHARACTER_REF_COUNT) continue;
 
-  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
-    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
-    const rankedGlobalScenes = rankedRefs((reference) => reference.kind === 'scene');
-    pushRanked(rankedGlobalScenes, groundingNeed);
+    const fallbackRef = refsWithMeta
+      .map((ref, index) => ({ ref, index }))
+      .find((entry) =>
+        canonicalOption(entry.ref?.characterName || '') === canonicalOption(characterName || '') &&
+        isTightMappedRef(entry.ref, 'character')
+      );
+    if (fallbackRef) {
+      pushRefByIndex(fallbackRef.index);
+    }
   }
-  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
-    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
-    const rankedGlobalCharacters = rankedRefs(
-      (reference) => isTightMappedRef(reference, 'character')
+
+  if (shouldIncludeSceneAnchorRef(participants, optionText)) {
+    const targetSceneSet = new Set(
+      dedupeOrderedList([
+        ...(participants?.scenes || []),
+        ...(questionParticipants?.scenes || [])
+      ], 6)
     );
-    pushRanked(rankedGlobalCharacters, groundingNeed);
+    const sceneCandidate = refsWithMeta
+      .map((ref, index) => ({ ref, index }))
+      .filter((entry) => entry.ref?.kind === 'scene' && targetSceneSet.has(entry.ref.sceneId || ''))
+      .sort((a, b) => {
+        const bScore = (b.ref?.qualityScore || b.ref?.confidence || 0.5);
+        const aScore = (a.ref?.qualityScore || a.ref?.confidence || 0.5);
+        if (bScore !== aScore) return bScore - aScore;
+        return a.index - b.index;
+      })[0];
+    if (sceneCandidate) {
+      pushRefByIndex(sceneCandidate.index);
+    }
   }
-  if (selectedRefs.length < MIN_STYLE_REF_GROUNDING) {
-    const groundingNeed = MIN_STYLE_REF_GROUNDING - selectedRefs.length;
-    const rankedGlobalObjects = rankedRefs(
-      (reference) => isTightMappedRef(reference, 'object')
-    );
-    pushRanked(rankedGlobalObjects, groundingNeed);
+
+  if (FAST_PRESET_INCLUDE_OBJECT_REF) {
+    const objectLookup = buildObjectRefLookup(storyFacts);
+    for (const objectName of dedupeOrderedList(participants?.objects || [], 2)) {
+      const index = (objectLookup.get(canonicalOption(objectName)) || [])[0];
+      const ref = Number.isInteger(index) ? refsWithMeta[index] : null;
+      if (!ref || !isTightMappedRef(ref, 'object')) continue;
+      pushRefByIndex(index);
+      break;
+    }
+  }
+
+  if (selectedRefs.length === 0 && refsWithMeta.length > 0) {
+    pushRefByIndex(0);
   }
 
   return {
     refs: selectedRefs.slice(0, STYLE_REF_MAX_TOTAL),
-    participants,
-    selectedStyleRefIndexes: [...selectedIndexes].slice(0, STYLE_REF_MAX_TOTAL)
+    participants: {
+      ...participants,
+      requiredCharacters
+    },
+    selectedStyleRefIndexes: selectedStyleRefIndexes.slice(0, STYLE_REF_MAX_TOTAL)
   };
 };
 
@@ -3452,19 +3607,49 @@ const buildStyleBibleFromModel = async (ai, { summary, artStyle, styleReferences
 const buildEntityRecords = (storyFacts, imageIdsByIndex) => {
   const records = [];
   const styleTags = normalizeFactList(storyFacts?.worldTags || [], 8);
+  const characterGoldMap = new Map(
+    (Array.isArray(storyFacts?.characterGoldRefMap) ? storyFacts.characterGoldRefMap : [])
+      .map((entry) => [canonicalOption(entry?.characterName || ''), entry])
+      .filter((entry) => entry[0])
+  );
+  const characterTraitMap = new Map(
+    (Array.isArray(storyFacts?.characterTraitLocks) ? storyFacts.characterTraitLocks : [])
+      .map((entry) => [canonicalOption(entry?.characterName || ''), entry])
+      .filter((entry) => entry[0])
+  );
 
   for (const character of storyFacts?.characterCatalog || []) {
+    const characterKey = canonicalOption(character.name);
     const styleRefIndexes = (storyFacts?.characterImageMap || [])
       .find((entry) => entry.characterName === character.name)
       ?.styleRefIndexes || [];
-    const mappedImageIds = styleRefIndexes
-      .map((index) => imageIdsByIndex.get(index))
-      .filter(Boolean);
-    const visualAssets = mappedImageIds.map((imageId, idx) => ({
-      imageId,
-      role: idx === 0 ? 'gold_face' : idx === 1 ? 'gold_body' : 'reference',
-      styleRefIndex: styleRefIndexes[idx]
-    }));
+    const goldEntry = characterGoldMap.get(characterKey);
+    const goldFaceIndex = Number(goldEntry?.faceRefIndex);
+    const goldBodyIndex = Number(goldEntry?.bodyRefIndex);
+    const prioritizedIndexes = [];
+    if (Number.isInteger(goldFaceIndex) && goldFaceIndex >= 0) {
+      prioritizedIndexes.push(goldFaceIndex);
+    }
+    if (Number.isInteger(goldBodyIndex) && goldBodyIndex >= 0 && !prioritizedIndexes.includes(goldBodyIndex)) {
+      prioritizedIndexes.push(goldBodyIndex);
+    }
+    for (const index of styleRefIndexes) {
+      const n = Number(index);
+      if (!Number.isInteger(n) || n < 0) continue;
+      if (!prioritizedIndexes.includes(n)) {
+        prioritizedIndexes.push(n);
+      }
+    }
+    const traitLock = characterTraitMap.get(characterKey);
+    const mustHaveTraits = normalizeFactList(traitLock?.mustHaveTraits || traitLock?.must_have_traits || [], 5);
+    const negativeTraits = normalizeFactList(traitLock?.negativeTraits || traitLock?.negative_traits || [], 4);
+    const visualAssets = prioritizedIndexes
+      .map((index, idx) => ({
+        imageId: imageIdsByIndex.get(index),
+        role: idx === 0 ? 'gold_face' : idx === 1 ? 'gold_body' : 'reference',
+        styleRefIndex: index
+      }))
+      .filter((asset) => Boolean(asset.imageId));
 
     records.push({
       entityId: makeEntityId('character', character.name),
@@ -3472,13 +3657,13 @@ const buildEntityRecords = (storyFacts, imageIdsByIndex) => {
       aliases: [],
       type: 'character',
       canonicalDescription: `${character.name} from the story`,
-      mustHaveTraits: [],
-      negativeTraits: [],
+      mustHaveTraits,
+      negativeTraits,
       styleTags,
       visualAssets,
       goldRefs: {
-        face: mappedImageIds[0],
-        body: mappedImageIds[1]
+        face: visualAssets[0]?.imageId,
+        body: visualAssets[1]?.imageId
       }
     });
   }
@@ -3547,6 +3732,133 @@ const buildEntityRecords = (storyFacts, imageIdsByIndex) => {
   }
 
   return records;
+};
+
+const chooseGoldStyleRefIndex = (styleReferences) => {
+  const refs = Array.isArray(styleReferences) ? styleReferences : [];
+  let bestIndex = -1;
+  let bestScore = -1;
+
+  refs.forEach((ref, index) => {
+    if (!ref?.mimeType || !ref?.data) return;
+    const isSceneLike = ref.kind === 'scene' ? 1 : 0;
+    const score = (isSceneLike * 1000) + ((ref.qualityScore || ref.confidence || 0.5) * 100) - (index * 0.01);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+
+  return Number.isInteger(bestIndex) && bestIndex >= 0 ? bestIndex : undefined;
+};
+
+const buildCharacterGoldRefMap = (storyFacts, styleReferences) => {
+  const refs = Array.isArray(styleReferences) ? styleReferences : [];
+  const maxIndex = refs.length;
+  const byCharacter = new Map();
+
+  for (const entry of Array.isArray(storyFacts?.characterImageMap) ? storyFacts.characterImageMap : []) {
+    const characterName = normalizePhrase(entry?.characterName || '');
+    if (!characterName) continue;
+    const indexes = (Array.isArray(entry?.styleRefIndexes) ? entry.styleRefIndexes : [])
+      .map((index) => Number(index))
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < maxIndex);
+    if (indexes.length === 0) continue;
+
+    const ranked = indexes
+      .map((index) => ({
+        index,
+        score: (refs[index]?.qualityScore || refs[index]?.confidence || 0.5) * 100
+      }))
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .map((item) => item.index);
+
+    byCharacter.set(characterName.toLowerCase(), {
+      characterName,
+      faceRefIndex: ranked[0],
+      bodyRefIndex: ranked[1]
+    });
+  }
+
+  return Array.from(byCharacter.values()).slice(0, 32);
+};
+
+const fallbackTraitLocksForCharacters = (storyFacts) =>
+  (Array.isArray(storyFacts?.characterCatalog) ? storyFacts.characterCatalog : [])
+    .map((entry) => {
+      const name = normalizePhrase(entry?.name || '');
+      if (!name) return null;
+      return {
+        characterName: name,
+        mustHaveTraits: [
+          'same species and silhouette as the book references',
+          'same key colors and markings as the book references',
+          'same face shape and eye style as the book references'
+        ],
+        negativeTraits: [
+          'do not change species',
+          'do not add new costume or props',
+          'do not switch to realistic rendering'
+        ]
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 24);
+
+const extractCharacterTraitLocks = async (ai, storyText, storyFacts) => {
+  const characterNames = (storyFacts?.characterCatalog || []).map((entry) => entry.name).filter(Boolean);
+  if (characterNames.length === 0) return [];
+
+  try {
+    const response = await retryWithBackoff(() =>
+      ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [{
+            text: [
+              'Create concise visual trait locks for known story characters.',
+              `Characters: ${characterNames.join(', ')}`,
+              `Story text:\n${compactStoryTextForPrompt(storyText || '')}`,
+              'Return strict JSON with "character_trait_locks".',
+              'Each item: { character_name, must_have_traits[3..5], negative_traits[2..4] }',
+              'Rules:',
+              '- Traits must be visual and illustration-focused.',
+              '- Use only character names from the provided list.',
+              '- Keep traits short phrases.'
+            ].join('\n')
+          }]
+        },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingBudget: 0 },
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              character_trait_locks: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    character_name: { type: Type.STRING },
+                    must_have_traits: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    negative_traits: { type: Type.ARRAY, items: { type: Type.STRING } }
+                  },
+                  required: ['character_name', 'must_have_traits', 'negative_traits']
+                }
+              }
+            },
+            required: ['character_trait_locks']
+          }
+        }
+      })
+    );
+
+    const payload = parseJsonSafe(response.text, { character_trait_locks: [] });
+    return normalizeCharacterTraitLocks(payload.character_trait_locks, storyFacts?.characterCatalog || []);
+  } catch (error) {
+    console.warn('[setup] character trait locks extraction failed', error?.message || error);
+    return [];
+  }
 };
 
 const buildQaReadyBookPackage = async (
@@ -3942,7 +4254,7 @@ export const setupStoryPack = async (
     ...storyFacts,
     sceneCatalog: enrichedSceneCatalog
   });
-  const storyFactsWithImageMap = normalizeStoryFacts(
+  let storyFactsWithImageMap = normalizeStoryFacts(
     {
       ...storyFacts,
       sceneCatalog: enrichedSceneCatalog,
@@ -3956,6 +4268,21 @@ export const setupStoryPack = async (
   );
   const pagesTextPayload = await pagesTextPromise;
   const storyText = pagesTextPayload.storyText || await storyTextPromise;
+  const characterGoldRefMap = buildCharacterGoldRefMap(storyFactsWithImageMap, finalStyleReferences);
+  const goldStyleRefIndex = chooseGoldStyleRefIndex(finalStyleReferences);
+  const extractedTraitLocks = await extractCharacterTraitLocks(ai, storyText, storyFactsWithImageMap);
+  const characterTraitLocks = extractedTraitLocks.length > 0
+    ? extractedTraitLocks
+    : fallbackTraitLocksForCharacters(storyFactsWithImageMap);
+  storyFactsWithImageMap = normalizeStoryFacts(
+    {
+      ...storyFactsWithImageMap,
+      characterGoldRefMap,
+      characterTraitLocks,
+      goldStyleRefIndex
+    },
+    storyBrief
+  );
   const qaReadyPackage = await buildQaReadyBookPackage(ai, {
     storyFile,
     summary,
