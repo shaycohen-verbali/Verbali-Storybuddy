@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { BookOpen, Key, ArrowRight, RotateCcw, RefreshCw, AlertCircle, Library as LibraryIcon, Bug, X } from 'lucide-react';
-import { AppMode, FileData, Option, Publisher, StoryAssets, StoryManifest, StoryMetadata, StoryPack, StyleReferenceAsset } from './types';
+import { AppMode, FileData, ImageModelPreference, Option, Publisher, StoryAssets, StoryManifest, StoryMetadata, StoryPack, StyleReferenceAsset } from './types';
 import { USE_BACKEND_PIPELINE } from './services/apiClient';
 import RecordButton from './components/RecordButton';
 import OptionCard from './components/OptionCard';
@@ -29,6 +29,7 @@ const App: React.FC = () => {
   const [setupView, setSetupView] = useState<SetupViewState | null>(null);
   const [showAiDebug, setShowAiDebug] = useState(false);
   const [expandedDebugImage, setExpandedDebugImage] = useState<{ src: string; label?: string } | null>(null);
+  const [imageModelPreference, setImageModelPreference] = useState<ImageModelPreference>('nano-banana-pro');
   const buildCommit = (__APP_COMMIT_SHA__ || 'local-dev').slice(0, 7);
   const buildLabel = `${__APP_REPO_SLUG__}@${buildCommit}`;
 
@@ -58,7 +59,7 @@ const App: React.FC = () => {
     retry,
     selectOption,
     resetConversation
-  } = useTurnPipeline(activeAssets);
+  } = useTurnPipeline(activeAssets, imageModelPreference);
 
   useEffect(() => {
     if (USE_BACKEND_PIPELINE) {
@@ -316,6 +317,10 @@ const App: React.FC = () => {
     await updatePublisherImage(publisherId, coverImage);
   }, [updatePublisherImage]);
 
+  const handlePrepareStory = useCallback((storyFile: FileData, styleImages: FileData[]) => {
+    return prepareStory(storyFile, styleImages, imageModelPreference);
+  }, [prepareStory, imageModelPreference]);
+
   if (!hasApiKey) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-kid-blue to-kid-orange flex items-center justify-center p-4">
@@ -346,6 +351,19 @@ const App: React.FC = () => {
           {currentMode === AppMode.LIBRARY && (
             <div className="px-3 py-2 bg-white rounded-full shadow-md text-[11px] text-gray-500 font-mono">
               Build {buildLabel}
+            </div>
+          )}
+          {currentMode !== AppMode.LIBRARY && (
+            <div className="px-3 py-2 bg-white rounded-full shadow-md border border-indigo-100 flex items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-indigo-700">Image model</span>
+              <select
+                value={imageModelPreference}
+                onChange={(event) => setImageModelPreference(event.target.value as ImageModelPreference)}
+                className="text-xs font-semibold bg-transparent text-gray-700 focus:outline-none"
+              >
+                <option value="nano-banana-pro">Nano Banana Pro</option>
+                <option value="nano-banana">Nano Banana</option>
+              </select>
             </div>
           )}
           {currentMode === AppMode.STORY && (
@@ -687,7 +705,7 @@ const App: React.FC = () => {
       {currentMode === AppMode.SETUP && (
         <SetupPanel
           publishers={publishers}
-          onPrepareStory={prepareStory}
+          onPrepareStory={handlePrepareStory}
           onComplete={handleSetupComplete}
           onSaveExisting={handleSaveExistingSetup}
           onUpdatePublisherImage={handleUpdatePublisherImage}

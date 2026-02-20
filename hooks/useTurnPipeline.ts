@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
-import { ChatTurn, Option, StoryAssets } from '../types';
+import { ChatTurn, ImageModelPreference, Option, StoryAssets } from '../types';
 import { initialTurnSessionState, turnSessionReducer } from '../features/session/sessionReducer';
 import { requestTtsFromBackend, runTurnWithBackend, USE_BACKEND_PIPELINE } from '../services/apiClient';
 import { decodePcm16AudioBase64, playAudioBuffer, playPcm16AudioBase64 } from '../services/audioService';
@@ -64,7 +64,10 @@ const toUserFacingTurnError = (error: unknown): string => {
   return 'Something went wrong processing your request.';
 };
 
-export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
+export const useTurnPipeline = (
+  activeAssets: StoryAssets | null,
+  imageModelPreference: ImageModelPreference = 'nano-banana-pro'
+) => {
   const [state, dispatch] = useReducer(turnSessionReducer, initialTurnSessionState);
   const stateRef = useRef(state);
   const ttsCacheRef = useRef<Map<string, Promise<TtsResponse>>>(new Map());
@@ -140,6 +143,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
           audioBase64,
           mimeType: audioBlob.type,
           storyText,
+          imageModelPreference,
           storyBrief: activeAssets.storyBrief,
           storyFacts: activeAssets.metadata.storyFacts,
           artStyle: activeAssets.metadata.artStyle || 'Children\'s book illustration',
@@ -267,7 +271,7 @@ export const useTurnPipeline = (activeAssets: StoryAssets | null) => {
       console.error('Turn pipeline failed', error);
       dispatch({ type: 'SET_ERROR', error: toUserFacingTurnError(error) });
     }
-  }, [activeAssets, warmTtsCache]);
+  }, [activeAssets, imageModelPreference, warmTtsCache]);
 
   const retry = useCallback(() => {
     if (stateRef.current.lastAudioBlob) {

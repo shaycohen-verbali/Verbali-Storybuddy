@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import { SetupStoryResponse, FileData } from '../types';
+import { SetupStoryResponse, FileData, ImageModelPreference } from '../types';
 import { setupStoryWithBackend, USE_BACKEND_PIPELINE } from '../services/apiClient';
 import { logPayloadSize, logSetupTimings } from '../services/performanceService';
 import * as GeminiService from '../services/geminiService';
@@ -8,13 +8,17 @@ export const useStorySetup = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const prepareStory = useCallback(async (storyFile: FileData, styleImages: FileData[]): Promise<SetupStoryResponse> => {
+  const prepareStory = useCallback(async (
+    storyFile: FileData,
+    styleImages: FileData[],
+    imageModelPreference: ImageModelPreference = 'nano-banana-pro'
+  ): Promise<SetupStoryResponse> => {
     setIsProcessing(true);
     setError(null);
 
     try {
       if (USE_BACKEND_PIPELINE) {
-        const response = await setupStoryWithBackend({ storyFile, styleImages });
+        const response = await setupStoryWithBackend({ storyFile, styleImages, imageModelPreference });
         return response;
       }
 

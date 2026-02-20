@@ -19,7 +19,11 @@ export default async function handler(req, res) {
       return send(res, 400, { error: 'storyFile is required' });
     }
 
-    const result = await setupStoryPack(body.storyFile, body.styleImages || []);
+    const result = await setupStoryPack(
+      body.storyFile,
+      body.styleImages || [],
+      body.imageModelPreference || 'nano-banana-pro'
+    );
     return send(res, 200, {
       ...result,
       payloadBytes

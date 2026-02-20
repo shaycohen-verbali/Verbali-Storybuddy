@@ -3,6 +3,8 @@ export interface FileData {
   mimeType: string;
 }
 
+export type ImageModelPreference = 'nano-banana-pro' | 'nano-banana';
+
 export type StyleReferenceKind = 'scene' | 'character' | 'object';
 export type StyleReferenceSource = 'pdf_page' | 'upload' | 'crop' | 'generated';
 
@@ -268,6 +270,7 @@ export interface PipelineTimings {
 export interface SetupStoryRequest {
   storyFile: FileData;
   styleImages: FileData[];
+  imageModelPreference?: ImageModelPreference;
 }
 
 export interface SetupStoryResponse {
@@ -281,6 +284,7 @@ export interface TurnRequest {
   mimeType: string;
   storyText: string;
   storyPdf?: FileData;
+  imageModelPreference?: ImageModelPreference;
   storyBrief: string;
   storyFacts?: StoryFacts;
   artStyle: string;

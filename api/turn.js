@@ -24,6 +24,7 @@ export default async function handler(req, res) {
       body.mimeType,
       body.storyText,
       body.storyPdf,
+      body.imageModelPreference || 'nano-banana-pro',
       body.storyBrief,
       body.storyFacts || null,
       body.artStyle,

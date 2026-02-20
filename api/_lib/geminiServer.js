@@ -15,11 +15,18 @@ const MAX_HISTORY_TEXT_CHARS = 90;
 const MAX_FACT_PROMPT_ITEMS = 8;
 const ANSWER_AGENT_MODEL = 'gemini-3-flash-preview';
 const ILLUSTRATION_AGENT_MODEL = 'gemini-3-flash-preview';
-const REPLICATE_IMAGE_MODEL = (
+const IMAGE_MODEL_PREFERENCE_PRO = 'nano-banana-pro';
+const IMAGE_MODEL_PREFERENCE_STANDARD = 'nano-banana';
+const DEFAULT_IMAGE_MODEL_PREFERENCE = IMAGE_MODEL_PREFERENCE_PRO;
+const REPLICATE_IMAGE_MODEL_PRO = (
+  process.env.REPLICATE_IMAGE_MODEL_NANO_BANANA_PRO ||
   process.env.REPLICATE_IMAGE_MODEL ||
   'google/nano-banana-pro:d71e2df08d6ef4c4fb6d3773e9e557de6312e04444940dbb81fd73366ed83941'
 ).trim();
-const IMAGE_MODEL = REPLICATE_IMAGE_MODEL;
+const REPLICATE_IMAGE_MODEL_STANDARD = (
+  process.env.REPLICATE_IMAGE_MODEL_NANO_BANANA ||
+  ''
+).trim();
 const REPLICATE_PREDICTIONS_URL = 'https://api.replicate.com/v1/predictions';
 const STYLE_REF_MAX_TOTAL = 14;
 const MIN_STYLE_REF_GROUNDING = 4;
@@ -87,9 +94,33 @@ const getClient = () => {
 const getReplicateToken = () => {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) {
-    throw new Error('Image generation is configured for Replicate nano-banana-pro only. Missing REPLICATE_API_TOKEN.');
+    throw new Error('Image generation is configured for Replicate models. Missing REPLICATE_API_TOKEN.');
   }
   return token;
+};
+
+const normalizeImageModelPreference = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === IMAGE_MODEL_PREFERENCE_STANDARD) return IMAGE_MODEL_PREFERENCE_STANDARD;
+  return IMAGE_MODEL_PREFERENCE_PRO;
+};
+
+const resolveReplicateImageModel = (preference) => {
+  const normalizedPreference = normalizeImageModelPreference(preference);
+  const modelVersion = normalizedPreference === IMAGE_MODEL_PREFERENCE_STANDARD
+    ? REPLICATE_IMAGE_MODEL_STANDARD
+    : REPLICATE_IMAGE_MODEL_PRO;
+  if (!modelVersion) {
+    const envName = normalizedPreference === IMAGE_MODEL_PREFERENCE_STANDARD
+      ? 'REPLICATE_IMAGE_MODEL_NANO_BANANA'
+      : 'REPLICATE_IMAGE_MODEL_NANO_BANANA_PRO';
+    throw new Error(`Image model "${normalizedPreference}" is not configured. Missing ${envName}.`);
+  }
+
+  return {
+    preference: normalizedPreference,
+    modelVersion
+  };
 };
 
 const partsToReplicateInput = (parts, aspectRatio) => {
@@ -184,7 +215,7 @@ const waitForReplicatePrediction = async (predictionUrl, token) => {
   throw new Error('Replicate prediction timed out');
 };
 
-const generateImageWithReplicate = async (parts, aspectRatio) => {
+const generateImageWithReplicate = async (parts, aspectRatio, modelVersion) => {
   const token = getReplicateToken();
   const input = partsToReplicateInput(parts, aspectRatio);
 
@@ -196,7 +227,7 @@ const generateImageWithReplicate = async (parts, aspectRatio) => {
       Prefer: 'wait=60'
     },
     body: JSON.stringify({
-      version: REPLICATE_IMAGE_MODEL,
+      version: modelVersion,
       input
     })
   });
@@ -224,12 +255,9 @@ const generateImageWithReplicate = async (parts, aspectRatio) => {
   return fetchRemoteImageAsDataUrl(outputUrl);
 };
 
-const generateImageDataUrl = async (ai, parts, aspectRatio) => {
-  if (!REPLICATE_IMAGE_MODEL) {
-    throw new Error('Image generation is configured for Replicate nano-banana-pro only. Missing REPLICATE_IMAGE_MODEL.');
-  }
-
-  return generateImageWithReplicate(parts, aspectRatio);
+const generateImageDataUrl = async (ai, parts, aspectRatio, imageModelPreference = DEFAULT_IMAGE_MODEL_PREFERENCE) => {
+  const resolvedImageModel = resolveReplicateImageModel(imageModelPreference);
+  return generateImageWithReplicate(parts, aspectRatio, resolvedImageModel.modelVersion);
 };
 
 const toFileDataFromDataUrl = (dataUrl) => {
@@ -3679,8 +3707,13 @@ const enrichSceneEvidenceFromStyleRefs = (sceneCatalog, styleReferences) => {
   return Array.from(byScene.values());
 };
 
-export const setupStoryPack = async (storyFile, styleImages) => {
+export const setupStoryPack = async (
+  storyFile,
+  styleImages,
+  imageModelPreference = DEFAULT_IMAGE_MODEL_PREFERENCE
+) => {
   const ai = getClient();
+  const resolvedImageModel = resolveReplicateImageModel(imageModelPreference);
 
   const setupStart = performance.now();
   const analyzeStart = performance.now();
@@ -3864,7 +3897,7 @@ export const setupStoryPack = async (storyFile, styleImages) => {
     ].join('\n')
   });
 
-  const coverImage = await generateImageDataUrl(ai, coverParts, '3:4');
+  const coverImage = await generateImageDataUrl(ai, coverParts, '3:4', resolvedImageModel.preference);
 
   const coverMs = Math.round(performance.now() - coverStart);
   const totalMs = Math.round(performance.now() - setupStart);
@@ -3958,6 +3991,7 @@ export const runTurnPipeline = async (
   mimeType,
   storyText,
   storyPdf,
+  imageModelPreference,
   storyBrief,
   storyFacts,
   artStyle,
@@ -3970,6 +4004,7 @@ export const runTurnPipeline = async (
   }
 
   const ai = getClient();
+  const resolvedImageModel = resolveReplicateImageModel(imageModelPreference || DEFAULT_IMAGE_MODEL_PREFERENCE);
   const totalStart = performance.now();
   const normalizedFacts = normalizeStoryFacts(storyFacts, storyBrief);
   const effectiveStyleReferences = normalizeStyleReferenceAssets(
@@ -4195,7 +4230,7 @@ export const runTurnPipeline = async (
       const imageGenerationStart = performance.now();
       try {
         card.imageUrl = (
-          await retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1'), 1, 350)
+          await retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1', resolvedImageModel.preference), 1, 350)
         ) || undefined;
       } catch (error) {
         console.warn('[image] generation failed', card.id, error?.message || error);
@@ -4214,7 +4249,7 @@ export const runTurnPipeline = async (
         selectedStyleRefs,
         selectedParticipants: participants,
         imagePrompt,
-        imageModel: IMAGE_MODEL,
+        imageModel: `${resolvedImageModel.preference}:${resolvedImageModel.modelVersion}`,
         imageGenerationError: imageGenerationError || undefined
       };
       const cardTotalMs = Math.round(performance.now() - cardStart);
