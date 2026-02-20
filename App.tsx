@@ -51,6 +51,7 @@ const App: React.FC = () => {
     selectedOptionId,
     conversationHistory,
     lastAudioBlob,
+    lastTimings,
     error,
     isBusy,
     processRecording,
@@ -235,6 +236,7 @@ const App: React.FC = () => {
   }, []);
 
   const hasTurnDebug = options.some((opt) => Boolean(opt.debug));
+  const formatMs = (value?: number): string => `${Math.max(0, Math.round(Number(value) || 0))} ms`;
 
   const handleSaveExistingSetup = useCallback(async (payload: ExistingSetupUpdatePayload) => {
     const existingManifest = stories.find((story) => story.id === payload.storyId);
@@ -438,6 +440,96 @@ const App: React.FC = () => {
                 ))
               )}
             </div>
+
+            {lastTimings && (
+              <div className="w-full mb-6 rounded-2xl border border-blue-200 bg-white/95 p-4 shadow-sm">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-blue-700">Performance Timings</h3>
+                  <span className="text-xs font-semibold text-blue-700">
+                    Total: {formatMs(lastTimings.totalMs)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mb-3">
+                  <div className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <div className="font-semibold">Transcribe</div>
+                    <div>{formatMs(lastTimings.transcribeMs)}</div>
+                  </div>
+                  <div className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <div className="font-semibold">Options</div>
+                    <div>{formatMs(lastTimings.optionsMs)}</div>
+                  </div>
+                  <div className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <div className="font-semibold">Images</div>
+                    <div>{formatMs(lastTimings.fullCardsMs)}</div>
+                  </div>
+                  <div className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <div className="font-semibold">Cards</div>
+                    <div>{Object.keys(lastTimings.imageMsById || {}).length}</div>
+                  </div>
+                  <div className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <div className="font-semibold">Avg/Card</div>
+                    <div>
+                      {formatMs(
+                        Object.keys(lastTimings.imageMsById || {}).length > 0
+                          ? lastTimings.fullCardsMs / Object.keys(lastTimings.imageMsById || {}).length
+                          : 0
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {lastTimings.stepMs && (
+                  <details className="mb-3">
+                    <summary className="text-xs font-semibold text-gray-700 cursor-pointer select-none">
+                      Backend Step Breakdown
+                    </summary>
+                    <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-gray-700">
+                      <div className="rounded-lg border border-gray-200 px-3 py-2">
+                        Question transcription: {formatMs(lastTimings.stepMs.questionTranscriptionMs)}
+                      </div>
+                      <div className="rounded-lg border border-gray-200 px-3 py-2">
+                        Resolve question entities: {formatMs(lastTimings.stepMs.resolveQuestionParticipantsMs)}
+                      </div>
+                      <div className="rounded-lg border border-gray-200 px-3 py-2">
+                        Answer generation: {formatMs(lastTimings.stepMs.answerAgentMs)}
+                      </div>
+                      <div className="rounded-lg border border-gray-200 px-3 py-2">
+                        Option assembly: {formatMs(lastTimings.stepMs.optionAssemblyMs)}
+                      </div>
+                      <div className="rounded-lg border border-gray-200 px-3 py-2">
+                        Image fan-out: {formatMs(lastTimings.stepMs.imageFanoutMs)}
+                      </div>
+                    </div>
+                  </details>
+                )}
+
+                {lastTimings.cardStepMsById && Object.keys(lastTimings.cardStepMsById).length > 0 && (
+                  <details>
+                    <summary className="text-xs font-semibold text-gray-700 cursor-pointer select-none">
+                      Per-Card Step Breakdown
+                    </summary>
+                    <div className="mt-2 space-y-2">
+                      {Object.entries(lastTimings.cardStepMsById).map(([cardId, cardTiming]) => {
+                        const optionText = options.find((option) => option.id === cardId)?.text || cardId;
+                        return (
+                          <div key={`timing-${cardId}`} className="rounded-lg border border-gray-200 px-3 py-2 text-xs text-gray-700">
+                            <div className="font-semibold mb-1">{optionText}</div>
+                            <div className="grid grid-cols-1 md:grid-cols-5 gap-1">
+                              <span>Resolve: {formatMs(cardTiming.resolveParticipantsMs)}</span>
+                              <span>Refs: {formatMs(cardTiming.selectRefsMs)}</span>
+                              <span>Plan: {formatMs(cardTiming.illustrationPlanMs)}</span>
+                              <span>Image: {formatMs(cardTiming.imageGenerationMs)}</span>
+                              <span>Total: {formatMs(cardTiming.totalMs)}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
 
             {showAiDebug && hasTurnDebug && (
               <div className="w-full mb-6 rounded-2xl border border-red-200 bg-white/95 p-4 shadow-sm">

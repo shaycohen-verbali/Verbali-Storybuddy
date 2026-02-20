@@ -23,7 +23,11 @@ export const logSetupTimings = (label: string, timings: SetupTimings): void => {
 };
 
 export const logTurnTimings = (label: string, timings: PipelineTimings): void => {
+  const step = timings.stepMs;
+  const stepSuffix = step
+    ? ` steps(transcribe=${step.questionTranscriptionMs}ms,resolveQ=${step.resolveQuestionParticipantsMs}ms,answer=${step.answerAgentMs}ms,assemble=${step.optionAssemblyMs}ms,fanout=${step.imageFanoutMs}ms)`
+    : '';
   console.info(
-    `[perf] ${label} transcribe=${timings.transcribeMs}ms options=${timings.optionsMs}ms fullCards=${timings.fullCardsMs}ms total=${timings.totalMs}ms`
+    `[perf] ${label} transcribe=${timings.transcribeMs}ms options=${timings.optionsMs}ms fullCards=${timings.fullCardsMs}ms total=${timings.totalMs}ms${stepSuffix}`
   );
 };

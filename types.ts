@@ -237,6 +237,23 @@ export interface PipelineTimings {
   imageMsById: Record<string, number>;
   fullCardsMs: number;
   totalMs: number;
+  stepMs?: {
+    questionTranscriptionMs: number;
+    resolveQuestionParticipantsMs: number;
+    answerAgentMs: number;
+    optionAssemblyMs: number;
+    imageFanoutMs: number;
+  };
+  cardStepMsById?: Record<
+    string,
+    {
+      resolveParticipantsMs: number;
+      selectRefsMs: number;
+      illustrationPlanMs: number;
+      imageGenerationMs: number;
+      totalMs: number;
+    }
+  >;
 }
 
 export interface SetupStoryRequest {

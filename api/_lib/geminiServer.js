@@ -3705,6 +3705,13 @@ export const runTurnPipeline = async (
   );
   const question = transcribeResponse.text?.trim() || '';
   const transcribeMs = Math.round(performance.now() - transcribeStart);
+  const stepMs = {
+    questionTranscriptionMs: transcribeMs,
+    resolveQuestionParticipantsMs: 0,
+    answerAgentMs: 0,
+    optionAssemblyMs: 0,
+    imageFanoutMs: 0
+  };
 
   if (!question) {
     return {
@@ -3715,12 +3722,15 @@ export const runTurnPipeline = async (
         optionsMs: 0,
         imageMsById: {},
         fullCardsMs: transcribeMs,
-        totalMs: transcribeMs
+        totalMs: transcribeMs,
+        stepMs,
+        cardStepMsById: {}
       }
     };
   }
 
   const optionsStart = performance.now();
+  const resolveQuestionParticipantsStart = performance.now();
   const questionParticipants = await resolveTurnContextParticipants(
     ai,
     question,
@@ -3728,6 +3738,9 @@ export const runTurnPipeline = async (
     effectiveStyleReferences,
     null
   );
+  stepMs.resolveQuestionParticipantsMs = Math.round(performance.now() - resolveQuestionParticipantsStart);
+
+  const answerAgentStart = performance.now();
   const answerAgentResult = await generateAnswersFromStoryText(ai, {
     question,
     storyText,
@@ -3736,11 +3749,12 @@ export const runTurnPipeline = async (
     storyFacts: normalizedFacts,
     storyBrief
   });
+  stepMs.answerAgentMs = Math.round(performance.now() - answerAgentStart);
   const resolvedOptions = answerAgentResult.options;
   const regenerationCount = 0;
 
+  const optionAssemblyStart = performance.now();
   const shuffled = shuffle(resolvedOptions);
-  const optionsMs = Math.round(performance.now() - optionsStart);
 
   const cards = shuffled.map((choice, idx) => {
     const renderMode = determineRenderMode(
@@ -3777,15 +3791,19 @@ export const runTurnPipeline = async (
     `[qa] turn options wrong_truth_rate=${(accidentalTruthCount / Math.max(wrongCards.length, 1)).toFixed(2)} ` +
       `render_split=${renderModeSplit.blend}/${renderModeSplit.standalone} regenerations=${regenerationCount}`
   );
+  stepMs.optionAssemblyMs = Math.round(performance.now() - optionAssemblyStart);
+  const optionsMs = Math.round(performance.now() - optionsStart);
 
   const imageMsById = {};
+  const cardStepMsById = {};
   const imageStart = performance.now();
 
   await Promise.all(
     cards.map(async (card) => {
-      const start = performance.now();
+      const cardStart = performance.now();
       const parts = [];
       const combinedContext = `${question}\n${card.text}`;
+      const resolveParticipantsStart = performance.now();
       const participants = await resolveTurnContextParticipants(
         ai,
         combinedContext,
@@ -3793,6 +3811,8 @@ export const runTurnPipeline = async (
         effectiveStyleReferences,
         questionParticipants
       );
+      const resolveParticipantsMs = Math.round(performance.now() - resolveParticipantsStart);
+      const selectRefsStart = performance.now();
       const { refs: refsForOption, selectedStyleRefIndexes } = await selectStyleRefsForOption(
         ai,
         effectiveStylePrimer,
@@ -3802,6 +3822,7 @@ export const runTurnPipeline = async (
         questionParticipants,
         participants
       );
+      const selectRefsMs = Math.round(performance.now() - selectRefsStart);
       const refSummary = refsForOption
         .map((ref, idx) => {
           const linkedIndex = selectedStyleRefIndexes[idx];
@@ -3835,6 +3856,7 @@ export const runTurnPipeline = async (
         confidence: Number.isFinite(Number(ref.confidence)) ? Number(ref.confidence) : undefined
       }));
 
+      const illustrationPlanStart = performance.now();
       const { illustrationAgentPrompt, illustrationPlan } = await generateIllustrationPlanForAnswer(ai, {
         question,
         answerText: card.text,
@@ -3843,6 +3865,7 @@ export const runTurnPipeline = async (
         storyFacts: normalizedFacts,
         selectedRefs: refsForOption
       });
+      const illustrationPlanMs = Math.round(performance.now() - illustrationPlanStart);
       const illustrationPlanText = toIllustrationPlanText(illustrationPlan, card.text);
       const imagePrompt = buildImagePrompt({
         optionText: card.text,
@@ -3860,6 +3883,7 @@ export const runTurnPipeline = async (
       });
 
       let imageGenerationError = '';
+      const imageGenerationStart = performance.now();
       try {
         card.imageUrl = (
           await retryWithBackoff(() => generateImageDataUrl(ai, parts, '1:1'), 1, 350)
@@ -3869,6 +3893,7 @@ export const runTurnPipeline = async (
         imageGenerationError = String(error?.message || error || 'image generation failed');
         card.imageUrl = undefined;
       }
+      const imageGenerationMs = Math.round(performance.now() - imageGenerationStart);
 
       card.isLoadingImage = false;
       card.debug = {
@@ -3883,11 +3908,20 @@ export const runTurnPipeline = async (
         imageModel: IMAGE_MODEL,
         imageGenerationError: imageGenerationError || undefined
       };
-      imageMsById[card.id] = Math.round(performance.now() - start);
+      const cardTotalMs = Math.round(performance.now() - cardStart);
+      imageMsById[card.id] = cardTotalMs;
+      cardStepMsById[card.id] = {
+        resolveParticipantsMs,
+        selectRefsMs,
+        illustrationPlanMs,
+        imageGenerationMs,
+        totalMs: cardTotalMs
+      };
     })
   );
 
   const fullCardsMs = Math.round(performance.now() - imageStart);
+  stepMs.imageFanoutMs = fullCardsMs;
   const totalMs = Math.round(performance.now() - totalStart);
 
   return {
@@ -3898,7 +3932,9 @@ export const runTurnPipeline = async (
       optionsMs,
       imageMsById,
       fullCardsMs,
-      totalMs
+      totalMs,
+      stepMs,
+      cardStepMsById
     }
   };
 };
